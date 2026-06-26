@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using ModelSharp.Manifest;
 
 namespace ModelSharp.Pipeline;
@@ -27,13 +28,22 @@ public static class ProcessorRegistry
     private static readonly ConcurrentDictionary<ModelTask, Func<ProcessorContext, IPreprocessor>> Preprocessors = new();
     private static readonly ConcurrentDictionary<ModelTask, Func<ProcessorContext, IPostprocessor>> Postprocessors = new();
 
+    // One shared attention-mask holder per ProcessorContext, so the Embedding pre/post processors
+    // built from the same context cooperate (the preprocessor records the input mask, the
+    // postprocessor reads it back to pool over real tokens only).
+    private static readonly ConditionalWeakTable<ProcessorContext, AttentionMaskHolder> MaskHolders = new();
+
     static ProcessorRegistry()
     {
         // Built-in core processors that depend only on the dependency-free core
         // (WordPiece tokenizer + mean-pool). Vision/audio adapters register their own.
-        RegisterPreprocessor(ModelTask.Embedding, ctx => new TextEmbeddingPreprocessor(ctx));
-        RegisterPostprocessor(ModelTask.Embedding, _ => new MeanPoolEmbeddingPostprocessor());
+        RegisterPreprocessor(ModelTask.Embedding, ctx => new TextEmbeddingPreprocessor(ctx, MaskHolderFor(ctx)));
+        RegisterPostprocessor(ModelTask.Embedding, ctx => new MeanPoolEmbeddingPostprocessor(MaskHolderFor(ctx)));
     }
+
+    /// <summary>Gets (creating on first use) the attention-mask holder shared by one context's processors.</summary>
+    private static AttentionMaskHolder MaskHolderFor(ProcessorContext ctx)
+        => MaskHolders.GetValue(ctx, _ => new AttentionMaskHolder());
 
     /// <summary>Registers (or replaces) the preprocessor factory for a task.</summary>
     public static void RegisterPreprocessor(ModelTask task, Func<ProcessorContext, IPreprocessor> factory)
