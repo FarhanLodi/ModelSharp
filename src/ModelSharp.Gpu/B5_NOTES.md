@@ -1,64 +1,92 @@
-# B5 — Whole-graph on GPU & on-device KV-cache: current state
+# B5 — GPU decoder kernels, on-device KV-cache & LLM-on-GPU validation (current state)
 
-## Current data-movement behaviour (after this change)
+## Summary of what changed in this pass
 
-`IlgpuEngine.Run` already keeps **all intermediate tensors resident on the device** across the
-op chain. The mechanics:
+The GPU engine (`IlgpuEngine`) now dispatches the full transformer **compute** path on CUDA, plus a
+persistent **on-device KV-cache** with a stateful decode seam. Validated on an RTX 4090 against
+`ManagedCpuEngine` to ~1e-3 (`GpuLlmTests.cs`, `GpuCudaParityTests.cs`).
 
-- `buffers` is a `Dictionary<string, MemoryBuffer1D<float>>` of **device** buffers. Inputs and
-  initializers are uploaded **once** at the start of `Run`. Every op reads its input device
-  buffers and writes a freshly-allocated device output buffer into `buffers`; nothing is copied
-  back to host between ops.
-- There is a **single** `_accelerator.Synchronize()` at the very end, immediately before the
-  outputs are read back with `GetAsArray1D()`. So a full forward pass issues all kernels
-  asynchronously and pays exactly **one** device→host copy per graph output — not per op.
+## Data-movement behaviour (unchanged from the prior pass, still true)
 
-In other words, the per-op host round-trip that B5 warns about **was already absent** for the
-main op chain. The kernels (Add/Sub/Mul/Div, activations, Transpose, Softmax, Reduce, MatMul,
-Conv) all operate device→device.
+`IlgpuEngine.Run` keeps **all intermediate float tensors resident on the device** across the op chain:
+inputs/initializers upload once, every op writes a fresh device output buffer, and there is a single
+`_accelerator.Synchronize()` immediately before the graph outputs are read back. One device→host copy
+per graph output, not per op. Integer/bool tensors (token ids, masks, shape/index vectors) flow
+host-side as dtype-carrying `Tensor` values, which is correct and pragmatic for the index math they feed.
 
-### Host round-trips that remained, and what was done
+## New GPU ops added this pass (each with a hardware-CUDA parity test)
 
-1. **`ReduceSum`/`ReduceMean` identity path** (`noop_with_empty_axes` with empty axes). Previously
-   did `Allocate1D(x.GetAsArray1D())` — a device→host→device bounce. **Fixed**: now a
-   device-to-device `x.View.CopyTo(stream, copy.View)`, no host involvement.
+Audited against the real `distilgpt2.onnx` (1569 nodes, 30 distinct ops). The decoder ops that were
+missing and are now implemented on the GPU engine:
 
-2. **`ReduceSum`/`ReduceMean` dynamic axes** read from a *tensor* input
-   (`buffers[node.Inputs[1]].GetAsArray1D()`). This is an unavoidable host read: the axes are
-   needed on the **host** to compute the reduction's stride layout before launching the kernel.
-   It only triggers when axes are supplied as a runtime tensor rather than an attribute (rare for
-   static graphs), and moves a handful of ints, not bulk data. Left as-is.
+| Op            | Device path                                                                              |
+|---------------|-------------------------------------------------------------------------------------------|
+| `Reshape`     | shape-only; float buffer copied device→device, int stays host                            |
+| `Unsqueeze`   | shape-only (same as Reshape)                                                              |
+| `Squeeze`     | shape-only (same as Reshape)                                                              |
+| `Shape`       | emits dims as a host int64 tensor (pure metadata)                                         |
+| `Constant`    | float value → device, int value → host                                                    |
+| `Expand`      | float broadcast via the device Gather kernel (host-precomputed offsets); int host-side    |
+| `Split`       | float chunks sliced on-device via the Gather kernel; int host-side                        |
+| `Pow`         | new `PowK` broadcasting kernel (device)                                                   |
+| `Where`       | new `WhereK` broadcasting kernel (device, condition uploaded as 0/1 floats); int host     |
+| `Erf`         | new `ErfK` device kernel (A&S 7.1.26, matching the CPU `MathHelpers.Erf`)                 |
+| `Gemm`        | device: optional A/B transpose (Transpose kernel) → MatMul kernel → α/β scale + C add     |
 
-The stride/offset/batch-offset arrays the host precomputes for broadcasting, Transpose, Reduce and
-MatMul are uploaded as small `int[]` device buffers (`Upload`) — these are control data derived
-from shapes, not tensor payload, and are correctly kept off the hot path.
+All of these are exercised by `GpuLlmTests.cs` (`Cuda_Pow_*`, `Cuda_Erf`, `Cuda_Where_*`,
+`Cuda_Reshape_*`, `Cuda_Unsqueeze_Squeeze_*`, `Cuda_Expand_*`, `Cuda_Split_*`, `Cuda_Gemm_*`), each
+asserting CUDA-vs-CPU parity to 1e-3 and confirming `IsHardwareGpu==true`, skipping cleanly when no CUDA.
 
-## What remains for full on-device KV-cache
+`Run`'s `finally` now dedupes buffers by reference before disposing, so unwinding mid-graph (e.g. on an
+unsupported op) can't double-free a device buffer.
 
-The engine does not yet implement an attention/KV-cache fast path because the op set it supports
-(elementwise, activations, Transpose, Softmax, Reduce, MatMul, Conv) does not include the
-transformer attention ops (no `Gather`/`Concat`/`Slice`/`Cast`/`LayerNormalization` on the GPU
-engine — those run on the CPU engine only). A genuine on-device KV-cache needs, in order:
+## distilgpt2 GPU-op audit (see `GpuDistilGpt2AuditTests` and `GpuLlmTests.DistilGpt2_Gpu_Coverage_*`)
 
-1. **GPU ops for the attention graph**: `Concat` (to append new K/V along the sequence axis),
-   `Gather`/`Slice` (cache indexing), and ideally `LayerNormalization`, all as device→device
-   kernels in `GpuKernels`. Until these exist, any attention graph falls back to the CPU engine
-   and the question of on-device caching is moot.
+- **1548 / 1569 nodes (98.7%) are GPU-dispatchable** after this pass.
+- **Still falls back to CPU** (21 nodes, 6 distinct ops), all in the mask / position-id prologue:
+  `Range`, `ConstantOfShape`, `Equal`, `Greater`, `Trilu`, `ScatterND`.
+  These are integer/boolean control-flow ops that build the causal mask and position ids; they are not
+  on the float compute path. The first one in topo order is `/transformer/Range` (node #23).
+- Consequently a **whole-graph** distilgpt2 GPU run is **not** reachable yet (it would stop at `Range`),
+  and is also impractical to drive through `Run` because the empty (seq-0) `past_key_values` float
+  inputs produce zero-length device allocations. The transformer **compute** path itself
+  (Gemm/MatMul/Softmax/LayerNorm/attention, the Pow+Tanh GELU, and all the Reshape/Transpose/Split/
+  Concat/Gather/Slice plumbing) is GPU-complete.
 
-2. **A persistent cross-`Run` device buffer pool.** Today every `Run` allocates fresh device
-   buffers and disposes them in `finally`. An autoregressive KV-cache must instead hold the K/V
-   buffers on the device **across decode steps** (across `Run` calls), appending one token's K/V
-   per step rather than recomputing the whole prefix. That requires:
-   - a cache object owning `MemoryBuffer1D` handles that outlive a single `Run`;
-   - an "append" kernel/path that writes the new step's K/V at the current sequence offset of the
-     persistent buffer (no realloc, no host copy);
-   - lifetime/eviction management (max sequence length, reset between sequences).
+## What now runs ENTIRELY on GPU end-to-end
 
-3. **Engine API surface** to express "this is a decode step, reuse cache X" — the current
-   `IExecutionEngine.Run(feeds) -> outputs` contract is stateless, so KV-cache needs either an
-   overload that threads a cache handle through, or a stateful decode session wrapper.
+- A full **scaled-dot-product self-attention block** (`Transpose → MatMul → Mul(scale) → Softmax →
+  MatMul`) runs entirely on the GPU engine and matches the CPU engine to 1e-3
+  (`GpuLlmTests.Cuda_Attention_Block_Matches_Cpu`).
+- A **multi-step autoregressive decode** over the on-device KV-cache (5 steps) runs entirely on GPU and
+  matches a CPU full-attention reference at every step to 1e-3
+  (`GpuLlmTests.Cuda_OnDevice_KvCache_MultiStep_Matches_Cpu`).
+- Not the full distilgpt2 graph — see the fallback list above.
 
-None of (1)–(3) could be added safely within this change without touching the core engine seam
-(owned by another agent) and adding several new GPU kernels — a much larger piece of work. The
-safe, completed portion of B5 here is: **confirm intermediates already stay on-device, and remove
-the one remaining mid-chain host round-trip (the Reduce identity copy).**
+## On-device KV-cache (new)
+
+`GpuKvCache` (in `GpuKvCache.cs`) owns two device buffers laid out `[numHeads, maxSeq, headDim]` for K
+and V that **persist across decode steps**. It is created via `IlgpuEngine.CreateKvCache(numHeads,
+maxSeq, headDim)` (borrows the engine's accelerator) and tracks the current `SeqLen`; `Reset()` reuses
+it for a new sequence; `Dispose()` frees the buffers.
+
+The stateful decode seam is `IlgpuEngine.DecodeStepAttention(cache, stepQ, stepK, stepV, scale?)`:
+1. **Append** the step's per-head K/V into the persistent cache at the current `SeqLen` offset via a
+   device→device `SubView.CopyTo` — **no realloc, no host round-trip**; `SeqLen` advances by `stepLen`.
+2. Compute attention of the step's query against the **entire cached prefix** on-device: per head it
+   builds Kᵀ (Transpose kernel), `scores = Q·Kᵀ` (MatMul kernel), scales (broadcast Mul), `softmax`
+   (Softmax kernel), then `ctx = attn·V` (MatMul kernel). Only the final context is downloaded.
+
+This does **not** disturb the existing stateless `IExecutionEngine.Run` contract — it is an additional
+public surface on the engine.
+
+## Honest list of what still falls back / is not covered
+
+- The 6 integer/mask prologue ops above (`Range`/`ConstantOfShape`/`Equal`/`Greater`/`Trilu`/
+  `ScatterND`) are CPU-only; no GPU kernels were added for them this pass.
+- `DecodeStepAttention` is a single self-attention block, not the whole decoder layer stack (no
+  projections/MLP/residual wired into the seam) — those ops exist individually on the GPU but are not
+  composed into the cache path here.
+- The cache currently downloads the per-step context to host at the end of each step (the typical
+  consumer wants the token's hidden state on host for the next op); the K/V themselves never leave the
+  device.
