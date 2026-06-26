@@ -292,6 +292,65 @@ internal static class GpuKernels
         int i = idx.X;
         y[i] = x[srcOffsets[i]];
     }
+
+    /// <summary>
+    /// Elementwise <c>Pow</c> (base^exp) with NumPy-style broadcasting, sharing the broadcast-stride
+    /// decomposition of <see cref="BroadcastBinaryK"/>. One thread per output element. Mirrors the CPU
+    /// <c>PowKernel</c> (which is <c>MathF.Pow</c>).
+    /// </summary>
+    internal static void PowK(
+        Index1D i,
+        ArrayView<float> a,
+        ArrayView<float> b,
+        ArrayView<float> y,
+        ArrayView<int> outStrides,
+        ArrayView<int> sA,
+        ArrayView<int> sB,
+        int rank)
+    {
+        int rem = i.X;
+        int aOff = 0, bOff = 0;
+        for (int ax = 0; ax < rank; ax++)
+        {
+            int st = outStrides[ax];
+            int c = rem / st;
+            rem -= c * st;
+            aOff += c * sA[ax];
+            bOff += c * sB[ax];
+        }
+        y[i] = MathF.Pow(a[aOff], b[bOff]);
+    }
+
+    /// <summary>
+    /// Elementwise <c>Where</c>: <c>cond != 0 ? x : y</c>, with NumPy-style broadcasting over all three
+    /// operands. <paramref name="cond"/> is supplied as a float buffer (0/1). One thread per output element.
+    /// Mirrors the CPU <c>WhereKernel</c> (float value path).
+    /// </summary>
+    internal static void WhereK(
+        Index1D i,
+        ArrayView<float> cond,
+        ArrayView<float> x,
+        ArrayView<float> y,
+        ArrayView<float> outBuf,
+        ArrayView<int> outStrides,
+        ArrayView<int> sC,
+        ArrayView<int> sX,
+        ArrayView<int> sY,
+        int rank)
+    {
+        int rem = i.X;
+        int cOff = 0, xOff = 0, yOff = 0;
+        for (int ax = 0; ax < rank; ax++)
+        {
+            int st = outStrides[ax];
+            int c = rem / st;
+            rem -= c * st;
+            cOff += c * sC[ax];
+            xOff += c * sX[ax];
+            yOff += c * sY[ax];
+        }
+        outBuf[i] = cond[cOff] != 0f ? x[xOff] : y[yOff];
+    }
 }
 
 /// <summary>

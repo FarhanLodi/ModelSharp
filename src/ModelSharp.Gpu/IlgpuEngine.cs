@@ -50,6 +50,7 @@ public sealed class IlgpuEngine : IExecutionEngine
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _exp;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _sqrt;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, float> _leakyRelu;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _erf;
 
     // Data-movement / reduction ops whose strides are precomputed on the host.
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>,
@@ -73,6 +74,12 @@ public sealed class IlgpuEngine : IExecutionEngine
 
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         ArrayView<float>, ConvParams> _conv;
+
+    // B5 decoder ops: broadcasting Pow and Where (the latter with a float-encoded condition).
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        ArrayView<int>, ArrayView<int>, ArrayView<int>, int> _pow;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>, int> _where;
 
     /// <inheritdoc />
     public IReadOnlyList<TensorInfo> Inputs { get; }
@@ -110,6 +117,7 @@ public sealed class IlgpuEngine : IExecutionEngine
         _exp = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(ExpK);
         _sqrt = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(SqrtK);
         _leakyRelu = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, float>(LeakyReluK);
+        _erf = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(ErfK);
 
         _transpose = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>,
             ArrayView<int>, ArrayView<int>, int>(GpuKernels.TransposeK);
@@ -127,6 +135,11 @@ public sealed class IlgpuEngine : IExecutionEngine
             ArrayView<int>, ArrayView<int>, int, int, int>(GpuKernels.MatMulK);
         _conv = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             ArrayView<float>, ConvParams>(GpuKernels.Conv2DK);
+
+        _pow = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, ArrayView<int>, ArrayView<int>, int>(GpuKernels.PowK);
+        _where = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>, int>(GpuKernels.WhereK);
 
         Inputs = graph.Inputs.Select(n => new TensorInfo(n, ElementType.Float32, Array.Empty<int>())).ToList();
         Outputs = graph.Outputs.Select(n => new TensorInfo(n, ElementType.Float32, Array.Empty<int>())).ToList();
@@ -146,6 +159,7 @@ public sealed class IlgpuEngine : IExecutionEngine
     private static void SqrtK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Sqrt(a[i]);
     private static void GeluK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = 0.5f * a[i] * (1f + Erf(a[i] * 0.70710678f));
     private static void LeakyReluK(Index1D i, ArrayView<float> a, ArrayView<float> y, float alpha) => y[i] = a[i] >= 0f ? a[i] : alpha * a[i];
+    private static void ErfK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = Erf(a[i]);
 
     /// <summary>
     /// Device-side error function (Abramowitz &amp; Stegun 7.1.26), with the same constants as the CPU
@@ -203,12 +217,24 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Slice": RunSlice(node, values, temps); break;
                     case "Cast": RunCast(node, values); break;
                     case "MatMul": RunMatMul(node, values, temps); break;
+                    case "Gemm": RunGemm(node, values, temps); break;
                     case "Conv": RunConv(node, values, temps); break;
+                    case "Erf": RunUnary(_erf, node, values); break;
+                    case "Pow": RunPow(node, values, temps); break;
+                    case "Where": RunWhere(node, values, temps); break;
+                    case "Reshape": RunReshape(node, values); break;
+                    case "Unsqueeze": RunUnsqueeze(node, values); break;
+                    case "Squeeze": RunSqueeze(node, values); break;
+                    case "Shape": RunShape(node, values); break;
+                    case "Constant": RunConstant(node, values); break;
+                    case "Expand": RunExpand(node, values, temps); break;
+                    case "Split": RunSplit(node, values, temps); break;
                     default:
                         throw new UnsupportedOperatorException(node.OpType,
                             $"node '{node.Name}' — the GPU engine covers elementwise/activations, Softmax, " +
                             "Transpose, ReduceSum/ReduceMean, LayerNormalization, Gather/Concat/Slice/Cast, " +
-                            "MatMul and Conv ops");
+                            "MatMul/Gemm, Conv, and the decoder shape ops Reshape/Unsqueeze/Squeeze/Shape/" +
+                            "Constant/Expand/Split plus Pow/Where/Erf");
                 }
             }
             _accelerator.Synchronize();
@@ -220,8 +246,16 @@ public sealed class IlgpuEngine : IExecutionEngine
         }
         finally
         {
-            foreach (DeviceValue v in values.Values) v.FloatBuf?.Dispose();
-            foreach (MemoryBuffer buf in temps) buf.Dispose();
+            // Dispose each device buffer at most once. A few ops (e.g. an op whose output name reuses an input
+            // name, or shared scalar buffers) can leave the same handle reachable from more than one dictionary
+            // entry; disposing a buffer twice corrupts ILGPU's accelerator child-object tracking and surfaces as
+            // a NullReferenceException when the accelerator itself is later disposed. Deduping by reference makes
+            // cleanup robust even when Run unwinds mid-graph (e.g. on an unsupported op).
+            var seen = new HashSet<MemoryBuffer>(ReferenceEqualityComparer.Instance);
+            foreach (DeviceValue v in values.Values)
+                if (v.FloatBuf is not null && seen.Add(v.FloatBuf)) v.FloatBuf.Dispose();
+            foreach (MemoryBuffer buf in temps)
+                if (seen.Add(buf)) buf.Dispose();
         }
     }
 
@@ -1112,6 +1146,512 @@ public sealed class IlgpuEngine : IExecutionEngine
         values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(N, cout, outH, outW));
     }
 
+    // --- B5 decoder shape / compute ops ---
+
+    /// <summary>
+    /// Re-emits <paramref name="src"/> under a new shape without changing its element order. Float values are
+    /// copied device→device into a fresh buffer (so the new dictionary entry owns its own buffer, avoiding the
+    /// double-dispose that aliasing would cause in <c>Run</c>'s finally); integer/bool values stay host-side
+    /// via <see cref="Tensor.WithShape"/>. Used by Reshape/Unsqueeze/Squeeze.
+    /// </summary>
+    private DeviceValue Reshaped(DeviceValue src, int[] outDims)
+    {
+        var shape = new TensorShape(outDims);
+        if (src.IsFloat)
+        {
+            MemoryBuffer1D<float, Stride1D.Dense> copy = _accelerator.Allocate1D<float>(src.FloatBuf!.Length);
+            src.FloatBuf!.View.CopyTo(_accelerator.DefaultStream, copy.View);
+            return DeviceValue.Device(copy, shape);
+        }
+        return DeviceValue.Host(src.HostInt!.WithShape(shape));
+    }
+
+    /// <summary>ONNX <c>Reshape</c> (shape from the 2nd input; 0 = keep, -1 = infer). Mirrors the CPU <c>ReshapeKernel</c>.</summary>
+    private void RunReshape(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        DeviceValue src = values[node.Inputs[0]];
+        ReadOnlySpan<int> inDims = src.Shape.Dimensions;
+        long total = src.Shape.Length;
+        long[] sp = ReadInts(values, node.Inputs[1]);
+
+        int n = sp.Length;
+        var dims = new int[n];
+        int inferIdx = -1;
+        long known = 1;
+        for (int i = 0; i < n; i++)
+        {
+            long d = sp[i];
+            if (d == -1) inferIdx = i;
+            else if (d == 0) { dims[i] = inDims[i]; known *= dims[i]; }
+            else { dims[i] = (int)d; known *= d; }
+        }
+        if (inferIdx >= 0) dims[inferIdx] = (int)(total / known);
+        values[node.Outputs[0]] = Reshaped(src, dims);
+    }
+
+    /// <summary>ONNX <c>Unsqueeze</c> (axes from attribute or 2nd input). Mirrors the CPU <c>UnsqueezeKernel</c>.</summary>
+    private void RunUnsqueeze(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        DeviceValue src = values[node.Inputs[0]];
+        int[]? axes = node.Attributes.ContainsKey("axes") ? AttrInts(node, "axes", Array.Empty<int>()) : null;
+        if (axes is null && node.Inputs.Count > 1)
+            axes = Array.ConvertAll(ReadInts(values, node.Inputs[1]), v => (int)v);
+        axes ??= Array.Empty<int>();
+
+        ReadOnlySpan<int> inDims = src.Shape.Dimensions;
+        int outRank = inDims.Length + axes.Length;
+        var inserted = new HashSet<int>();
+        foreach (int ax in axes) inserted.Add(ax < 0 ? ax + outRank : ax);
+
+        var outDims = new int[outRank];
+        int j = 0;
+        for (int i = 0; i < outRank; i++) outDims[i] = inserted.Contains(i) ? 1 : inDims[j++];
+        values[node.Outputs[0]] = Reshaped(src, outDims);
+    }
+
+    /// <summary>ONNX <c>Squeeze</c> (specified axes, or all size-1 axes). Mirrors the CPU <c>SqueezeKernel</c>.</summary>
+    private void RunSqueeze(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        DeviceValue src = values[node.Inputs[0]];
+        ReadOnlySpan<int> inDims = src.Shape.Dimensions;
+        int rank = inDims.Length;
+
+        int[]? axes = node.Attributes.ContainsKey("axes") ? AttrInts(node, "axes", Array.Empty<int>()) : null;
+        if (axes is null && node.Inputs.Count > 1)
+            axes = Array.ConvertAll(ReadInts(values, node.Inputs[1]), v => (int)v);
+
+        var kept = new List<int>();
+        if (axes is null)
+        {
+            for (int i = 0; i < rank; i++) if (inDims[i] != 1) kept.Add(inDims[i]);
+        }
+        else
+        {
+            var remove = new HashSet<int>();
+            foreach (int ax in axes) remove.Add(ax < 0 ? ax + rank : ax);
+            for (int i = 0; i < rank; i++) if (!remove.Contains(i)) kept.Add(inDims[i]);
+        }
+        values[node.Outputs[0]] = Reshaped(src, kept.ToArray());
+    }
+
+    /// <summary>
+    /// ONNX <c>Shape</c> (opset 15+ start/end honored): emits the input's dimensions as a 1-D int64 host tensor.
+    /// Pure shape metadata, so this never touches the device buffer. Mirrors the CPU <c>ShapeKernel</c>.
+    /// </summary>
+    private void RunShape(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        TensorShape shape = values[node.Inputs[0]].Shape;
+        int rank = shape.Rank;
+        int start = ClampShapeAxis(AttrInt(node, "start", 0), rank);
+        int end = ClampShapeAxis(AttrInt(node, "end", rank), rank);
+        int count = end - start;
+        if (count < 0) count = 0;
+
+        ReadOnlySpan<int> dims = shape.Dimensions;
+        var buf = new long[count];
+        for (int i = 0; i < count; i++) buf[i] = dims[start + i];
+        values[node.Outputs[0]] = DeviceValue.Host(new Tensor<long>(new TensorShape(count), buf));
+    }
+
+    private static int ClampShapeAxis(long value, int rank)
+    {
+        if (value < 0) value += rank;
+        if (value < 0) value = 0;
+        if (value > rank) value = rank;
+        return (int)value;
+    }
+
+    /// <summary>
+    /// ONNX <c>Constant</c>: materializes the node's <c>value</c>/<c>value_int(s)</c>/<c>value_float(s)</c>
+    /// attribute. Float tensors are uploaded to the device; integer tensors stay host-side. Mirrors the CPU
+    /// <c>ConstantKernel</c>.
+    /// </summary>
+    private void RunConstant(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        string outName = node.Outputs[0];
+        if (node.Attributes.TryGetValue("value", out object? tv) && tv is Tensor t)
+        {
+            values[outName] = Load(t);
+            return;
+        }
+        if (node.Attributes.TryGetValue("value_ints", out object? viv) && viv is long[] ints)
+        {
+            values[outName] = DeviceValue.Host(new Tensor<long>(new TensorShape(ints.Length), ints));
+            return;
+        }
+        if (node.Attributes.TryGetValue("value_floats", out object? vfv) && vfv is float[] floats)
+        {
+            values[outName] = DeviceValue.Device(_accelerator.Allocate1D(floats), new TensorShape(floats.Length));
+            return;
+        }
+        if (node.Attributes.TryGetValue("value_int", out object? iv))
+        {
+            values[outName] = DeviceValue.Host(new Tensor<long>(new TensorShape(Array.Empty<int>()), new[] { Convert.ToInt64(iv) }));
+            return;
+        }
+        if (node.Attributes.TryGetValue("value_float", out object? fv))
+        {
+            values[outName] = DeviceValue.Device(_accelerator.Allocate1D(new[] { Convert.ToSingle(fv) }), new TensorShape(Array.Empty<int>()));
+            return;
+        }
+        throw new ModelSharpException(
+            $"Constant node '{node.Name}' has no supported value attribute (value/value_int(s)/value_float(s)).");
+    }
+
+    /// <summary>
+    /// ONNX <c>Pow</c>: elementwise base^exp with NumPy broadcasting (float path on the device). Integer/bool
+    /// operands are not expected here; falls through to broadcasting on the float device buffers. Mirrors the
+    /// CPU <c>PowKernel</c>.
+    /// </summary>
+    private void RunPow(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> a = FloatBuf(values, node.Inputs[0]);
+        MemoryBuffer1D<float, Stride1D.Dense> b = FloatBuf(values, node.Inputs[1]);
+        TensorShape sa = values[node.Inputs[0]].Shape;
+        TensorShape sb = values[node.Inputs[1]].Shape;
+
+        int[] outd = BroadcastShape(sa.Dimensions, sb.Dimensions);
+        int rank = outd.Length;
+        int n = 1; foreach (int d in outd) n *= d;
+        int[] outStrides = Strides(outd);
+        int[] strideA = BroadcastStrides(sa.Dimensions, rank);
+        int[] strideB = BroadcastStrides(sb.Dimensions, rank);
+
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(n == 0 ? 1 : n);
+        ArrayView<int> vOut = Upload(outStrides, temps);
+        ArrayView<int> vA = Upload(strideA, temps);
+        ArrayView<int> vB = Upload(strideB, temps);
+        if (n > 0) _pow(n, a.View, b.View, y.View, vOut, vA, vB, rank);
+        values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(outd));
+    }
+
+    /// <summary>
+    /// ONNX <c>Where</c>: <c>cond ? X : Y</c> with NumPy broadcasting over all three inputs, float value path on
+    /// the device. The boolean condition (carried host-side) is uploaded as a 0/1 float buffer. Mirrors the CPU
+    /// <c>WhereKernel</c> float path.
+    /// </summary>
+    private void RunWhere(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        DeviceValue condV = values[node.Inputs[0]];
+        DeviceValue xV = values[node.Inputs[1]];
+        DeviceValue yV = values[node.Inputs[2]];
+
+        // Integer/bool value path: do it host-side (rare; keeps dtype correctness).
+        if (!xV.IsFloat || !yV.IsFloat)
+        {
+            RunWhereHost(node, values, condV, xV, yV);
+            return;
+        }
+
+        // Condition → float 0/1 device buffer (it arrives as a host bool/int tensor, or already a float buffer).
+        MemoryBuffer1D<float, Stride1D.Dense> condBuf;
+        bool condTemp = false;
+        if (condV.IsFloat)
+        {
+            condBuf = condV.FloatBuf!;
+        }
+        else
+        {
+            long[] ci = TensorAsInts(condV.HostInt!);
+            var cf = new float[ci.Length];
+            for (int i = 0; i < ci.Length; i++) cf[i] = ci[i] != 0 ? 1f : 0f;
+            condBuf = _accelerator.Allocate1D(cf);
+            temps.Add(condBuf);
+            condTemp = true;
+        }
+        _ = condTemp;
+
+        TensorShape sc = condV.Shape, sx = xV.Shape, sy = yV.Shape;
+        int[] outd = BroadcastShape(BroadcastShape(sc.Dimensions, sx.Dimensions), sy.Dimensions);
+        int rank = outd.Length;
+        int n = 1; foreach (int d in outd) n *= d;
+        int[] outStrides = Strides(outd);
+        int[] sCs = BroadcastStrides(sc.Dimensions, rank);
+        int[] sXs = BroadcastStrides(sx.Dimensions, rank);
+        int[] sYs = BroadcastStrides(sy.Dimensions, rank);
+
+        MemoryBuffer1D<float, Stride1D.Dense> outBuf = _accelerator.Allocate1D<float>(n == 0 ? 1 : n);
+        ArrayView<int> vOut = Upload(outStrides, temps);
+        ArrayView<int> vC = Upload(sCs, temps);
+        ArrayView<int> vX = Upload(sXs, temps);
+        ArrayView<int> vY = Upload(sYs, temps);
+        if (n > 0) _where(n, condBuf.View, xV.FloatBuf!.View, yV.FloatBuf!.View, outBuf.View, vOut, vC, vX, vY, rank);
+        values[node.Outputs[0]] = DeviceValue.Device(outBuf, new TensorShape(outd));
+    }
+
+    private void RunWhereHost(GraphNode node, Dictionary<string, DeviceValue> values,
+        DeviceValue condV, DeviceValue xV, DeviceValue yV)
+    {
+        long[] cond = condV.IsFloat
+            ? Array.ConvertAll(condV.FloatBuf!.GetAsArray1D(), f => f != 0f ? 1L : 0L)
+            : TensorAsInts(condV.HostInt!);
+        Tensor xt = xV.ToHost(), yt = yV.ToHost();
+
+        TensorShape sc = condV.Shape, sx = xV.Shape, sy = yV.Shape;
+        int[] outd = BroadcastShape(BroadcastShape(sc.Dimensions, sx.Dimensions), sy.Dimensions);
+        int rank = outd.Length;
+        int n = 1; foreach (int d in outd) n *= d;
+        int[] sCs = BroadcastStrides(sc.Dimensions, rank);
+        int[] sXs = BroadcastStrides(sx.Dimensions, rank);
+        int[] sYs = BroadcastStrides(sy.Dimensions, rank);
+
+        Tensor outT = xt.Dtype switch
+        {
+            ElementType.Int64 => WhereHost<long>(cond, xt.AsInt64().Span, yt.AsInt64().Span, outd, n, rank, sCs, sXs, sYs),
+            ElementType.Int32 => WhereHost<int>(cond, xt.AsInt32().Span, yt.AsInt32().Span, outd, n, rank, sCs, sXs, sYs),
+            ElementType.Boolean => WhereHost<bool>(cond, xt.AsBool().Span, yt.AsBool().Span, outd, n, rank, sCs, sXs, sYs),
+            _ => WhereHost<float>(cond, xt.AsFloat().Span, yt.AsFloat().Span, outd, n, rank, sCs, sXs, sYs),
+        };
+        values[node.Outputs[0]] = DeviceValue.Host(outT);
+    }
+
+    private static Tensor<T> WhereHost<T>(long[] cond, Span<T> x, Span<T> y, int[] outd, int n, int rank,
+        int[] sC, int[] sX, int[] sY) where T : unmanaged
+    {
+        var buf = new T[n == 0 ? 0 : n];
+        var coord = new int[rank];
+        int cOff = 0, xOff = 0, yOff = 0;
+        for (int idx = 0; idx < n; idx++)
+        {
+            buf[idx] = cond[cOff] != 0 ? x[xOff] : y[yOff];
+            for (int ax = rank - 1; ax >= 0; ax--)
+            {
+                coord[ax]++;
+                cOff += sC[ax]; xOff += sX[ax]; yOff += sY[ax];
+                if (coord[ax] < outd[ax]) break;
+                coord[ax] = 0;
+                cOff -= sC[ax] * outd[ax]; xOff -= sX[ax] * outd[ax]; yOff -= sY[ax] * outd[ax];
+            }
+        }
+        return new Tensor<T>(new TensorShape(outd), buf);
+    }
+
+    /// <summary>
+    /// ONNX <c>Expand</c>: broadcast to (broadcast of input shape and) the requested 1-D shape input. Float path
+    /// runs the broadcast as a device gather (host-precomputed per-output source offsets); integer/bool stays
+    /// host-side. Mirrors the CPU <c>ExpandKernel</c>.
+    /// </summary>
+    private void RunExpand(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        DeviceValue src = values[node.Inputs[0]];
+        long[] requested = ReadInts(values, node.Inputs[1]);
+        var reqDims = new int[requested.Length];
+        for (int i = 0; i < requested.Length; i++) reqDims[i] = (int)requested[i];
+
+        int[] outd = BroadcastShape(src.Shape.Dimensions, reqDims);
+        int rank = outd.Length;
+        int n = 1; foreach (int d in outd) n *= d;
+        int[] stride = BroadcastStrides(src.Shape.Dimensions, rank);
+
+        // Per-output-element source offset (element units).
+        var srcOff = new int[n == 0 ? 1 : n];
+        var coord = new int[rank];
+        int off = 0;
+        for (int idx = 0; idx < n; idx++)
+        {
+            srcOff[idx] = off;
+            for (int ax = rank - 1; ax >= 0; ax--)
+            {
+                coord[ax]++;
+                off += stride[ax];
+                if (coord[ax] < outd[ax]) break;
+                coord[ax] = 0;
+                off -= stride[ax] * outd[ax];
+            }
+        }
+
+        if (!src.IsFloat)
+        {
+            values[node.Outputs[0]] = DeviceValue.Host(HostGatherFlat(src.HostInt!, outd, srcOff, n));
+            return;
+        }
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(n == 0 ? 1 : n);
+        ArrayView<int> vOff = Upload(srcOff, temps);
+        if (n > 0) _gather(n, src.FloatBuf!.View, y.View, vOff);
+        values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(outd));
+    }
+
+    /// <summary>
+    /// ONNX <c>Split</c> along <c>axis</c> into the node's outputs (sizes from the 2nd input, the <c>split</c>
+    /// attribute, or even division by <c>num_outputs</c>/output count). Float chunks are sliced on the device
+    /// (per-output-element source offset via the Gather kernel); integer/bool chunks host-side. Mirrors the CPU
+    /// <c>SplitKernel</c>.
+    /// </summary>
+    private void RunSplit(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        DeviceValue src = values[node.Inputs[0]];
+        ReadOnlySpan<int> dims = src.Shape.Dimensions;
+        int rank = dims.Length;
+        long axisAttr = AttrInt(node, "axis", 0);
+        int axis = (int)(axisAttr < 0 ? axisAttr + rank : axisAttr);
+        int axisDim = dims[axis];
+
+        int[] sizes;
+        int[]? splitAttr = node.Attributes.ContainsKey("split") ? AttrInts(node, "split", Array.Empty<int>()) : null;
+        if (node.Inputs.Count > 1 && !string.IsNullOrEmpty(node.Inputs[1]))
+        {
+            long[] sp = ReadInts(values, node.Inputs[1]);
+            sizes = new int[sp.Length];
+            for (int i = 0; i < sp.Length; i++) sizes[i] = (int)sp[i];
+        }
+        else if (splitAttr is not null && splitAttr.Length > 0)
+        {
+            sizes = splitAttr;
+        }
+        else
+        {
+            int no = (int)AttrInt(node, "num_outputs", node.Outputs.Count);
+            if (no <= 0) no = node.Outputs.Count;
+            int chunk = (axisDim + no - 1) / no;
+            sizes = new int[no];
+            int rem = axisDim;
+            for (int i = 0; i < no; i++) { int c = Math.Min(chunk, Math.Max(0, rem)); sizes[i] = c; rem -= c; }
+        }
+
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= dims[i];
+        int inner = 1; for (int i = axis + 1; i < rank; i++) inner *= dims[i];
+
+        int offset = 0;
+        for (int p = 0; p < sizes.Length; p++)
+        {
+            int sz = sizes[p];
+            int[] outDims = dims.ToArray();
+            outDims[axis] = sz;
+            int block = sz * inner;
+            int total = outer * block;
+
+            if (!src.IsFloat)
+            {
+                // Host-side block copy mirroring the CPU SplitKernel.
+                var srcOffH = new int[total == 0 ? 1 : total];
+                int posH = 0;
+                for (int o = 0; o < outer; o++)
+                {
+                    int srcBase = (o * axisDim + offset) * inner;
+                    for (int e = 0; e < block; e++) srcOffH[posH++] = srcBase + e;
+                }
+                values[node.Outputs[p]] = DeviceValue.Host(HostGatherFlat(src.HostInt!, outDims, srcOffH, total));
+                offset += sz;
+                continue;
+            }
+
+            var srcOff = new int[total == 0 ? 1 : total];
+            int pos = 0;
+            for (int o = 0; o < outer; o++)
+            {
+                int srcBase = (o * axisDim + offset) * inner;
+                for (int e = 0; e < block; e++) srcOff[pos++] = srcBase + e;
+            }
+            MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(total == 0 ? 1 : total);
+            ArrayView<int> vOff = Upload(srcOff, temps);
+            if (total > 0) _gather(total, src.FloatBuf!.View, y.View, vOff);
+            values[node.Outputs[p]] = DeviceValue.Device(y, new TensorShape(outDims));
+            offset += sz;
+        }
+    }
+
+    /// <summary>
+    /// ONNX <c>Gemm</c>: <c>Y = α·op(A)·op(B) + β·C</c> with optional transpose flags and broadcastable C, all on
+    /// the device. A/B are pre-transposed via the existing Transpose kernel when needed, then multiplied with the
+    /// MatMul kernel; α/β scaling and the C add are applied with elementwise kernels. Mirrors the CPU <c>GemmKernel</c>.
+    /// </summary>
+    private void RunGemm(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> a = FloatBuf(values, node.Inputs[0]);
+        MemoryBuffer1D<float, Stride1D.Dense> b = FloatBuf(values, node.Inputs[1]);
+        TensorShape sa = values[node.Inputs[0]].Shape;
+        TensorShape sb = values[node.Inputs[1]].Shape;
+        float alpha = AttrFloat(node, "alpha", 1f);
+        float beta = AttrFloat(node, "beta", 1f);
+        bool transA = AttrInt(node, "transA", 0) != 0;
+        bool transB = AttrInt(node, "transB", 0) != 0;
+
+        int M = transA ? sa[1] : sa[0];
+        int K = transA ? sa[0] : sa[1];
+        int Kb = transB ? sb[1] : sb[0];
+        int N = transB ? sb[0] : sb[1];
+        if (K != Kb) throw new ModelSharpException($"Gemm inner dimensions disagree: {K} vs {Kb}.");
+
+        ArrayView<float> aView = transA ? Transpose2D(a, sa[0], sa[1], temps) : a.View;
+        ArrayView<float> bView = transB ? Transpose2D(b, sb[0], sb[1], temps) : b.View;
+
+        // A·B via the batched MatMul kernel with a single (trivial) batch.
+        int total = M * N;
+        MemoryBuffer1D<float, Stride1D.Dense> ab = _accelerator.Allocate1D<float>(total);
+        ArrayView<int> vAOff = Upload(new[] { 0 }, temps);
+        ArrayView<int> vBOff = Upload(new[] { 0 }, temps);
+        _matmul(total, aView, bView, ab.View, vAOff, vBOff, M, K, N);
+
+        // y = alpha*ab (+ beta*C, broadcast). Fold alpha/beta and the optional C with one Where-free pass:
+        // scale ab by alpha, then add beta*C broadcast. Done with small device buffers for the scalars.
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(total);
+        MemoryBuffer1D<float, Stride1D.Dense> alphaBuf = _accelerator.Allocate1D(new[] { alpha });
+        temps.Add(alphaBuf);
+        // y = ab * alpha  (broadcast scalar)
+        {
+            int[] outStrides = Strides(new[] { M, N });
+            int[] sA = BroadcastStrides(new[] { M, N }, 2);
+            int[] sB = BroadcastStrides(Array.Empty<int>(), 2);
+            ArrayView<int> vOut = Upload(outStrides, temps);
+            ArrayView<int> vAs = Upload(sA, temps);
+            ArrayView<int> vBs = Upload(sB, temps);
+            _broadcast(total, ab.View, alphaBuf.View, y.View, vOut, vAs, vBs, 2, GpuKernels.OpMul);
+        }
+
+        bool hasC = node.Inputs.Count > 2 && node.Inputs[2].Length > 0;
+        if (hasC)
+        {
+            MemoryBuffer1D<float, Stride1D.Dense> c = FloatBuf(values, node.Inputs[2]);
+            TensorShape sc = values[node.Inputs[2]].Shape;
+            // betaC = C * beta
+            MemoryBuffer1D<float, Stride1D.Dense> betaC = _accelerator.Allocate1D<float>((int)c.Length);
+            temps.Add(betaC);
+            MemoryBuffer1D<float, Stride1D.Dense> betaBuf = _accelerator.Allocate1D(new[] { beta });
+            temps.Add(betaBuf);
+            {
+                int[] outStrides = Strides(sc.Dimensions);
+                int rankC = sc.Rank;
+                int[] sCc = BroadcastStrides(sc.Dimensions, rankC);
+                int[] sBeta = BroadcastStrides(Array.Empty<int>(), rankC);
+                ArrayView<int> vOut = Upload(outStrides, temps);
+                ArrayView<int> vCc = Upload(sCc, temps);
+                ArrayView<int> vBeta = Upload(sBeta, temps);
+                _broadcast((int)c.Length, c.View, betaBuf.View, betaC.View, vOut, vCc, vBeta, rankC, GpuKernels.OpMul);
+            }
+            // y = y + betaC (broadcast betaC over [M,N])
+            MemoryBuffer1D<float, Stride1D.Dense> y2 = _accelerator.Allocate1D<float>(total);
+            int[] outStridesY = Strides(new[] { M, N });
+            int[] sYstr = BroadcastStrides(new[] { M, N }, 2);
+            int[] sCstr = BroadcastStrides(sc.Dimensions, 2);
+            ArrayView<int> vOutY = Upload(outStridesY, temps);
+            ArrayView<int> vYs = Upload(sYstr, temps);
+            ArrayView<int> vCs = Upload(sCstr, temps);
+            _broadcast(total, y.View, betaC.View, y2.View, vOutY, vYs, vCs, 2, GpuKernels.OpAdd);
+            temps.Add(ab);
+            temps.Add(y);
+            values[node.Outputs[0]] = DeviceValue.Device(y2, new TensorShape(M, N));
+            return;
+        }
+
+        temps.Add(ab);
+        values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(M, N));
+    }
+
+    /// <summary>Transposes a 2-D [r,c] device buffer to [c,r] via the Transpose kernel; returns a temp view.</summary>
+    private ArrayView<float> Transpose2D(MemoryBuffer1D<float, Stride1D.Dense> x, int r, int c, List<MemoryBuffer> temps)
+    {
+        int[] inStrides = Strides(new[] { r, c });
+        int[] outDims = { c, r };
+        int[] srcStrides = { inStrides[1], inStrides[0] };
+        int[] outStrides = Strides(outDims);
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(r * c);
+        temps.Add(y);
+        ArrayView<int> vOut = Upload(outStrides, temps);
+        ArrayView<int> vSrc = Upload(srcStrides, temps);
+        _transpose(r * c, x.View, y.View, vOut, vSrc, 2);
+        return y.View;
+    }
+
     /// <summary>Uploads a host int array to the accelerator, tracking the buffer for disposal, and returns its view.</summary>
     private ArrayView<int> Upload(int[] data, List<MemoryBuffer> temps)
     {
@@ -1193,6 +1733,137 @@ public sealed class IlgpuEngine : IExecutionEngine
             long l => new[] { (int)l },
             _ => dflt,
         };
+    }
+
+    // --- B5: on-device KV-cache + stateful attention decode seam ---
+
+    /// <summary>
+    /// Allocates a device-resident key/value cache for an autoregressive decoder with <paramref name="numHeads"/>
+    /// heads of dimension <paramref name="headDim"/>, holding up to <paramref name="maxSeq"/> past tokens. The K
+    /// and V buffers live on this engine's accelerator and persist across <see cref="DecodeStepAttention"/> calls
+    /// so multi-step attention reads the past K/V from GPU memory with no host round-trip. Dispose the cache when
+    /// the sequence is finished (or call <see cref="GpuKvCache.Reset"/> to reuse it for a new sequence).
+    /// </summary>
+    public GpuKvCache CreateKvCache(int numHeads, int maxSeq, int headDim)
+    {
+        var kBuf = _accelerator.Allocate1D<float>((long)numHeads * maxSeq * headDim);
+        var vBuf = _accelerator.Allocate1D<float>((long)numHeads * maxSeq * headDim);
+        return new GpuKvCache(kBuf, vBuf, numHeads, maxSeq, headDim);
+    }
+
+    /// <summary>
+    /// One autoregressive attention decode step, run entirely on the GPU against a persistent on-device KV-cache.
+    /// Appends the step's per-head key/value (<paramref name="stepK"/>/<paramref name="stepV"/>, each
+    /// <c>[numHeads, stepLen, headDim]</c>) to <paramref name="cache"/> at its current sequence offset (a device→
+    /// device copy, no realloc, no host copy), then computes scaled-dot-product attention of the step's query
+    /// (<paramref name="stepQ"/>, <c>[numHeads, stepLen, headDim]</c>) against the <em>entire</em> cached
+    /// key/value sequence and returns the context <c>[numHeads, stepLen, headDim]</c>. The softmax scale defaults
+    /// to <c>1/√headDim</c>. All intermediates (scores, softmax, context) stay on the device; only the final
+    /// context is downloaded. Mirrors a single transformer self-attention block so results match the CPU engine.
+    /// </summary>
+    public Tensor<float> DecodeStepAttention(
+        GpuKvCache cache,
+        Tensor<float> stepQ,
+        Tensor<float> stepK,
+        Tensor<float> stepV,
+        float? scale = null)
+    {
+        if (cache.NumHeads != stepQ.Shape[0])
+            throw new ModelSharpException($"KV-cache head count {cache.NumHeads} != query heads {stepQ.Shape[0]}.");
+        int H = cache.NumHeads, D = cache.HeadDim;
+        int stepLen = stepK.Shape[1];
+        if (cache.SeqLen + stepLen > cache.MaxSeq)
+            throw new ModelSharpException($"KV-cache overflow: {cache.SeqLen}+{stepLen} > maxSeq {cache.MaxSeq}.");
+        float invScale = scale ?? (1f / MathF.Sqrt(D));
+
+        // Upload the step's Q/K/V to the device.
+        using MemoryBuffer1D<float, Stride1D.Dense> qBuf = _accelerator.Allocate1D(stepQ.Span.ToArray());
+        using MemoryBuffer1D<float, Stride1D.Dense> kStep = _accelerator.Allocate1D(stepK.Span.ToArray());
+        using MemoryBuffer1D<float, Stride1D.Dense> vStep = _accelerator.Allocate1D(stepV.Span.ToArray());
+
+        // Append K/V into the persistent cache at [head, seqLen .. seqLen+stepLen) — device→device, per head
+        // (the cache is laid out [H, maxSeq, D] so each head's region is contiguous).
+        int prev = cache.SeqLen;
+        for (int h = 0; h < H; h++)
+        {
+            long dstK = (long)h * cache.MaxSeq * D + (long)prev * D;
+            long dstV = dstK;
+            long src = (long)h * stepLen * D;
+            long len = (long)stepLen * D;
+            kStep.View.SubView(src, len).CopyTo(_accelerator.DefaultStream, cache.KBuffer.View.SubView(dstK, len));
+            vStep.View.SubView(src, len).CopyTo(_accelerator.DefaultStream, cache.VBuffer.View.SubView(dstV, len));
+        }
+        int total = prev + stepLen;
+        cache.SeqLen = total;
+
+        // scores[h, i, j] = sum_d q[h,i,d] * K[h,j,d] * invScale, for j in [0,total).
+        // Compute per head with the batched MatMul kernel: q_h [stepLen,D] · kᵀ_h [D,total].
+        // We assemble a contiguous Kᵀ per head on the device via Transpose, then MatMul, Softmax, MatMul with V.
+        var ctxHost = new float[(long)H * stepLen * D];
+        var temps = new List<MemoryBuffer>();
+        try
+        {
+            for (int h = 0; h < H; h++)
+            {
+                // Views into the cache for this head: K_h, V_h are [total, D] (contiguous prefix of [maxSeq,D]).
+                ArrayView<float> kH = cache.KBuffer.View.SubView((long)h * cache.MaxSeq * D, (long)total * D);
+                ArrayView<float> vH = cache.VBuffer.View.SubView((long)h * cache.MaxSeq * D, (long)total * D);
+                ArrayView<float> qH = qBuf.View.SubView((long)h * stepLen * D, (long)stepLen * D);
+
+                // Kᵀ_h : [D, total] via Transpose kernel (perm [1,0] over [total, D]).
+                MemoryBuffer1D<float, Stride1D.Dense> ktBuf = _accelerator.Allocate1D<float>((long)D * total);
+                temps.Add(ktBuf);
+                {
+                    int[] inStrides = Strides(new[] { total, D });
+                    int[] outStrides = Strides(new[] { D, total });
+                    int[] srcStrides = { inStrides[1], inStrides[0] };
+                    ArrayView<int> vOut = Upload(outStrides, temps);
+                    ArrayView<int> vSrc = Upload(srcStrides, temps);
+                    _transpose(D * total, kH, ktBuf.View, vOut, vSrc, 2);
+                }
+
+                // scores = q_h [stepLen,D] · Kᵀ_h [D,total]  -> [stepLen, total]
+                MemoryBuffer1D<float, Stride1D.Dense> scores = _accelerator.Allocate1D<float>((long)stepLen * total);
+                temps.Add(scores);
+                ArrayView<int> z0 = Upload(new[] { 0 }, temps);
+                _matmul(stepLen * total, qH, ktBuf.View, scores.View, z0, z0, stepLen, D, total);
+
+                // scaled = scores * invScale  (in place via a scalar-broadcast Mul)
+                MemoryBuffer1D<float, Stride1D.Dense> scaled = _accelerator.Allocate1D<float>((long)stepLen * total);
+                temps.Add(scaled);
+                MemoryBuffer1D<float, Stride1D.Dense> scaleBuf = _accelerator.Allocate1D(new[] { invScale });
+                temps.Add(scaleBuf);
+                {
+                    int[] outStrides = Strides(new[] { stepLen, total });
+                    int[] sA = BroadcastStrides(new[] { stepLen, total }, 2);
+                    int[] sB = BroadcastStrides(Array.Empty<int>(), 2);
+                    ArrayView<int> vOut = Upload(outStrides, temps);
+                    ArrayView<int> vA = Upload(sA, temps);
+                    ArrayView<int> vB = Upload(sB, temps);
+                    _broadcast(stepLen * total, scores.View, scaleBuf.View, scaled.View, vOut, vA, vB, 2, GpuKernels.OpMul);
+                }
+
+                // attn = softmax(scaled) over the last axis (total).
+                MemoryBuffer1D<float, Stride1D.Dense> attn = _accelerator.Allocate1D<float>((long)stepLen * total);
+                temps.Add(attn);
+                _softmax(stepLen /* outer*inner with inner=1 */, scaled.View, attn.View, total, 1);
+
+                // ctx_h = attn [stepLen,total] · V_h [total, D] -> [stepLen, D]
+                MemoryBuffer1D<float, Stride1D.Dense> ctx = _accelerator.Allocate1D<float>((long)stepLen * D);
+                temps.Add(ctx);
+                _matmul(stepLen * D, attn.View, vH, ctx.View, z0, z0, stepLen, total, D);
+
+                _accelerator.Synchronize();
+                float[] ctxArr = ctx.GetAsArray1D();
+                Array.Copy(ctxArr, 0, ctxHost, (long)h * stepLen * D, (long)stepLen * D);
+            }
+        }
+        finally
+        {
+            foreach (MemoryBuffer b in temps) b.Dispose();
+        }
+
+        return new Tensor<float>(new TensorShape(H, stepLen, D), ctxHost);
     }
 
     /// <inheritdoc />
