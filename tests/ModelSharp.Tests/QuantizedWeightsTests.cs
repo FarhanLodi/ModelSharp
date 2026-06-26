@@ -157,7 +157,7 @@ public class QuantizedWeightsTests
     public void DequantizeGptq_Two_Groups_Use_Distinct_Scales()
     {
         // in_features = 16, out_features = 1, group_size = 8 -> 2 groups.
-        int inFeatures = 16, outFeatures = 1, groupSize = 8;
+        int inFeatures = 16, groupSize = 8; // out_features = 1
         int[] rows = { 3, 3, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5 };
         int w0 = Pack4(new ReadOnlySpan<int>(rows, 0, 8), Natural8);
         int w1 = Pack4(new ReadOnlySpan<int>(rows, 8, 8), Natural8);
