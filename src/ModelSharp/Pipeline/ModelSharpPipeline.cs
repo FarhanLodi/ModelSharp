@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using ModelSharp.Cpu;
+using ModelSharp.Generation;
 using ModelSharp.Graph;
 using ModelSharp.Manifest;
 using ModelSharp.Onnx;
@@ -45,8 +46,19 @@ public static class ModelSharpPipeline
         var engine = new ManagedCpuEngine(graph);
         List<string> inputNames = engine.Inputs.Select(i => i.Name).ToList();
         List<string> outputNames = engine.Outputs.Select(o => o.Name).ToList();
-
         var ctx = new ProcessorContext(manifest, inputNames, outputNames);
+
+        // Text generation is autoregressive: it does not fit the single-shot pre/post path, so we
+        // special-case it here (before ProcessorRegistry resolution) and wire a TextGenerator +
+        // BPE tokenizer into the generation-flavoured Pipeline constructor. This keeps the registry
+        // free of a TextGeneration entry — Generate / GenerateStream are the entry points, not Run<T>.
+        if (manifest.Task == ModelTask.TextGeneration)
+        {
+            var generation = new TextGenerationProcessor(ctx);
+            TextGenerator generator = generation.CreateGenerator(engine);
+            return new Pipeline(engine, manifest, generator, generation);
+        }
+
         IPreprocessor pre = ProcessorRegistry.CreatePreprocessor(ctx);
         IPostprocessor post = ProcessorRegistry.CreatePostprocessor(ctx);
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using ModelSharp.Cpu.Kernels;
 using ModelSharp.Cpu.Kernels.Activations;
+using ModelSharp.Cpu.Kernels.Logical;
 using ModelSharp.Cpu.Kernels.MathOps;
 using ModelSharp.Cpu.Kernels.Nn;
 using ModelSharp.Cpu.Kernels.Reduction;
@@ -37,6 +38,9 @@ public class NewOpsTests
 
     private static Tensor<int> I32(int[] dims, params int[] data) =>
         Tensor<int>.FromArray(new TensorShape(dims), data);
+
+    private static Tensor<bool> B(int[] dims, params bool[] data) =>
+        Tensor<bool>.FromArray(new TensorShape(dims), data);
 
     private static GraphNode Node(string op, string[] ins, string[] outs,
         Dictionary<string, object>? attrs = null) => new(op, "n", ins, outs, attrs);
@@ -618,5 +622,281 @@ public class NewOpsTests
         new TileKernel().Execute(Node("Tile", new[] { "x", "r" }, new[] { "y" }), ti);
         Assert.Equal(ElementType.Int32, ti.GetTensor("y").Dtype);
         Assert.Equal(new[] { 1, 2, 1, 2 }, ti.GetTensor("y").AsInt32().Span.ToArray());
+    }
+
+    // ---- Phase D: previously-untested existing ops ----------------------------------------------
+
+    [Fact]
+    public void Tan_Elementwise()
+    {
+        var ctx = Ctx(("x", F(new[] { 4 }, 0f, 0.5f, 1f, -1f)));
+        new TanKernel().Execute(Node("Tan", new[] { "x" }, new[] { "y" }), ctx);
+        Close(new[] { MathF.Tan(0f), MathF.Tan(0.5f), MathF.Tan(1f), MathF.Tan(-1f) },
+            ctx.Get("y").Span.ToArray(), 1e-5f);
+    }
+
+    [Fact]
+    public void ReduceSumSquare_Axis_Keepdims()
+    {
+        // x = [[1,2,3],[4,5,6]]. Sum of squares over axis 1:
+        //   row0 = 1+4+9 = 14, row1 = 16+25+36 = 77.
+        Tensor<float> x = F(new[] { 2, 3 }, 1, 2, 3, 4, 5, 6);
+
+        Tensor<float> flat = Reduce(new ReduceSumSquareKernel(), x, new long[] { 1 }, 0);
+        Assert.Equal(new[] { 2 }, flat.Shape.Dimensions.ToArray());
+        Assert.Equal(new[] { 14f, 77f }, flat.Span.ToArray());
+
+        Tensor<float> kept = Reduce(new ReduceSumSquareKernel(), x, new long[] { 1 }, 1);
+        Assert.Equal(new[] { 2, 1 }, kept.Shape.Dimensions.ToArray());
+        Assert.Equal(new[] { 14f, 77f }, kept.Span.ToArray());
+
+        // Over axis 0: col sums of squares = 1+16, 4+25, 9+36 = 17, 29, 45.
+        Tensor<float> ax0 = Reduce(new ReduceSumSquareKernel(), x, new long[] { 0 }, 0);
+        Assert.Equal(new[] { 17f, 29f, 45f }, ax0.Span.ToArray());
+    }
+
+    // ---- new elementwise unary math (trig / hyperbolic) ----------------------------------------
+
+    [Fact]
+    public void Asin_Acos_Atan()
+    {
+        var s = Ctx(("x", F(new[] { 3 }, 0f, 0.5f, 1f)));
+        new AsinKernel().Execute(Node("Asin", new[] { "x" }, new[] { "y" }), s);
+        Close(new[] { MathF.Asin(0f), MathF.Asin(0.5f), MathF.Asin(1f) }, s.Get("y").Span.ToArray(), 1e-5f);
+
+        var c = Ctx(("x", F(new[] { 3 }, 0f, 0.5f, 1f)));
+        new AcosKernel().Execute(Node("Acos", new[] { "x" }, new[] { "y" }), c);
+        Close(new[] { MathF.Acos(0f), MathF.Acos(0.5f), MathF.Acos(1f) }, c.Get("y").Span.ToArray(), 1e-5f);
+
+        var t = Ctx(("x", F(new[] { 3 }, -1f, 0f, 2f)));
+        new AtanKernel().Execute(Node("Atan", new[] { "x" }, new[] { "y" }), t);
+        Close(new[] { MathF.Atan(-1f), MathF.Atan(0f), MathF.Atan(2f) }, t.Get("y").Span.ToArray(), 1e-5f);
+    }
+
+    [Fact]
+    public void Sinh_Cosh_Asinh_Acosh_Atanh()
+    {
+        var sh = Ctx(("x", F(new[] { 3 }, -1f, 0f, 1f)));
+        new SinhKernel().Execute(Node("Sinh", new[] { "x" }, new[] { "y" }), sh);
+        Close(new[] { MathF.Sinh(-1f), 0f, MathF.Sinh(1f) }, sh.Get("y").Span.ToArray(), 1e-5f);
+
+        var ch = Ctx(("x", F(new[] { 2 }, 0f, 1f)));
+        new CoshKernel().Execute(Node("Cosh", new[] { "x" }, new[] { "y" }), ch);
+        Close(new[] { 1f, MathF.Cosh(1f) }, ch.Get("y").Span.ToArray(), 1e-5f);
+
+        var ash = Ctx(("x", F(new[] { 2 }, 0f, 2f)));
+        new AsinhKernel().Execute(Node("Asinh", new[] { "x" }, new[] { "y" }), ash);
+        Close(new[] { 0f, MathF.Asinh(2f) }, ash.Get("y").Span.ToArray(), 1e-5f);
+
+        var ach = Ctx(("x", F(new[] { 2 }, 1f, 3f)));
+        new AcoshKernel().Execute(Node("Acosh", new[] { "x" }, new[] { "y" }), ach);
+        Close(new[] { 0f, MathF.Acosh(3f) }, ach.Get("y").Span.ToArray(), 1e-5f);
+
+        var ath = Ctx(("x", F(new[] { 2 }, 0f, 0.5f)));
+        new AtanhKernel().Execute(Node("Atanh", new[] { "x" }, new[] { "y" }), ath);
+        Close(new[] { 0f, MathF.Atanh(0.5f) }, ath.Get("y").Span.ToArray(), 1e-5f);
+    }
+
+    // ---- logical binary (bool input, bool output, broadcasting) --------------------------------
+
+    [Fact]
+    public void Not_And_Or_Xor()
+    {
+        var n = Ctx(("x", B(new[] { 3 }, true, false, true)));
+        new NotKernel().Execute(Node("Not", new[] { "x" }, new[] { "y" }), n);
+        Assert.Equal(new[] { false, true, false }, n.GetTensor("y").AsBool().Span.ToArray());
+
+        Tensor<bool> A() => B(new[] { 4 }, true, true, false, false);
+        Tensor<bool> Bb() => B(new[] { 4 }, true, false, true, false);
+
+        var and = Ctx(("a", A()), ("b", Bb()));
+        new AndKernel().Execute(Node("And", new[] { "a", "b" }, new[] { "y" }), and);
+        Assert.Equal(new[] { true, false, false, false }, and.GetTensor("y").AsBool().Span.ToArray());
+
+        var or = Ctx(("a", A()), ("b", Bb()));
+        new OrKernel().Execute(Node("Or", new[] { "a", "b" }, new[] { "y" }), or);
+        Assert.Equal(new[] { true, true, true, false }, or.GetTensor("y").AsBool().Span.ToArray());
+
+        var xor = Ctx(("a", A()), ("b", Bb()));
+        new XorKernel().Execute(Node("Xor", new[] { "a", "b" }, new[] { "y" }), xor);
+        Assert.Equal(new[] { false, true, true, false }, xor.GetTensor("y").AsBool().Span.ToArray());
+    }
+
+    [Fact]
+    public void And_Broadcasts()
+    {
+        // a: [2,1], b: [1,2] -> [2,2].
+        var ctx = Ctx(("a", B(new[] { 2, 1 }, true, false)), ("b", B(new[] { 1, 2 }, true, false)));
+        new AndKernel().Execute(Node("And", new[] { "a", "b" }, new[] { "y" }), ctx);
+        Assert.Equal(new[] { 2, 2 }, ctx.GetTensor("y").Shape.Dimensions.ToArray());
+        // row0 (a=true):  [true&true, true&false]  = [true, false]
+        // row1 (a=false): [false&true, false&false] = [false, false]
+        Assert.Equal(new[] { true, false, false, false }, ctx.GetTensor("y").AsBool().Span.ToArray());
+    }
+
+    // ---- order comparisons (numeric input, bool output, broadcasting) --------------------------
+
+    [Fact]
+    public void GreaterOrEqual_LessOrEqual()
+    {
+        var ge = Ctx(("a", F(new[] { 4 }, 1, 2, 3, 4)), ("b", F(new[] { 4 }, 2, 2, 1, 5)));
+        new GreaterOrEqualKernel().Execute(Node("GreaterOrEqual", new[] { "a", "b" }, new[] { "y" }), ge);
+        Assert.Equal(new[] { false, true, true, false }, ge.GetTensor("y").AsBool().Span.ToArray());
+
+        var le = Ctx(("a", F(new[] { 4 }, 1, 2, 3, 4)), ("b", F(new[] { 4 }, 2, 2, 1, 5)));
+        new LessOrEqualKernel().Execute(Node("LessOrEqual", new[] { "a", "b" }, new[] { "y" }), le);
+        Assert.Equal(new[] { true, true, false, true }, le.GetTensor("y").AsBool().Span.ToArray());
+    }
+
+    [Fact]
+    public void GreaterOrEqual_Broadcasts_Int64()
+    {
+        // a: [3], b: scalar [1] -> [3].
+        var ctx = Ctx(("a", I64(new[] { 3 }, 1, 3, 5)), ("b", I64(new[] { 1 }, 3)));
+        new GreaterOrEqualKernel().Execute(Node("GreaterOrEqual", new[] { "a", "b" }, new[] { "y" }), ctx);
+        Assert.Equal(new[] { false, true, true }, ctx.GetTensor("y").AsBool().Span.ToArray());
+    }
+
+    // ---- numeric predicates --------------------------------------------------------------------
+
+    [Fact]
+    public void IsNaN_IsInf()
+    {
+        var nan = Ctx(("x", F(new[] { 4 }, 0f, float.NaN, 1f, float.PositiveInfinity)));
+        new IsNaNKernel().Execute(Node("IsNaN", new[] { "x" }, new[] { "y" }), nan);
+        Assert.Equal(new[] { false, true, false, false }, nan.GetTensor("y").AsBool().Span.ToArray());
+
+        var inf = Ctx(("x", F(new[] { 4 }, 0f, float.NaN, float.PositiveInfinity, float.NegativeInfinity)));
+        new IsInfKernel().Execute(Node("IsInf", new[] { "x" }, new[] { "y" }), inf);
+        Assert.Equal(new[] { false, false, true, true }, inf.GetTensor("y").AsBool().Span.ToArray());
+    }
+
+    // ---- new activations -----------------------------------------------------------------------
+
+    [Fact]
+    public void HardSwish_ThresholdedRelu()
+    {
+        // HardSwish: x * relu6(x+3) / 6.
+        //   x=-4 -> relu6(-1)=0 -> 0
+        //   x=-3 -> relu6(0)=0  -> 0
+        //   x=0  -> relu6(3)=3  -> 0
+        //   x=1  -> relu6(4)=4  -> 4/6
+        //   x=4  -> relu6(7)=6  -> 4*6/6 = 4
+        var hsw = Ctx(("x", F(new[] { 5 }, -4f, -3f, 0f, 1f, 4f)));
+        new HardSwishKernel().Execute(Node("HardSwish", new[] { "x" }, new[] { "y" }), hsw);
+        Close(new[] { 0f, 0f, 0f, 4f / 6f, 4f }, hsw.Get("y").Span.ToArray());
+
+        // ThresholdedRelu default alpha=1: x>1 ? x : 0.
+        var tr = Ctx(("x", F(new[] { 4 }, 0.5f, 1f, 1.5f, 3f)));
+        new ThresholdedReluKernel().Execute(Node("ThresholdedRelu", new[] { "x" }, new[] { "y" }), tr);
+        Assert.Equal(new[] { 0f, 0f, 1.5f, 3f }, tr.Get("y").Span.ToArray());
+
+        var tr2 = Ctx(("x", F(new[] { 3 }, 1.5f, 2f, 3f)));
+        new ThresholdedReluKernel().Execute(Node("ThresholdedRelu", new[] { "x" }, new[] { "y" },
+            new Dictionary<string, object> { ["alpha"] = 2f }), tr2);
+        Assert.Equal(new[] { 0f, 0f, 3f }, tr2.Get("y").Span.ToArray());
+    }
+
+    [Fact]
+    public void Celu_Default_And_Alpha()
+    {
+        // Celu alpha=1: max(0,x)+min(0,exp(x)-1).
+        //   x=2  -> 2 + min(0, e^2-1) = 2 + 0 = 2
+        //   x=0  -> 0
+        //   x=-1 -> 0 + min(0, e^-1 - 1) = e^-1 - 1
+        var c = Ctx(("x", F(new[] { 3 }, 2f, 0f, -1f)));
+        new CeluKernel().Execute(Node("Celu", new[] { "x" }, new[] { "y" }), c);
+        Close(new[] { 2f, 0f, MathF.Exp(-1f) - 1f }, c.Get("y").Span.ToArray());
+
+        // alpha=2: x=-2 -> 0 + min(0, 2*(exp(-1)-1)) = 2*(exp(-1)-1).
+        var c2 = Ctx(("x", F(new[] { 2 }, 3f, -2f)));
+        new CeluKernel().Execute(Node("Celu", new[] { "x" }, new[] { "y" },
+            new Dictionary<string, object> { ["alpha"] = 2f }), c2);
+        Close(new[] { 3f, 2f * (MathF.Exp(-1f) - 1f) }, c2.Get("y").Span.ToArray());
+    }
+
+    [Fact]
+    public void Shrink_BiasLambd()
+    {
+        // bias=0.5, lambd=1.5: x>1.5 ? x-0.5 : (x<-1.5 ? x+0.5 : 0).
+        var ctx = Ctx(("x", F(new[] { 5 }, -3f, -1f, 0f, 1f, 2f)));
+        new ShrinkKernel().Execute(Node("Shrink", new[] { "x" }, new[] { "y" },
+            new Dictionary<string, object> { ["bias"] = 0.5f, ["lambd"] = 1.5f }), ctx);
+        Assert.Equal(new[] { -2.5f, 0f, 0f, 0f, 1.5f }, ctx.Get("y").Span.ToArray());
+
+        // Defaults bias=0, lambd=0.5.
+        var def = Ctx(("x", F(new[] { 3 }, -1f, 0.25f, 1f)));
+        new ShrinkKernel().Execute(Node("Shrink", new[] { "x" }, new[] { "y" }), def);
+        Assert.Equal(new[] { -1f, 0f, 1f }, def.Get("y").Span.ToArray());
+    }
+
+    // ---- shape / data: Size, NonZero -----------------------------------------------------------
+
+    [Fact]
+    public void Size_Scalar_Int64()
+    {
+        var ctx = Ctx(("x", F(new[] { 2, 3 }, 1, 2, 3, 4, 5, 6)));
+        new SizeKernel().Execute(Node("Size", new[] { "x" }, new[] { "y" }), ctx);
+        Tensor sz = ctx.GetTensor("y");
+        Assert.Equal(ElementType.Int64, sz.Dtype);
+        Assert.Equal(0, sz.Shape.Rank);
+        Assert.Equal(new long[] { 6 }, sz.AsInt64().Span.ToArray());
+    }
+
+    [Fact]
+    public void NonZero_2D_OnnxLayout()
+    {
+        // x = [[0,1],[2,0]]. Nonzero (row-major): (0,1) and (1,0).
+        // ONNX layout [rank, nnz] = [[row indices],[col indices]] = [[0,1],[1,0]].
+        var ctx = Ctx(("x", F(new[] { 2, 2 }, 0, 1, 2, 0)));
+        new NonZeroKernel().Execute(Node("NonZero", new[] { "x" }, new[] { "y" }), ctx);
+        Tensor nz = ctx.GetTensor("y");
+        Assert.Equal(new[] { 2, 2 }, nz.Shape.Dimensions.ToArray());
+        Assert.Equal(new long[] { 0, 1, 1, 0 }, nz.AsInt64().Span.ToArray());
+    }
+
+    [Fact]
+    public void NonZero_1D_Bool()
+    {
+        var ctx = Ctx(("x", B(new[] { 4 }, false, true, false, true)));
+        new NonZeroKernel().Execute(Node("NonZero", new[] { "x" }, new[] { "y" }), ctx);
+        Tensor nz = ctx.GetTensor("y");
+        Assert.Equal(new[] { 1, 2 }, nz.Shape.Dimensions.ToArray());
+        Assert.Equal(new long[] { 1, 3 }, nz.AsInt64().Span.ToArray());
+    }
+
+    // ---- new reductions: ReduceLogSum, ReduceLogSumExp -----------------------------------------
+
+    [Fact]
+    public void ReduceLogSum_Axis_Keepdims()
+    {
+        // x=[[1,2,3],[4,5,6]]. log(sum over axis1): log(6), log(15).
+        Tensor<float> x = F(new[] { 2, 3 }, 1, 2, 3, 4, 5, 6);
+
+        Tensor<float> flat = Reduce(new ReduceLogSumKernel(), x, new long[] { 1 }, 0);
+        Assert.Equal(new[] { 2 }, flat.Shape.Dimensions.ToArray());
+        Close(new[] { MathF.Log(6f), MathF.Log(15f) }, flat.Span.ToArray());
+
+        Tensor<float> kept = Reduce(new ReduceLogSumKernel(), x, new long[] { 1 }, 1);
+        Assert.Equal(new[] { 2, 1 }, kept.Shape.Dimensions.ToArray());
+        Close(new[] { MathF.Log(6f), MathF.Log(15f) }, kept.Span.ToArray());
+    }
+
+    [Fact]
+    public void ReduceLogSumExp_Axis_Keepdims()
+    {
+        // x=[[1,2,3],[4,5,6]]. log(sum(exp)) over axis1.
+        Tensor<float> x = F(new[] { 2, 3 }, 1, 2, 3, 4, 5, 6);
+
+        float row0 = MathF.Log(MathF.Exp(1f) + MathF.Exp(2f) + MathF.Exp(3f));
+        float row1 = MathF.Log(MathF.Exp(4f) + MathF.Exp(5f) + MathF.Exp(6f));
+
+        Tensor<float> flat = Reduce(new ReduceLogSumExpKernel(), x, new long[] { 1 }, 0);
+        Assert.Equal(new[] { 2 }, flat.Shape.Dimensions.ToArray());
+        Close(new[] { row0, row1 }, flat.Span.ToArray(), 1e-4f);
+
+        Tensor<float> kept = Reduce(new ReduceLogSumExpKernel(), x, new long[] { 1 }, 1);
+        Assert.Equal(new[] { 2, 1 }, kept.Shape.Dimensions.ToArray());
+        Close(new[] { row0, row1 }, kept.Span.ToArray(), 1e-4f);
     }
 }

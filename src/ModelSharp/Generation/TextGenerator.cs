@@ -32,6 +32,7 @@ public sealed class TextGenerator
     private readonly TensorInfo? _inputIdsInfo;
     private readonly TensorInfo? _attentionMaskInfo;
     private readonly TensorInfo? _positionIdsInfo;
+    private readonly TensorInfo? _useCacheBranchInfo;
 
     /// <summary>Creates a generator over the supplied engine.</summary>
     /// <param name="engine">The decoder execution engine to drive.</param>
@@ -47,6 +48,7 @@ public sealed class TextGenerator
         _inputIdsInfo = FindInput(_options.InputIdsName);
         _attentionMaskInfo = FindInput(_options.AttentionMaskName);
         _positionIdsInfo = FindInput(_options.PositionIdsName);
+        _useCacheBranchInfo = FindInput(_options.UseCacheBranchName);
 
         if (_inputIdsInfo is null)
             throw new ModelSharpException(
@@ -62,6 +64,12 @@ public sealed class TextGenerator
 
     /// <summary>Whether the model declares a position-ids input that this generator will feed.</summary>
     public bool FeedsPositionIds => _positionIdsInfo is not null;
+
+    /// <summary>
+    /// Whether the model declares a <c>use_cache_branch</c> input (Optimum "merged" decoder export)
+    /// that this generator will feed: <c>false</c> on the prefill pass, <c>true</c> on cached steps.
+    /// </summary>
+    public bool FeedsUseCacheBranch => _useCacheBranchInfo is not null;
 
     /// <summary>
     /// Generates tokens for a prompt and returns the result eagerly.
@@ -177,6 +185,16 @@ public sealed class TextGenerator
                 _options.PositionIdsName, BuildIntTensor(_positionIdsInfo, new TensorShape(1, chunkLength), positions));
         }
 
+        // use_cache_branch (Optimum "merged" exports): false selects the no-past branch on the first
+        // pass, true selects the with-past branch on every subsequent cached step. The empty past
+        // tensors are still fed on the first pass below so the graph's input bindings all exist.
+        if (_useCacheBranchInfo is not null)
+        {
+            bool useCache = past is not null;
+            feeds[_options.UseCacheBranchName] = new NamedTensor(
+                _options.UseCacheBranchName, BuildBoolTensor(_useCacheBranchInfo, useCache));
+        }
+
         // past_key_values: empty on the first pass, otherwise the previous present.* outputs.
         if (cache)
         {
@@ -281,6 +299,25 @@ public sealed class TextGenerator
             return new Tensor<int>(shape, buffer);
         }
         return new Tensor<long>(shape, values);
+    }
+
+    /// <summary>
+    /// Builds the single-element <c>use_cache_branch</c> feed (shape <c>[1]</c>). The HF/Optimum
+    /// convention declares it as <see cref="ElementType.Boolean"/>; an engine that instead declares
+    /// it as Int32/Int64 receives <c>1</c>/<c>0</c> in that dtype (mirrors the int dtype-adaptation).
+    /// </summary>
+    private static Tensor BuildBoolTensor(TensorInfo info, bool value)
+    {
+        var shape = new TensorShape(1);
+        switch (info.ElementType)
+        {
+            case ElementType.Int32:
+                return new Tensor<int>(shape, new[] { value ? 1 : 0 });
+            case ElementType.Int64:
+                return new Tensor<long>(shape, new long[] { value ? 1L : 0L });
+            default:
+                return new Tensor<bool>(shape, new[] { value });
+        }
     }
 
     /// <summary>
