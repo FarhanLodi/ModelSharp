@@ -38,8 +38,10 @@ public enum DetectionLayout
 /// <para>
 /// Tunables come from <see cref="ModelManifest.Extra"/> (parsed with invariant culture):
 /// <c>"det_layout"</c>/<c>"layout"</c> (<c>A</c>|<c>B</c>|<c>yolov5</c>|<c>yolov7</c>|<c>yolov8</c>),
-/// <c>"iou"</c> (default 0.45), <c>"score_threshold"</c> (default 0.25) and <c>"max_det"</c> (default 300).
+/// <c>"iou"</c>/<c>"iou_threshold"</c> (default 0.45),
+/// <c>"score_threshold"</c>/<c>"conf_threshold"</c> (default 0.25) and <c>"max_det"</c> (default 300).
 /// Explicit constructor arguments win over <c>Extra</c>, which wins over the defaults.
+/// An explicit but unrecognized <c>det_layout</c> value is a configuration error and throws.
 /// </para>
 /// <para>
 /// Boxes are returned in the model's own coordinate space (input pixels or normalized);
@@ -75,11 +77,11 @@ public sealed class DetectionPostprocessor : IPostprocessor
         float? scoreThreshold = null,
         int? maxDetections = null)
     {
-        _manifest = manifest;
+        _manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         IReadOnlyDictionary<string, string> extra = manifest.Extra;
         _layout = layout ?? ParseLayout(extra);
-        _iou = iouThreshold ?? ParseFloat(extra, "iou", DefaultIou);
-        _scoreThreshold = scoreThreshold ?? ParseFloat(extra, "score_threshold", DefaultScoreThreshold);
+        _iou = iouThreshold ?? ParseFloat(extra, "iou", "iou_threshold", DefaultIou);
+        _scoreThreshold = scoreThreshold ?? ParseFloat(extra, "score_threshold", "conf_threshold", DefaultScoreThreshold);
         _maxDetections = maxDetections ?? ParseInt(extra, "max_det", DefaultMaxDetections);
     }
 
@@ -217,13 +219,17 @@ public sealed class DetectionPostprocessor : IPostprocessor
                 case "v8":
                 case "yolov8":
                     return DetectionLayout.YoloV8;
+                default:
+                    throw new NotSupportedException(
+                        $"Unrecognized 'det_layout' value '{raw.Trim()}'. " +
+                        "Expected one of: A, B, yolov5, yolov7, yolov8 (v5/v7/v8).");
             }
         }
         return DetectionLayout.YoloV5;   // default = Layout A
     }
 
-    private static float ParseFloat(IReadOnlyDictionary<string, string> extra, string key, float fallback)
-        => extra.TryGetValue(key, out string? s)
+    private static float ParseFloat(IReadOnlyDictionary<string, string> extra, string key, string altKey, float fallback)
+        => (extra.TryGetValue(key, out string? s) || extra.TryGetValue(altKey, out s))
            && float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out float v)
             ? v : fallback;
 

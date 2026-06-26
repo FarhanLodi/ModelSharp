@@ -4,6 +4,25 @@
 > Phase 0. The library is **pure-managed, CPU-first, manifest-driven ONNX inference for .NET** —
 > "ImageSharp for model inference." Goal: any model (embedding / LLM / vision / audio) "just runs."
 
+## Progress log (CPU-only dev machine)
+
+All **pure-managed, code-level** roadmap items are now implemented + unit-tested (test suite: **432 green**).
+Items marked ✅ are done; items needing a **real CUDA GPU** or **downloaded model assets** are coded +
+test-scaffolded but can only be *validated* on a GPU machine (marked ⏳ — the code is ready, the proof needs hardware/assets).
+
+- **Phase C:** ✅ C1 `use_cache_branch`, ✅ C2 `Pipeline.Generate` text-generation API, ✅ C3 quantization
+  (DequantizeLinear/QuantizeLinear/DynamicQuantizeLinear/MatMulInteger + GPTQ/AWQ safetensors dequant),
+  ✅ C4 mmap >2 GB safetensors + sharded `index.json`, ✅ C5 GGUF reader, ✅ C6 fused LLM ops
+  (RMSNorm/SkipRMSNorm/RotaryEmbedding/MultiHeadAttention/GroupQueryAttention).
+- **Phase D:** ✅ embedding attention-mask fix, ✅ manifest-precedence test, ✅ Tan/ReduceSumSquare tests,
+  ✅ op coverage **88 → 143** ops (logical, trig/hyperbolic inverses, IsNaN/IsInf, normalization family,
+  data-movement family, pooling-extra family, Mod/BitShift/Random, Size/NonZero, etc.).
+- **Phase B (GPU):** ⏳ B2 GPU multi-dtype (int32/int64 pass-through) + B3 GPU op parity
+  (LayerNorm/Gather/Concat/Slice/Cast) — validated GPU-vs-CPU on ILGPU's **CPU accelerator**; real-CUDA
+  validation (B1/B4/B5) still pending a GPU.
+- **Phase A:** ⏳ opt-in real-model tests for A1–A4 exist and **skip when the asset is absent** (see
+  `docs/REAL_MODELS.md` + env var `MODELSHARP_MODELS_DIR`); they go live once the ONNX files are dropped in.
+
 ## 0. Current state (read first)
 
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
@@ -97,30 +116,32 @@ test that **skips if the model asset is absent** (mirror `MiniLmTests`).
 ---
 
 ## Phase C — LLM productionization
-- **C1 — `use_cache_branch`.** Support Optimum **merged** decoder exports (the most common form): they
+> ✅ **C1–C6 all implemented + unit-tested** on the CPU dev machine. Remaining proof for big quantized
+> models (7B+) on GPU still needs hardware. Original task text retained below for reference.
+- **C1 — `use_cache_branch`.** ✅ Done. Support Optimum **merged** decoder exports (the most common form): they
   add a boolean `use_cache_branch` input and unify prefill/decode. Extend `TextGenerator`/
   `DecoderModelOptions` to feed it. (Audit flagged this as the #1 real-LLM blocker.)
-- **C2 — `Pipeline.Load` for TextGeneration.** Wire BPE tokenizer + `TextGenerator` + manifest behind
+- **C2 — `Pipeline.Load` for TextGeneration.** ✅ Wire BPE tokenizer + `TextGenerator` + manifest behind
   the one-line API (a `TextGenerationPreprocessor`/postprocessor + registry entry for
   `ModelTask.TextGeneration`), so completion is as simple as embeddings are today.
-- **C3 — Quantization (required for big models on GPU).** int8 + int4 dequant kernels; load GPTQ/AWQ /
+- **C3 — Quantization (required for big models on GPU).** ✅ int8 + int4 dequant kernels; load GPTQ/AWQ /
   HF quantized safetensors; a quantized Linear/MatMul path. Without this, 7B+ won't fit.
-- **C4 — safetensors > 2 GB.** Replace `File.ReadAllBytes` with memory-mapped / chunked reads so large
+- **C4 — safetensors > 2 GB.** ✅ Replace `File.ReadAllBytes` with memory-mapped / chunked reads so large
   shards load (current ~2 GB `byte[]` cap). Parse the `*.index.json` to load sharded checkpoints.
-- **C5 — GGUF loader.** Add a GGUF reader (llama.cpp ecosystem) alongside ONNX + safetensors.
-- **C6 — Fused LLM ops** if a target model exports them: `RotaryEmbedding`, `SimplifiedLayerNormalization`
+- **C5 — GGUF loader.** ✅ Add a GGUF reader (llama.cpp ecosystem) alongside ONNX + safetensors.
+- **C6 — Fused LLM ops** ✅ if a target model exports them: `RotaryEmbedding`, `SimplifiedLayerNormalization`
   (RMSNorm), grouped-query attention, `MultiHeadAttention` contrib op. Driven by the per-model op probe.
 
 ---
 
 ## Phase D — Op coverage & correctness cleanups
-- Extend ONNX op coverage as models demand (we're ~88 of ~190 standard ops). Add via new kernel files +
+- ✅ Op coverage now **143 of ~190** standard ops. Extend further as models demand. Add via new kernel files +
   `KernelRegistry`, each with a `NewOpsTests`-style unit test.
 - **Minor fixes from the audit (small, non-blocking):**
-  - `MeanPoolEmbeddingPostprocessor` looks for `attention_mask` among model **outputs** (it's normally an
-    **input**) → it pools over all tokens; fix so padded/batched inputs mask correctly.
-  - Add unit tests for `Tan` and `ReduceSumSquare` (implemented + registered, currently untested).
-  - Add a manifest test that pits a sidecar JSON against conflicting embedded metadata (precedence).
+  - ✅ `MeanPoolEmbeddingPostprocessor` now uses the **input** `attention_mask`. (Was: looks for it among model **outputs** (it's normally an
+    **input**) → it pooled over all tokens; fixed so padded/batched inputs mask correctly.)
+  - ✅ Added unit tests for `Tan` and `ReduceSumSquare`.
+  - ✅ Added a manifest-precedence test (sidecar JSON vs conflicting embedded metadata).
 
 ---
 

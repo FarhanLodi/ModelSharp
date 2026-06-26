@@ -243,6 +243,55 @@ internal static class GpuKernels
         }
         y[o] = acc / divisor;
     }
+
+    /// <summary>
+    /// Layer normalization over the trailing <paramref name="norm"/> elements of each group:
+    /// <c>y = (x − mean)/√(var + ε)·scale (+ bias)</c>. One thread per group of <paramref name="norm"/>
+    /// contiguous elements. The per-group mean, then the summed squared deviations, then the normalized
+    /// scale/bias apply are accumulated in the same order as the CPU <c>LayerNormalizationKernel</c>, so the
+    /// float results match. <paramref name="hasBias"/> selects whether <paramref name="bias"/> is added.
+    /// </summary>
+    internal static void LayerNormK(
+        Index1D idx,
+        ArrayView<float> x,
+        ArrayView<float> scale,
+        ArrayView<float> bias,
+        ArrayView<float> y,
+        int norm,
+        float eps,
+        int hasBias)
+    {
+        int b = idx.X * norm;
+
+        float mean = 0f;
+        for (int i = 0; i < norm; i++) mean += x[b + i];
+        mean /= norm;
+
+        float varSum = 0f;
+        for (int i = 0; i < norm; i++) { float d = x[b + i] - mean; varSum += d * d; }
+        float inv = 1f / MathF.Sqrt(varSum / norm + eps);
+
+        for (int i = 0; i < norm; i++)
+        {
+            float nval = (x[b + i] - mean) * inv;
+            y[b + i] = nval * scale[i] + (hasBias != 0 ? bias[i] : 0f);
+        }
+    }
+
+    /// <summary>
+    /// Generic gather-by-offset: <c>y[i] = x[srcOffsets[i]]</c>. One thread per output element. Used for both
+    /// ONNX <c>Gather</c> (axis indexing) and the float fast-path of <c>Slice</c>, where the host precomputes
+    /// the per-output-element source offset (element units) matching the corresponding CPU kernel's layout.
+    /// </summary>
+    internal static void GatherK(
+        Index1D idx,
+        ArrayView<float> x,
+        ArrayView<float> y,
+        ArrayView<int> srcOffsets)
+    {
+        int i = idx.X;
+        y[i] = x[srcOffsets[i]];
+    }
 }
 
 /// <summary>

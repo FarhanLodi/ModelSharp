@@ -153,5 +153,13 @@ public sealed class KernelRegistry
         .Register(new OrKernel())
         .Register(new XorKernel())
         .Register(new IsNaNKernel())
-        .Register(new IsInfKernel());
+        .Register(new IsInfKernel())
+        // Extended op families (registered via per-family extension methods so each owns its own file)
+        .AddQuantize()              // C3: DequantizeLinear/QuantizeLinear/DynamicQuantizeLinear/MatMulInteger
+        .AddLlmNormOps()            // C6: SimplifiedLayerNormalization (RMSNorm) / Skip variant / RotaryEmbedding
+        .AddAttentionContribOps()   // C6: MultiHeadAttention / GroupQueryAttention
+        .AddNormalizationOps()      // InstanceNormalization/GroupNormalization/MVN/LpNormalization/LRN
+        .AddDataMovementOps()       // OneHot/EyeLike/Compress/DepthToSpace/SpaceToDepth/ReverseSequence
+        .AddMiscMathOps()           // Mod/BitShift/RandomNormal/RandomUniform(+Like)
+        .AddPoolingExtraOps();      // GlobalMaxPool/LpPool/GlobalLpPool/Hardmax/MaxUnpool
 }
