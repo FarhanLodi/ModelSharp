@@ -266,7 +266,7 @@ public sealed class BpeTokenizer
             while (true)
             {
                 // Pick the adjacent pair with the lowest merge rank (ranks are unique, so no ties).
-                (string, string) best = default;
+                (string, string) best = (string.Empty, string.Empty);
                 int bestRank = int.MaxValue;
                 bool found = false;
                 foreach ((string, string) p in pairs)

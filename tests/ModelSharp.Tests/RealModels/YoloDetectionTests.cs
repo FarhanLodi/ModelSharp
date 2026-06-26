@@ -64,7 +64,9 @@ public class YoloDetectionTests
 
         ImageSharpRegistration.Ensure();
 
-        string layout = System.Environment.GetEnvironmentVariable("MODELSHARP_YOLO_LAYOUT") ?? "yolov5";
+        // Default "auto": the postprocessor infers v5 vs v8 from the output shape, so the test is
+        // green for either export without a hint. Override with MODELSHARP_YOLO_LAYOUT to force one.
+        string layout = System.Environment.GetEnvironmentVariable("MODELSHARP_YOLO_LAYOUT") ?? "auto";
 
         IReadOnlyList<string>? labels = RealModelAssets.TryPath(LabelsFile, out string labelsPath)
             ? File.ReadAllLines(labelsPath)

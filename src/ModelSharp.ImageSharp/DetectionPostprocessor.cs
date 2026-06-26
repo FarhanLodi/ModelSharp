@@ -22,6 +22,15 @@ public enum DetectionLayout
     /// <c>[cx, cy, w, h, class_scores…]</c> with no objectness channel. Confidence = max class score.
     /// </summary>
     YoloV8 = 1,
+
+    /// <summary>
+    /// Auto — infer v5 vs v8 from the output shape at decode time. The anchor count N greatly
+    /// exceeds the channel count (5+C / 4+C), so the smaller of the last two dims is the channel
+    /// dim: channels-last ⇒ <see cref="YoloV5"/>, channels-first ⇒ <see cref="YoloV8"/>. This is the
+    /// default when no <c>det_layout</c> is given, so a model "just runs" without the caller
+    /// knowing its variant.
+    /// </summary>
+    Auto = 2,
 }
 
 /// <summary>
@@ -29,7 +38,8 @@ public enum DetectionLayout
 /// <see cref="Detection"/>: argmax over class scores, threshold, convert center form
 /// (cx, cy, w, h) to corners, then run greedy per-class <see cref="NonMaxSuppression"/>.
 /// <para>
-/// Two layouts are supported, chosen from the manifest (default <see cref="DetectionLayout.YoloV5"/>):
+/// Layouts are chosen from the manifest (default <see cref="DetectionLayout.YoloV5"/>; pass
+/// <c>det_layout="auto"</c> to infer v5/v8 from the output shape):
 /// </para>
 /// <list type="bullet">
 ///   <item><description><b>Layout A</b> (<c>[1, N, 5+C]</c>, YOLOv5/v7) — rows carry an objectness term.</description></item>
@@ -37,7 +47,7 @@ public enum DetectionLayout
 /// </list>
 /// <para>
 /// Tunables come from <see cref="ModelManifest.Extra"/> (parsed with invariant culture):
-/// <c>"det_layout"</c>/<c>"layout"</c> (<c>A</c>|<c>B</c>|<c>yolov5</c>|<c>yolov7</c>|<c>yolov8</c>),
+/// <c>"det_layout"</c>/<c>"layout"</c> (<c>auto</c>|<c>A</c>|<c>B</c>|<c>yolov5</c>|<c>yolov7</c>|<c>yolov8</c>),
 /// <c>"iou"</c>/<c>"iou_threshold"</c> (default 0.45),
 /// <c>"score_threshold"</c>/<c>"conf_threshold"</c> (default 0.25) and <c>"max_det"</c> (default 300).
 /// Explicit constructor arguments win over <c>Extra</c>, which wins over the defaults.
@@ -92,11 +102,17 @@ public sealed class DetectionPostprocessor : IPostprocessor
         float[] data = first.Data.Span.ToArray();
         (int d1, int d2) = LastTwoDims(first.Tensor.Shape);
 
-        List<Detection> raw = _layout switch
+        // Resolve Auto from the shape: the channel dim (5+C / 4+C) is far smaller than the anchor
+        // count N, so channels-last ⇒ v5, channels-first ⇒ v8.
+        DetectionLayout layout = _layout == DetectionLayout.Auto
+            ? (d2 <= d1 ? DetectionLayout.YoloV5 : DetectionLayout.YoloV8)
+            : _layout;
+
+        List<Detection> raw = layout switch
         {
             DetectionLayout.YoloV5 => DecodeYoloV5(data, n: d1, stride: d2),
             DetectionLayout.YoloV8 => DecodeYoloV8(data, channels: d1, n: d2),
-            _ => throw new NotSupportedException($"Unsupported detection layout '{_layout}'."),
+            _ => throw new NotSupportedException($"Unsupported detection layout '{layout}'."),
         };
 
         return NonMaxSuppression.Suppress(raw, _iou, _scoreThreshold, _maxDetections);
@@ -219,13 +235,17 @@ public sealed class DetectionPostprocessor : IPostprocessor
                 case "v8":
                 case "yolov8":
                     return DetectionLayout.YoloV8;
+                case "auto":
+                    return DetectionLayout.Auto;
                 default:
                     throw new NotSupportedException(
                         $"Unrecognized 'det_layout' value '{raw.Trim()}'. " +
-                        "Expected one of: A, B, yolov5, yolov7, yolov8 (v5/v7/v8).");
+                        "Expected one of: auto, A, B, yolov5, yolov7, yolov8 (v5/v7/v8).");
             }
         }
-        return DetectionLayout.YoloV5;   // default = Layout A
+        // Default stays Layout A (YOLOv5) for back-compat; callers wanting shape inference pass
+        // det_layout="auto" explicitly (small synthetic tensors are ambiguous, so Auto is opt-in).
+        return DetectionLayout.YoloV5;
     }
 
     private static float ParseFloat(IReadOnlyDictionary<string, string> extra, string key, string altKey, float fallback)

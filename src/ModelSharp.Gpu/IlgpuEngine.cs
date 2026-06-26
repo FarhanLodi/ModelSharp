@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using ILGPU;
+using ILGPU.Algorithms;
 using ILGPU.Runtime;
 using ModelSharp.Engine;
 using ModelSharp.Graph;
@@ -88,7 +89,12 @@ public sealed class IlgpuEngine : IExecutionEngine
     public IlgpuEngine(ModelGraph graph, bool preferCpu = false)
     {
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
-        _context = Context.CreateDefault();
+        // EnableAlgorithms() registers ILGPU.Algorithms' intrinsic implementations (ExpF/TanhF/SqrtF/…)
+        // for the *hardware* backends. Without it the PTX/CUDA backend has no intrinsic for these
+        // transcendental MathF calls and throws at JIT time ("'ExpF' does not have an intrinsic
+        // implementation for this backend"); the ILGPU CPU accelerator tolerated their absence by
+        // falling back to .NET MathF, which is why the CPU-only tests never surfaced this.
+        _context = Context.Create(builder => builder.Default().EnableAlgorithms());
         Device device = _context.GetPreferredDevice(preferCPU: preferCpu);
         _accelerator = device.CreateAccelerator(_context);
 
@@ -489,8 +495,9 @@ public sealed class IlgpuEngine : IExecutionEngine
 
         if ((axes is null || axes.Length == 0) && noopEmpty)
         {
-            // Identity: copy the input through unchanged.
-            MemoryBuffer1D<float, Stride1D.Dense> copy = _accelerator.Allocate1D(x.GetAsArray1D());
+            // Identity: copy the input through unchanged, device-to-device (no host round-trip).
+            MemoryBuffer1D<float, Stride1D.Dense> copy = _accelerator.Allocate1D<float>(x.Length);
+            x.View.CopyTo(_accelerator.DefaultStream, copy.View);
             values[node.Outputs[0]] = DeviceValue.Device(copy, xS);
             return;
         }
