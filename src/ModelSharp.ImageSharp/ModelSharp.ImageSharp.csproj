@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>ModelSharp.ImageSharp</RootNamespace>
+    <AssemblyName>ModelSharp.ImageSharp</AssemblyName>
+    <PackageId>ModelSharp.ImageSharp</PackageId>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <Description>ImageSharp-based image pre/post-processing adapter for ModelSharp.</Description>
+    <Version>0.1.0-alpha</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pinned to v3.x: ImageSharp v4 added a build-time commercial license-key gate
+         that conflicts with ModelSharp's "works the moment you download it" goal. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ModelSharp\ModelSharp.csproj" />
+  </ItemGroup>
+
+</Project>

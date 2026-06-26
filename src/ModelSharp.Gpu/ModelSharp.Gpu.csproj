@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ModelSharp\ModelSharp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ILGPU" Version="1.5.3" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>ModelSharp.Gpu</PackageId>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <Description>ILGPU GPU execution backend for ModelSharp — C# kernels JIT-compiled to CUDA / OpenCL, with a CPU fallback.</Description>
+    <Version>0.1.0-alpha</Version>
+  </PropertyGroup>
+
+</Project>

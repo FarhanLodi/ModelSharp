@@ -1,0 +1,24 @@
+## .NET build output
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+## IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+## Test / coverage
+TestResults/
+*.trx
+coverage*.json
+coverage*.xml
+
+## Packaging / misc
+artifacts/
+*.nupkg
+
+## Large model fixtures (opt-in integration tests download these)
+tests/ModelSharp.Tests/assets/models/

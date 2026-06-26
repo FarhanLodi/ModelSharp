@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <RootNamespace>ModelSharp</RootNamespace>
+    <AssemblyName>ModelSharp</AssemblyName>
+    <PackageId>ModelSharp</PackageId>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <Description>Universal, manifest-driven, pure-managed model inference for .NET. All-in-one: ONNX loader, multi-dtype CPU engine (46 ops, float/int64/int32/bool), tensors, pipeline, plus audio (FFT/log-mel) and text (WordPiece) front ends — zero external dependencies.</Description>
+    <Version>0.1.0-alpha</Version>
+  </PropertyGroup>
+
+</Project>

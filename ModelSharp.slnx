@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ModelSharp.Gpu/ModelSharp.Gpu.csproj" />
+    <Project Path="src/ModelSharp.ImageSharp/ModelSharp.ImageSharp.csproj" />
+    <Project Path="src/ModelSharp/ModelSharp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ModelSharp.Tests/ModelSharp.Tests.csproj" />
+  </Folder>
+</Solution>
