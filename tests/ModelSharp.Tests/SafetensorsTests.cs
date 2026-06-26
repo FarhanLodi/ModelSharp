@@ -227,13 +227,157 @@ public class SafetensorsTests
         File.WriteAllBytes(path, buf);
         try
         {
-            SafetensorsFile f = SafetensorsFile.FromFiles(path);
+            using SafetensorsFile f = SafetensorsFile.FromFiles(path);
             var t = Assert.IsType<Tensor<long>>(f.GetTensor("ids"));
             Assert.Equal(new[] { 10L, 20L, 30L }, t.Span.ToArray());
         }
         finally
         {
             File.Delete(path);
+        }
+    }
+
+    // ---- memory-mapped / long-offset path --------------------------------------------
+
+    [Fact]
+    public void FromFile_Mmap_Path_Decodes_Identically_To_FromBytes()
+    {
+        // A multi-tensor file so several entries decode through the file-backed data section.
+        byte[] floats = ToBytes(1.5f, -2.25f, 0.75f, 4.0f);
+        byte[] longs = ToBytes(10L, 20L, 30L);
+        byte[] half = ToBytes(F16(1.0f), F16(-2.0f), F16(0.5f));
+        var data = new byte[floats.Length + longs.Length + half.Length];
+        Buffer.BlockCopy(floats, 0, data, 0, floats.Length);
+        Buffer.BlockCopy(longs, 0, data, floats.Length, longs.Length);
+        Buffer.BlockCopy(half, 0, data, floats.Length + longs.Length, half.Length);
+
+        // offsets: w [0,16), ids [16,40), h [40,46)
+        string json =
+            "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]}," +
+            "\"ids\":{\"dtype\":\"I64\",\"shape\":[3],\"data_offsets\":[16,40]}," +
+            "\"h\":{\"dtype\":\"F16\",\"shape\":[3],\"data_offsets\":[40,46]}}";
+        byte[] buf = Build(json, data);
+
+        SafetensorsFile inMem = SafetensorsFile.FromBytes(buf);
+
+        string path = Path.Combine(Path.GetTempPath(), $"modelsharp_{Guid.NewGuid():N}.safetensors");
+        File.WriteAllBytes(path, buf);
+        try
+        {
+            using SafetensorsFile mapped = SafetensorsFile.FromFile(path);
+
+            Assert.Equal(inMem.Count, mapped.Count);
+
+            var wMem = Assert.IsType<Tensor<float>>(inMem.GetTensor("w"));
+            var wMap = Assert.IsType<Tensor<float>>(mapped.GetTensor("w"));
+            Assert.Equal(wMem.Span.ToArray(), wMap.Span.ToArray());
+
+            var idsMem = Assert.IsType<Tensor<long>>(inMem.GetTensor("ids"));
+            var idsMap = Assert.IsType<Tensor<long>>(mapped.GetTensor("ids"));
+            Assert.Equal(idsMem.Span.ToArray(), idsMap.Span.ToArray());
+
+            var hMem = Assert.IsType<Tensor<float>>(inMem.GetTensor("h"));
+            var hMap = Assert.IsType<Tensor<float>>(mapped.GetTensor("h"));
+            Assert.Equal(hMem.Span.ToArray(), hMap.Span.ToArray());
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Dispose_Releases_The_Mapped_File()
+    {
+        byte[] data = ToBytes(1.0f);
+        byte[] buf = Build(
+            "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}", data);
+
+        string path = Path.Combine(Path.GetTempPath(), $"modelsharp_{Guid.NewGuid():N}.safetensors");
+        File.WriteAllBytes(path, buf);
+        try
+        {
+            SafetensorsFile f = SafetensorsFile.FromFile(path);
+            var t = Assert.IsType<Tensor<float>>(f.GetTensor("w"));
+            Assert.Equal(new[] { 1.0f }, t.Span.ToArray());
+            f.Dispose();
+
+            // After dispose the mapping is released: the file can be rewritten/deleted, and
+            // accessing a tensor throws ObjectDisposedException.
+            File.WriteAllBytes(path, buf);
+            Assert.Throws<ObjectDisposedException>(() => f.GetTensor("w"));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    // ---- sharded index.json ------------------------------------------------------------
+
+    [Fact]
+    public void FromIndex_Exposes_Union_Of_Shards()
+    {
+        byte[] shard1 = Build(
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}", ToBytes(1.0f, 2.0f));
+        byte[] shard2 = Build(
+            "{\"b\":{\"dtype\":\"I64\",\"shape\":[2],\"data_offsets\":[0,16]}}", ToBytes(7L, 8L));
+
+        string dir = Path.Combine(Path.GetTempPath(), $"modelsharp_idx_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        string s1 = Path.Combine(dir, "model-00001-of-00002.safetensors");
+        string s2 = Path.Combine(dir, "model-00002-of-00002.safetensors");
+        string idx = Path.Combine(dir, "model.safetensors.index.json");
+        File.WriteAllBytes(s1, shard1);
+        File.WriteAllBytes(s2, shard2);
+        File.WriteAllText(idx,
+            "{\"metadata\":{\"total_size\":24}," +
+            "\"weight_map\":{" +
+            "\"a\":\"model-00001-of-00002.safetensors\"," +
+            "\"b\":\"model-00002-of-00002.safetensors\"}}");
+
+        try
+        {
+            using SafetensorsFile f = SafetensorsFile.FromIndex(idx);
+
+            Assert.Equal(2, f.Count);
+            Assert.True(f.Contains("a"));
+            Assert.True(f.Contains("b"));
+
+            var a = Assert.IsType<Tensor<float>>(f.GetTensor("a"));
+            Assert.Equal(new[] { 1.0f, 2.0f }, a.Span.ToArray());
+
+            var b = Assert.IsType<Tensor<long>>(f.GetTensor("b"));
+            Assert.Equal(new[] { 7L, 8L }, b.Span.ToArray());
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FromIndex_Missing_Tensor_Throws()
+    {
+        byte[] shard1 = Build(
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}", ToBytes(1.0f, 2.0f));
+
+        string dir = Path.Combine(Path.GetTempPath(), $"modelsharp_idx_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        string s1 = Path.Combine(dir, "shard1.safetensors");
+        string idx = Path.Combine(dir, "bad.index.json");
+        File.WriteAllBytes(s1, shard1);
+        // weight_map references a tensor 'c' that no shard actually contains.
+        File.WriteAllText(idx,
+            "{\"weight_map\":{\"a\":\"shard1.safetensors\",\"c\":\"shard1.safetensors\"}}");
+
+        try
+        {
+            Assert.Throws<ModelSharpException>(() => SafetensorsFile.FromIndex(idx));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
         }
     }
 }

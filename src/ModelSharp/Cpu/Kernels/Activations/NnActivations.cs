@@ -89,3 +89,76 @@ public sealed class PReluKernel : BroadcastBinaryKernel
     public override string OpType => "PRelu";
     protected override float Apply(float x, float slope) => x >= 0f ? x : slope * x;
 }
+
+/// <summary>HardSwish: <c>x · max(0, min(6, x + 3)) / 6</c> (i.e. x·relu6(x+3)/6).</summary>
+public sealed class HardSwishKernel : UnaryKernel
+{
+    public override string OpType => "HardSwish";
+
+    protected override float Apply(float x)
+    {
+        float v = x + 3f;
+        v = v < 0f ? 0f : (v > 6f ? 6f : v); // relu6(x + 3)
+        return x * v / 6f;
+    }
+}
+
+/// <summary>ThresholdedRelu: <c>x</c> if x &gt; α else 0. <c>alpha</c> default 1.</summary>
+public sealed class ThresholdedReluKernel : IKernel
+{
+    public string OpType => "ThresholdedRelu";
+
+    public void Execute(GraphNode node, GraphContext ctx)
+    {
+        Tensor<float> x = ctx.Get(node.Inputs[0]);
+        float alpha = Attr.Float(node, "alpha", 1f);
+        var y = new Tensor<float>(x.Shape);
+        Span<float> xs = x.Span, ys = y.Span;
+        for (int i = 0; i < xs.Length; i++) ys[i] = xs[i] > alpha ? xs[i] : 0f;
+        ctx.Set(node.Outputs[0], y);
+    }
+}
+
+/// <summary>CELU: <c>max(0, x) + min(0, α·(exp(x/α) − 1))</c>. <c>alpha</c> default 1.</summary>
+public sealed class CeluKernel : IKernel
+{
+    public string OpType => "Celu";
+
+    public void Execute(GraphNode node, GraphContext ctx)
+    {
+        Tensor<float> x = ctx.Get(node.Inputs[0]);
+        float alpha = Attr.Float(node, "alpha", 1f);
+        var y = new Tensor<float>(x.Shape);
+        Span<float> xs = x.Span, ys = y.Span;
+        for (int i = 0; i < xs.Length; i++)
+        {
+            float v = xs[i];
+            float pos = MathF.Max(0f, v);
+            float neg = MathF.Min(0f, alpha * (MathF.Exp(v / alpha) - 1f));
+            ys[i] = pos + neg;
+        }
+        ctx.Set(node.Outputs[0], y);
+    }
+}
+
+/// <summary>Shrink: <c>x − bias</c> if x &gt; λ, <c>x + bias</c> if x &lt; −λ, else 0.
+/// Defaults <c>bias</c>=0, <c>lambd</c>=0.5.</summary>
+public sealed class ShrinkKernel : IKernel
+{
+    public string OpType => "Shrink";
+
+    public void Execute(GraphNode node, GraphContext ctx)
+    {
+        Tensor<float> x = ctx.Get(node.Inputs[0]);
+        float bias = Attr.Float(node, "bias", 0f);
+        float lambd = Attr.Float(node, "lambd", 0.5f);
+        var y = new Tensor<float>(x.Shape);
+        Span<float> xs = x.Span, ys = y.Span;
+        for (int i = 0; i < xs.Length; i++)
+        {
+            float v = xs[i];
+            ys[i] = v > lambd ? v - bias : (v < -lambd ? v + bias : 0f);
+        }
+        ctx.Set(node.Outputs[0], y);
+    }
+}
