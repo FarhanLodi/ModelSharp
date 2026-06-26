@@ -22,3 +22,6 @@ artifacts/
 
 ## Large model fixtures (opt-in integration tests download these)
 tests/ModelSharp.Tests/assets/models/
+
+# Claude Code local state (worktrees, transcripts)
+.claude/

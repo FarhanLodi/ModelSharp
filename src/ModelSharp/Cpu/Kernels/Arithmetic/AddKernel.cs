@@ -7,4 +7,5 @@ public sealed class AddKernel : BroadcastBinaryKernel
 {
     public override string OpType => "Add";
     protected override float Apply(float a, float b) => a + b;
+    protected override long ApplyInt64(long a, long b) => a + b;
 }

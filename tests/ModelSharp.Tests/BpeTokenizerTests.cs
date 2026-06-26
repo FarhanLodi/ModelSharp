@@ -121,7 +121,7 @@ public class BpeTokenizerTests
         int[] ids = tok.Encode("Hello<|endoftext|>World");
         Assert.Contains(50000, ids);
         // The special id appears exactly once and as a single unit.
-        Assert.Single(ids.Where(i => i == 50000));
+        Assert.Single(ids, i => i == 50000);
 
         Assert.Equal("Hello<|endoftext|>World", tok.Decode(ids, skipSpecial: false));
         Assert.Equal("HelloWorld", tok.Decode(ids, skipSpecial: true));

@@ -4,7 +4,12 @@ using ModelSharp.Tensors;
 
 namespace ModelSharp.Cpu.Kernels.Nn;
 
-/// <summary>2-D convolution (NCHW). Supports strides, pads, auto_pad, dilations, group, optional bias.</summary>
+/// <summary>
+/// Convolution supporting 1-D (NCW) and 2-D (NCHW) inputs. Strides, pads, auto_pad, dilations,
+/// group and an optional bias are all honored. The 1-D case (e.g. wav2vec2's feature extractor)
+/// is lifted to the 2-D path with a singleton height axis (H=kH=1), so the arithmetic is shared
+/// and the 2-D result is byte-for-byte what it always was.
+/// </summary>
 public sealed class ConvKernel : IKernel
 {
     public string OpType => "Conv";
@@ -18,28 +23,45 @@ public sealed class ConvKernel : IKernel
 
         System.ReadOnlySpan<int> xd = x.Shape.Dimensions;
         System.ReadOnlySpan<int> wd = w.Shape.Dimensions;
-        if (xd.Length != 4 || wd.Length != 4)
-            throw new ModelSharpException("Conv currently supports 4-D NCHW tensors only.");
+        int spatial = xd.Length - 2;
+        if ((spatial != 1 && spatial != 2) || wd.Length != xd.Length)
+            throw new ModelSharpException("Conv supports 1-D (NCW) or 2-D (NCHW) tensors only.");
+        bool is1d = spatial == 1;
 
-        int N = xd[0], H = xd[2], W = xd[3];
-        int cout = wd[0], cinPerGroup = wd[1], kH = wd[2], kW = wd[3];
+        // Lift the 1-D layout into the 2-D one with a singleton height axis.
+        int N = xd[0];
+        int H = is1d ? 1 : xd[2];
+        int W = is1d ? xd[2] : xd[3];
+        int cout = wd[0], cinPerGroup = wd[1];
+        int kH = is1d ? 1 : wd[2];
+        int kW = is1d ? wd[2] : wd[3];
 
         int group = (int)Attr.Int(node, "group", 1);
-        int[] strides = Attr.Ints(node, "strides", new[] { 1, 1 });
-        int[] dil = Attr.Ints(node, "dilations", new[] { 1, 1 });
-        int sH = strides[0], sW = strides[1], dH = dil[0], dW = dil[1];
+        int[] strides = Attr.Ints(node, "strides", is1d ? new[] { 1 } : new[] { 1, 1 });
+        int[] dil = Attr.Ints(node, "dilations", is1d ? new[] { 1 } : new[] { 1, 1 });
+        int sH = is1d ? 1 : strides[0];
+        int sW = is1d ? strides[0] : strides[1];
+        int dH = is1d ? 1 : dil[0];
+        int dW = is1d ? dil[0] : dil[1];
 
         int padTop, padLeft, padBottom, padRight;
         string autoPad = Attr.Str(node, "auto_pad", "NOTSET");
         if (autoPad is "SAME_UPPER" or "SAME_LOWER")
         {
             bool upper = autoPad == "SAME_UPPER";
-            Nd.SamePad(H, kH, sH, dH, upper, out padTop, out padBottom);
+            if (is1d) { padTop = padBottom = 0; }
+            else Nd.SamePad(H, kH, sH, dH, upper, out padTop, out padBottom);
             Nd.SamePad(W, kW, sW, dW, upper, out padLeft, out padRight);
         }
         else if (autoPad == "VALID")
         {
             padTop = padLeft = padBottom = padRight = 0;
+        }
+        else if (is1d)
+        {
+            // 1-D pads are [begin_w, end_w]; height has no padding.
+            int[] p = Attr.Ints(node, "pads", new[] { 0, 0 });
+            padTop = padBottom = 0; padLeft = p[0]; padRight = p[1];
         }
         else
         {
@@ -51,7 +73,11 @@ public sealed class ConvKernel : IKernel
         int outW = (W + padLeft + padRight - (dW * (kW - 1) + 1)) / sW + 1;
         int outPerGroup = cout / group;
 
-        var y = new Tensor<float>(new TensorShape(N, cout, outH, outW));
+        // The flat NCHW layout with outH==1 is identical to the squeezed NCW layout, so 1-D
+        // output is allocated already-squeezed and the indexing below is unchanged.
+        var y = new Tensor<float>(is1d
+            ? new TensorShape(N, cout, outW)
+            : new TensorShape(N, cout, outH, outW));
         System.Span<float> xs = x.Span, ws = w.Span, ys = y.Span;
         System.Span<float> bs = bias is null ? default : bias.Span;
 

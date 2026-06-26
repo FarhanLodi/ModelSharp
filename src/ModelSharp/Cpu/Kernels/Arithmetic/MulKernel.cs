@@ -7,4 +7,5 @@ public sealed class MulKernel : BroadcastBinaryKernel
 {
     public override string OpType => "Mul";
     protected override float Apply(float a, float b) => a * b;
+    protected override long ApplyInt64(long a, long b) => a * b;
 }
