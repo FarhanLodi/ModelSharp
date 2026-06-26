@@ -3,6 +3,7 @@ using ModelSharp.Cpu.Kernels.Activations;
 using ModelSharp.Cpu.Kernels.Arithmetic;
 using ModelSharp.Cpu.Kernels.Linear;
 using ModelSharp.Cpu.Kernels.Logical;
+using ModelSharp.Cpu.Kernels.MathOps;
 using ModelSharp.Cpu.Kernels.Nn;
 using ModelSharp.Cpu.Kernels.Reduction;
 using ModelSharp.Cpu.Kernels.Rnn;
@@ -51,12 +52,37 @@ public sealed class KernelRegistry
         .Register(new LeakyReluKernel())
         .Register(new ClipKernel())
         .Register(new SoftmaxKernel())
+        .Register(new LogSoftmaxKernel())
+        // Elementwise unary math
+        .Register(new SinKernel())
+        .Register(new CosKernel())
+        .Register(new TanKernel())
+        .Register(new ReciprocalKernel())
+        .Register(new FloorKernel())
+        .Register(new CeilKernel())
+        .Register(new RoundKernel())
+        .Register(new SignKernel())
+        // Extra activations
+        .Register(new EluKernel())
+        .Register(new SeluKernel())
+        .Register(new HardSigmoidKernel())
+        .Register(new SoftplusKernel())
+        .Register(new SoftsignKernel())
+        .Register(new MishKernel())
+        .Register(new PReluKernel())
+        // Variadic elementwise
+        .Register(new MinKernel())
+        .Register(new MaxKernel())
+        .Register(new SumKernel())
+        .Register(new MeanKernel())
         // Neural-net layers
         .Register(new ConvKernel())
         .Register(new MaxPoolKernel())
+        .Register(new AveragePoolKernel())
         .Register(new GlobalAveragePoolKernel())
         .Register(new BatchNormalizationKernel())
         .Register(new LayerNormalizationKernel())
+        .Register(new ResizeKernel())
         // Recurrent
         .Register(new LstmKernel())
         .Register(new GruKernel())
@@ -65,6 +91,17 @@ public sealed class KernelRegistry
         .Register(new GemmKernel())
         // Reduction
         .Register(new ReduceMeanKernel())
+        .Register(new ReduceSumKernel())
+        .Register(new ReduceMaxKernel())
+        .Register(new ReduceMinKernel())
+        .Register(new ReduceProdKernel())
+        .Register(new ReduceL1Kernel())
+        .Register(new ReduceL2Kernel())
+        .Register(new ReduceSumSquareKernel())
+        .Register(new ArgMaxKernel())
+        .Register(new ArgMinKernel())
+        .Register(new TopKKernel())
+        .Register(new CumSumKernel())
         // Shape / data movement
         .Register(new ReshapeKernel())
         .Register(new FlattenKernel())
@@ -79,6 +116,15 @@ public sealed class KernelRegistry
         .Register(new ConstantOfShapeKernel())
         .Register(new SliceKernel())
         .Register(new ExpandKernel())
+        .Register(new SplitKernel())
+        .Register(new PadKernel())
+        .Register(new TileKernel())
+        .Register(new TriluKernel())
+        .Register(new RangeKernel())
+        .Register(new GatherElementsKernel())
+        .Register(new ScatterElementsKernel())
+        .Register(new GatherNDKernel())
+        .Register(new ScatterNDKernel())
         // Logical / comparison
         .Register(new WhereKernel())
         .Register(new EqualKernel())

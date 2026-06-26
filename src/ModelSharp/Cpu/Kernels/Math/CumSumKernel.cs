@@ -3,7 +3,7 @@ using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
-namespace ModelSharp.Cpu.Kernels.Math;
+namespace ModelSharp.Cpu.Kernels.MathOps;
 
 /// <summary>
 /// ONNX <c>CumSum</c>: cumulative sum along the axis given by the (scalar) second input.

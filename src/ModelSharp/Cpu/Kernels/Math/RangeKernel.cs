@@ -2,7 +2,7 @@ using System;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
-namespace ModelSharp.Cpu.Kernels.Math;
+namespace ModelSharp.Cpu.Kernels.MathOps;
 
 /// <summary>
 /// ONNX <c>Range</c>: generates the 1-D sequence <c>start, start+delta, ...</c> stopping before

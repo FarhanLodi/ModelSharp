@@ -1,7 +1,7 @@
 using System;
 using ModelSharp.Cpu.Kernels;
 
-namespace ModelSharp.Cpu.Kernels.Math;
+namespace ModelSharp.Cpu.Kernels.MathOps;
 
 /// <summary>Elementwise sine.</summary>
 public sealed class SinKernel : UnaryKernel { public override string OpType => "Sin"; protected override float Apply(float x) => MathF.Sin(x); }

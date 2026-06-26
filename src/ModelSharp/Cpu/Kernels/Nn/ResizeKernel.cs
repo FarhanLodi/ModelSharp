@@ -47,7 +47,7 @@ public sealed class ResizeKernel : IKernel
             for (int i = 0; i < rank; i++)
             {
                 scale[i] = scalesIn[i];
-                outDims[i] = (int)System.Math.Floor(電(inDims[i], scalesIn[i]));
+                outDims[i] = (int)System.Math.Floor(inDims[i] * (double)scalesIn[i]);
             }
         }
         else
@@ -60,30 +60,28 @@ public sealed class ResizeKernel : IKernel
         int[] inStrides = Nd.Strides(inDims);
         int n = (int)y.Shape.Length;
         var coord = new int[rank];
-
         bool linear = mode == "linear" || mode == "bilinear";
 
         for (int outIdx = 0; outIdx < n; outIdx++)
         {
-            if (linear) ys[outIdx] = SampleLinear(xs, inDims, inStrides, coord, scale, ct);
-            else ys[outIdx] = SampleNearest(xs, inDims, inStrides, coord, scale, ct, nearestMode);
+            ys[outIdx] = linear
+                ? SampleLinear(xs, inDims, inStrides, coord, scale, outDims, ct)
+                : SampleNearest(xs, inDims, inStrides, coord, scale, outDims, ct, nearestMode);
             for (int ax = rank - 1; ax >= 0; ax--) { if (++coord[ax] < outDims[ax]) break; coord[ax] = 0; }
         }
 
         ctx.Set(node.Outputs[0], y);
     }
 
-    private static double 電(int len, double s) => len * s; // length_original * scale
-
     private static float SampleNearest(
         Span<float> xs, ReadOnlySpan<int> inDims, int[] inStrides, int[] coord,
-        double[] scale, string ct, string nearestMode)
+        double[] scale, int[] outDims, string ct, string nearestMode)
     {
         int rank = inDims.Length;
         int src = 0;
         for (int i = 0; i < rank; i++)
         {
-            double c = SourceCoord(coord[i], scale[i], inDims[i], OutLen(inDims[i], scale[i]), ct);
+            double c = SourceCoord(coord[i], scale[i], inDims[i], outDims[i], ct);
             int idx = RoundNearest(c, nearestMode);
             if (idx < 0) idx = 0; else if (idx >= inDims[i]) idx = inDims[i] - 1;
             src += idx * inStrides[i];
@@ -93,14 +91,14 @@ public sealed class ResizeKernel : IKernel
 
     private static float SampleLinear(
         Span<float> xs, ReadOnlySpan<int> inDims, int[] inStrides, int[] coord,
-        double[] scale, string ct)
+        double[] scale, int[] outDims, string ct)
     {
         int rank = inDims.Length;
         var lo = new int[rank];
         var frac = new double[rank];
         for (int i = 0; i < rank; i++)
         {
-            double c = SourceCoord(coord[i], scale[i], inDims[i], OutLen(inDims[i], scale[i]), ct);
+            double c = SourceCoord(coord[i], scale[i], inDims[i], outDims[i], ct);
             if (c < 0) c = 0; else if (c > inDims[i] - 1) c = inDims[i] - 1;
             int i0 = (int)System.Math.Floor(c);
             if (i0 > inDims[i] - 1) i0 = inDims[i] - 1;
@@ -139,8 +137,6 @@ public sealed class ResizeKernel : IKernel
         return (float)acc;
     }
 
-    private static int OutLen(int inLen, double scale) => (int)System.Math.Floor(inLen * scale);
-
     /// <summary>Maps an output index to the (fractional) source coordinate per the transform mode.</summary>
     private static double SourceCoord(int outIdx, double scale, int inLen, int outLen, string ct) => ct switch
     {
@@ -164,8 +160,7 @@ public sealed class ResizeKernel : IKernel
         {
             Tensor t = ctx.GetTensor(node.Inputs[inputIndex]);
             if (t.Length == 0) return null;
-            Span<float> s = t.AsFloat().Span;
-            return s.ToArray();
+            return t.AsFloat().Span.ToArray();
         }
         return null;
     }

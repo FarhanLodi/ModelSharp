@@ -1,3 +1,4 @@
+using System;
 using ILGPU;
 
 namespace ModelSharp.Gpu;
@@ -139,6 +140,108 @@ internal static class GpuKernels
         }
 
         y[gid] = sum;
+    }
+
+    /// <summary>
+    /// General N-D axis permutation (ONNX <c>Transpose</c>). One thread per output element: the output's
+    /// linear index is decomposed into per-axis coordinates via the precomputed row-major
+    /// <paramref name="outStrides"/>, and each coordinate is re-projected into the source through
+    /// <paramref name="srcStrides"/> (where <c>srcStrides[i] = inStrides[perm[i]]</c>). Mirrors the CPU
+    /// <c>TransposeKernel</c>.
+    /// </summary>
+    internal static void TransposeK(
+        Index1D i,
+        ArrayView<float> x,
+        ArrayView<float> y,
+        ArrayView<int> outStrides,
+        ArrayView<int> srcStrides,
+        int rank)
+    {
+        int rem = i.X;
+        int src = 0;
+        for (int ax = 0; ax < rank; ax++)
+        {
+            int st = outStrides[ax];
+            int c = rem / st;
+            rem -= c * st;
+            src += c * srcStrides[ax];
+        }
+        y[i] = x[src];
+    }
+
+    /// <summary>
+    /// Softmax along one axis, numerically stabilized by max-subtraction. One thread per (outer, inner)
+    /// "row": the <paramref name="axisSize"/> elements of a row are <paramref name="inner"/> apart in
+    /// memory. Computes the per-row max, then the exponentials and their sum, then divides — matching the
+    /// accumulation order of the CPU <c>SoftmaxKernel</c>.
+    /// </summary>
+    internal static void SoftmaxK(
+        Index1D idx,
+        ArrayView<float> x,
+        ArrayView<float> y,
+        int axisSize,
+        int inner)
+    {
+        int gid = idx.X;
+        int o = gid / inner;
+        int q = gid - o * inner;
+        int baseIdx = o * axisSize * inner + q;
+
+        float mx = x[baseIdx];
+        for (int s = 1; s < axisSize; s++)
+        {
+            float v = x[baseIdx + s * inner];
+            if (v > mx) mx = v;
+        }
+
+        float sum = 0f;
+        for (int s = 0; s < axisSize; s++)
+        {
+            float e = MathF.Exp(x[baseIdx + s * inner] - mx);
+            y[baseIdx + s * inner] = e;
+            sum += e;
+        }
+
+        for (int s = 0; s < axisSize; s++)
+            y[baseIdx + s * inner] = y[baseIdx + s * inner] / sum;
+    }
+
+    /// <summary>
+    /// Axis reduction by summation (ONNX <c>ReduceSum</c> with <paramref name="divisor"/> = 1, or
+    /// <c>ReduceMean</c> with <paramref name="divisor"/> = reduced-element count). One thread per output
+    /// element: <paramref name="outBase"/> gives the input offset where every reduced coordinate is zero,
+    /// and the reduced coordinates are then enumerated in row-major order (<paramref name="redOutStrides"/>
+    /// over the reduced axes, <paramref name="redStrides"/> their input strides) — the same fold order as
+    /// the CPU reduce kernels, so float results match.
+    /// </summary>
+    internal static void ReduceK(
+        Index1D idx,
+        ArrayView<float> x,
+        ArrayView<float> y,
+        ArrayView<int> outBase,
+        ArrayView<int> redOutStrides,
+        ArrayView<int> redStrides,
+        int numRed,
+        int redCount,
+        float divisor)
+    {
+        int o = idx.X;
+        int baseOff = outBase[o];
+        float acc = 0f;
+        for (int r = 0; r < redCount; r++)
+        {
+            int rem = r;
+            int off = baseOff;
+            for (int k = 0; k < numRed; k++)
+            {
+                int st = redOutStrides[k];
+                int c = rem / st;
+                rem -= c * st;
+                off += c * redStrides[k];
+            }
+            acc += x[off];
+        }
+        y[o] = acc / divisor;
     }
 }
 

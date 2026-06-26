@@ -24,7 +24,7 @@ public abstract class ReduceKernelBase : IKernel
     protected abstract float Combine(float acc, float x);
 
     /// <summary>Post-processes the accumulator given the number of reduced elements (default: identity).</summary>
-    protected virtual float Finalize(float acc, int count) => acc;
+    protected virtual float Postprocess(float acc, int count) => acc;
 
     /// <inheritdoc />
     public void Execute(GraphNode node, GraphContext ctx)
@@ -84,7 +84,7 @@ public abstract class ReduceKernelBase : IKernel
             }
             acc[outIdx] = Combine(acc[outIdx], xs[idx]);
         }
-        for (int i = 0; i < outLen; i++) acc[i] = Finalize(acc[i], count);
+        for (int i = 0; i < outLen; i++) acc[i] = Postprocess(acc[i], count);
 
         int[] finalDims;
         if (keepdims)
@@ -139,7 +139,7 @@ public sealed class ReduceL2Kernel : ReduceKernelBase
     public override string OpType => "ReduceL2";
     protected override float Init => 0f;
     protected override float Combine(float acc, float x) => acc + x * x;
-    protected override float Finalize(float acc, int count) => MathF.Sqrt(acc);
+    protected override float Postprocess(float acc, int count) => MathF.Sqrt(acc);
 }
 
 /// <summary>Sum of absolute values over the given axes (ONNX <c>ReduceL1</c>).</summary>

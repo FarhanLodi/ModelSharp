@@ -3,7 +3,7 @@ using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
-namespace ModelSharp.Cpu.Kernels.Math;
+namespace ModelSharp.Cpu.Kernels.MathOps;
 
 /// <summary>
 /// Shared machinery for variadic elementwise ops (Min / Max / Sum / Mean): folds an arbitrary
@@ -21,7 +21,7 @@ public abstract class VariadicElementwiseKernel : IKernel
     protected abstract float Combine(float acc, float x);
 
     /// <summary>Post-processes the accumulator given the input count (default: identity).</summary>
-    protected virtual float Finalize(float acc, int count) => acc;
+    protected virtual float Postprocess(float acc, int count) => acc;
 
     /// <inheritdoc />
     public void Execute(GraphNode node, GraphContext ctx)
@@ -61,7 +61,7 @@ public abstract class VariadicElementwiseKernel : IKernel
 
         var y = new Tensor<float>(outShape, acc);
         Span<float> ys = y.Span;
-        for (int i = 0; i < n; i++) ys[i] = Finalize(acc[i], m);
+        for (int i = 0; i < n; i++) ys[i] = Postprocess(acc[i], m);
         ctx.Set(node.Outputs[0], y);
     }
 }
@@ -96,5 +96,5 @@ public sealed class MeanKernel : VariadicElementwiseKernel
     public override string OpType => "Mean";
     protected override float Init => 0f;
     protected override float Combine(float acc, float x) => acc + x;
-    protected override float Finalize(float acc, int count) => acc / count;
+    protected override float Postprocess(float acc, int count) => acc / count;
 }

@@ -15,10 +15,12 @@ namespace ModelSharp.Gpu;
 /// this runs (and is tested) on any machine. It plugs into the same <see cref="IExecutionEngine"/>
 /// seam as the managed CPU engine.
 ///
-/// Covers the elementwise ops (Add/Sub/Mul/Div, with NumPy-style broadcasting, plus Relu) and the
-/// two heavyweight tensor ops: batched MatMul (NumPy matmul semantics) and Conv2D (NCHW, with
-/// stride/padding/dilation/groups/bias). The engine is float32-only; the device kernels live in
-/// <see cref="GpuKernels"/> and the host-side stride/offset precomputation lives here.
+/// Covers the elementwise ops (Add/Sub/Mul/Div, with NumPy-style broadcasting) and elementwise
+/// activations (Relu/Sigmoid/Tanh/Gelu/LeakyRelu/Exp/Sqrt); the data-movement/reduction ops
+/// Transpose, Softmax, ReduceSum and ReduceMean; and the two heavyweight tensor ops: batched MatMul
+/// (NumPy matmul semantics) and Conv2D (NCHW, with stride/padding/dilation/groups/bias). The engine is
+/// float32-only; the device kernels live in <see cref="GpuKernels"/> and (for the per-element
+/// activations) here, with the host-side stride/offset precomputation in this class.
 /// </summary>
 public sealed class IlgpuEngine : IExecutionEngine
 {
@@ -31,6 +33,21 @@ public sealed class IlgpuEngine : IExecutionEngine
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _mul;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _div;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _relu;
+
+    // Extra elementwise activations (one-thread-per-element, mirroring the Relu style).
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _sigmoid;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _tanh;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _gelu;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _exp;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _sqrt;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, float> _leakyRelu;
+
+    // Data-movement / reduction ops whose strides are precomputed on the host.
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>,
+        ArrayView<int>, ArrayView<int>, int> _transpose;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, int, int> _softmax;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>,
+        ArrayView<int>, ArrayView<int>, ArrayView<int>, int, int, float> _reduce;
 
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         ArrayView<int>, ArrayView<int>, ArrayView<int>, int, int> _broadcast;
@@ -66,6 +83,19 @@ public sealed class IlgpuEngine : IExecutionEngine
         _div = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>>(GpuKernels.DivK);
         _relu = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(ReluK);
 
+        _sigmoid = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(SigmoidK);
+        _tanh = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(TanhK);
+        _gelu = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(GeluK);
+        _exp = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(ExpK);
+        _sqrt = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(SqrtK);
+        _leakyRelu = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, float>(LeakyReluK);
+
+        _transpose = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, ArrayView<int>, int>(GpuKernels.TransposeK);
+        _softmax = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, int, int>(GpuKernels.SoftmaxK);
+        _reduce = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, ArrayView<int>, ArrayView<int>, int, int, float>(GpuKernels.ReduceK);
+
         _broadcast = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             ArrayView<int>, ArrayView<int>, ArrayView<int>, int, int>(GpuKernels.BroadcastBinaryK);
         _matmul = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
@@ -82,6 +112,30 @@ public sealed class IlgpuEngine : IExecutionEngine
     private static void SubK(Index1D i, ArrayView<float> a, ArrayView<float> b, ArrayView<float> y) => y[i] = a[i] - b[i];
     private static void MulK(Index1D i, ArrayView<float> a, ArrayView<float> b, ArrayView<float> y) => y[i] = a[i] * b[i];
     private static void ReluK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = a[i] > 0f ? a[i] : 0f;
+
+    // Extra activations. MathF.{Exp,Tanh,Sqrt} are recognized by ILGPU's frontend (ExpF/TanhF/SqrtF) and
+    // lowered per backend, so these compile identically to the CPU kernels they mirror.
+    private static void SigmoidK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = 1f / (1f + MathF.Exp(-a[i]));
+    private static void TanhK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Tanh(a[i]);
+    private static void ExpK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Exp(a[i]);
+    private static void SqrtK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Sqrt(a[i]);
+    private static void GeluK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = 0.5f * a[i] * (1f + Erf(a[i] * 0.70710678f));
+    private static void LeakyReluK(Index1D i, ArrayView<float> a, ArrayView<float> y, float alpha) => y[i] = a[i] >= 0f ? a[i] : alpha * a[i];
+
+    /// <summary>
+    /// Device-side error function (Abramowitz &amp; Stegun 7.1.26), with the same constants as the CPU
+    /// <c>MathHelpers.Erf</c> so <see cref="GeluK"/> matches the CPU GELU. Avoids <c>MathF.Sign</c>/
+    /// <c>MathF.Abs</c> (computed inline) to stay on the always-available arithmetic intrinsics.
+    /// </summary>
+    private static float Erf(float x)
+    {
+        float sign = x < 0f ? -1f : 1f;
+        float ax = x < 0f ? -x : x;
+        float t = 1f / (1f + 0.3275911f * ax);
+        float y = 1f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f)
+                  * t * MathF.Exp(-ax * ax);
+        return sign * y;
+    }
 
     /// <inheritdoc />
     public IReadOnlyDictionary<string, NamedTensor> Run(IReadOnlyDictionary<string, NamedTensor> feeds)
@@ -114,11 +168,22 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Mul": RunBinary(GpuKernels.OpMul, node, buffers, shapes, temps); break;
                     case "Div": RunBinary(GpuKernels.OpDiv, node, buffers, shapes, temps); break;
                     case "Relu": RunUnary(_relu, node, buffers, shapes); break;
+                    case "Sigmoid": RunUnary(_sigmoid, node, buffers, shapes); break;
+                    case "Tanh": RunUnary(_tanh, node, buffers, shapes); break;
+                    case "Gelu": RunUnary(_gelu, node, buffers, shapes); break;
+                    case "Exp": RunUnary(_exp, node, buffers, shapes); break;
+                    case "Sqrt": RunUnary(_sqrt, node, buffers, shapes); break;
+                    case "LeakyRelu": RunLeakyRelu(node, buffers, shapes); break;
+                    case "Transpose": RunTranspose(node, buffers, shapes, temps); break;
+                    case "Softmax": RunSoftmax(node, buffers, shapes); break;
+                    case "ReduceSum": RunReduce(node, buffers, shapes, temps, mean: false); break;
+                    case "ReduceMean": RunReduce(node, buffers, shapes, temps, mean: true); break;
                     case "MatMul": RunMatMul(node, buffers, shapes, temps); break;
                     case "Conv": RunConv(node, buffers, shapes, temps); break;
                     default:
                         throw new UnsupportedOperatorException(node.OpType,
-                            $"node '{node.Name}' — the GPU engine covers elementwise, MatMul and Conv ops");
+                            $"node '{node.Name}' — the GPU engine covers elementwise/activations, Softmax, " +
+                            "Transpose, ReduceSum/ReduceMean, MatMul and Conv ops");
                 }
             }
             _accelerator.Synchronize();
@@ -201,6 +266,196 @@ public sealed class IlgpuEngine : IExecutionEngine
         kernel((int)a.Length, a.View, y.View);
         buffers[node.Outputs[0]] = y;
         shapes[node.Outputs[0]] = shapes[node.Inputs[0]];
+    }
+
+    /// <summary>Leaky ReLU (<c>x</c> if x ≥ 0 else <c>α·x</c>); <c>alpha</c> defaults to 0.01. Mirrors the CPU <c>LeakyReluKernel</c>.</summary>
+    private void RunLeakyRelu(
+        GraphNode node,
+        Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> buffers,
+        Dictionary<string, TensorShape> shapes)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> a = buffers[node.Inputs[0]];
+        float alpha = AttrFloat(node, "alpha", 0.01f);
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(a.Length);
+        _leakyRelu((int)a.Length, a.View, y.View, alpha);
+        buffers[node.Outputs[0]] = y;
+        shapes[node.Outputs[0]] = shapes[node.Inputs[0]];
+    }
+
+    /// <summary>
+    /// General N-D axis permutation (ONNX <c>Transpose</c>; <c>perm</c> defaults to a full reverse). The
+    /// output row-major strides and the per-output-axis source strides (<c>inStrides[perm[i]]</c>) are
+    /// precomputed on the host and uploaded; the kernel is a single gather. Mirrors the CPU <c>TransposeKernel</c>.
+    /// </summary>
+    private void RunTranspose(
+        GraphNode node,
+        Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> buffers,
+        Dictionary<string, TensorShape> shapes,
+        List<MemoryBuffer> temps)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> x = buffers[node.Inputs[0]];
+        TensorShape xS = shapes[node.Inputs[0]];
+        ReadOnlySpan<int> dims = xS.Dimensions;
+        int rank = dims.Length;
+
+        int[] perm = node.Attributes.ContainsKey("perm")
+            ? AttrInts(node, "perm", Array.Empty<int>())
+            : ReverseAxes(rank);
+
+        int[] inStrides = Strides(dims);
+        var outDims = new int[rank];
+        var srcStrides = new int[rank];
+        for (int i = 0; i < rank; i++)
+        {
+            outDims[i] = dims[perm[i]];
+            srcStrides[i] = inStrides[perm[i]];
+        }
+        int[] outStrides = Strides(outDims);
+
+        int n = 1;
+        foreach (int d in outDims) n *= d;
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(n);
+        ArrayView<int> vOut = Upload(outStrides, temps);
+        ArrayView<int> vSrc = Upload(srcStrides, temps);
+
+        _transpose(n, x.View, y.View, vOut, vSrc, rank);
+        buffers[node.Outputs[0]] = y;
+        shapes[node.Outputs[0]] = new TensorShape(outDims);
+    }
+
+    /// <summary>
+    /// Softmax along an axis (default the last), max-subtraction stabilized. The axis is reduced into
+    /// (outer, inner) extents on the host and one GPU thread handles each row. Mirrors the CPU <c>SoftmaxKernel</c>.
+    /// </summary>
+    private void RunSoftmax(
+        GraphNode node,
+        Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> buffers,
+        Dictionary<string, TensorShape> shapes)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> x = buffers[node.Inputs[0]];
+        TensorShape xS = shapes[node.Inputs[0]];
+        ReadOnlySpan<int> dims = xS.Dimensions;
+        int rank = dims.Length;
+        long axisAttr = AttrInt(node, "axis", -1);
+        int axis = (int)(axisAttr < 0 ? axisAttr + rank : axisAttr);
+
+        int axisSize = dims[axis];
+        int outer = 1;
+        for (int i = 0; i < axis; i++) outer *= dims[i];
+        int inner = 1;
+        for (int i = axis + 1; i < rank; i++) inner *= dims[i];
+
+        int total = 1;
+        foreach (int d in dims) total *= d;
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(total);
+
+        _softmax(outer * inner, x.View, y.View, axisSize, inner);
+        buffers[node.Outputs[0]] = y;
+        shapes[node.Outputs[0]] = xS;
+    }
+
+    /// <summary>
+    /// ReduceSum / ReduceMean over the given <c>axes</c> with <c>keepdims</c> (axes from the attribute, the
+    /// optional second input, or all axes when absent; <c>noop_with_empty_axes</c> honored). For each output
+    /// element the host precomputes its zero-reduced-coordinate input offset and the reduced-axis strides;
+    /// the kernel folds in the same order as the CPU reduce kernels. <paramref name="mean"/> divides by the
+    /// reduced-element count.
+    /// </summary>
+    private void RunReduce(
+        GraphNode node,
+        Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> buffers,
+        Dictionary<string, TensorShape> shapes,
+        List<MemoryBuffer> temps,
+        bool mean)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> x = buffers[node.Inputs[0]];
+        TensorShape xS = shapes[node.Inputs[0]];
+        ReadOnlySpan<int> inDims = xS.Dimensions;
+        int rank = inDims.Length;
+
+        int[]? axes = null;
+        if (node.Attributes.ContainsKey("axes"))
+            axes = AttrInts(node, "axes", Array.Empty<int>());
+        else if (node.Inputs.Count > 1 && node.Inputs[1].Length > 0)
+            axes = Array.ConvertAll(buffers[node.Inputs[1]].GetAsArray1D(), v => (int)v);
+
+        bool keepdims = AttrInt(node, "keepdims", 1) != 0;
+        bool noopEmpty = AttrInt(node, "noop_with_empty_axes", 0) != 0;
+
+        if ((axes is null || axes.Length == 0) && noopEmpty)
+        {
+            // Identity: copy the input through unchanged.
+            MemoryBuffer1D<float, Stride1D.Dense> copy = _accelerator.Allocate1D(x.GetAsArray1D());
+            buffers[node.Outputs[0]] = copy;
+            shapes[node.Outputs[0]] = xS;
+            return;
+        }
+
+        var reduced = new bool[rank];
+        if (axes is null || axes.Length == 0)
+            for (int i = 0; i < rank; i++) reduced[i] = true;
+        else
+            foreach (int ax in axes) reduced[ax < 0 ? ax + rank : ax] = true;
+
+        int[] inStrides = Strides(inDims);
+        var keepDims = new int[rank];
+        for (int i = 0; i < rank; i++) keepDims[i] = reduced[i] ? 1 : inDims[i];
+
+        int outLen = 1;
+        foreach (int d in keepDims) outLen *= d;
+        int redCount = 1;
+        for (int i = 0; i < rank; i++) if (reduced[i]) redCount *= inDims[i];
+
+        // Reduced axes (ascending order) and their input strides; row-major strides over the reduced
+        // index space drive the kernel's fold order (last reduced axis fastest = CPU order).
+        var redDimsList = new List<int>();
+        var redStridesList = new List<int>();
+        for (int i = 0; i < rank; i++)
+            if (reduced[i]) { redDimsList.Add(inDims[i]); redStridesList.Add(inStrides[i]); }
+        int numRed = redDimsList.Count;
+        int[] redStrides = redStridesList.ToArray();
+        int[] redOutStrides = Strides(redDimsList.ToArray());
+
+        // For each output element (row-major over keepDims) the input offset with all reduced coords = 0.
+        var outBase = new int[outLen];
+        var coord = new int[rank];
+        for (int o = 0; o < outLen; o++)
+        {
+            int off = 0;
+            for (int ax = 0; ax < rank; ax++) off += coord[ax] * inStrides[ax];
+            outBase[o] = off;
+            for (int ax = rank - 1; ax >= 0; ax--) { if (++coord[ax] < keepDims[ax]) break; coord[ax] = 0; }
+        }
+
+        float divisor = mean ? redCount : 1f;
+        MemoryBuffer1D<float, Stride1D.Dense> y = _accelerator.Allocate1D<float>(outLen);
+        ArrayView<int> vBase = Upload(outBase, temps);
+        ArrayView<int> vRedOut = Upload(redOutStrides, temps);
+        ArrayView<int> vRedStr = Upload(redStrides, temps);
+
+        _reduce(outLen, x.View, y.View, vBase, vRedOut, vRedStr, numRed, redCount, divisor);
+
+        int[] finalDims;
+        if (keepdims)
+        {
+            finalDims = keepDims;
+        }
+        else
+        {
+            var list = new List<int>();
+            for (int i = 0; i < rank; i++) if (!reduced[i]) list.Add(inDims[i]);
+            finalDims = list.ToArray();
+        }
+        buffers[node.Outputs[0]] = y;
+        shapes[node.Outputs[0]] = new TensorShape(finalDims);
+    }
+
+    /// <summary>The default Transpose permutation: axes fully reversed.</summary>
+    private static int[] ReverseAxes(int rank)
+    {
+        var perm = new int[rank];
+        for (int i = 0; i < rank; i++) perm[i] = rank - 1 - i;
+        return perm;
     }
 
     /// <summary>
@@ -414,6 +669,9 @@ public sealed class IlgpuEngine : IExecutionEngine
 
     private static long AttrInt(GraphNode n, string name, long dflt)
         => n.Attributes.TryGetValue(name, out object? v) ? Convert.ToInt64(v) : dflt;
+
+    private static float AttrFloat(GraphNode n, string name, float dflt)
+        => n.Attributes.TryGetValue(name, out object? v) ? Convert.ToSingle(v) : dflt;
 
     private static string AttrStr(GraphNode n, string name, string dflt)
         => n.Attributes.TryGetValue(name, out object? v) && v is string s ? s : dflt;

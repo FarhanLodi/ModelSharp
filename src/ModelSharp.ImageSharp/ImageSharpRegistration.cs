@@ -27,6 +27,16 @@ public static class ImageSharpRegistration
         ProcessorRegistry.RegisterPostprocessor(
             ModelTask.ImageClassification,
             ctx => new ClassificationPostprocessor(ctx.Manifest));
+
+        // Object detection reuses the image preprocessor (resize + normalize + NCHW) and
+        // decodes YOLO-style outputs into boxes via the DetectionPostprocessor.
+        ProcessorRegistry.RegisterPreprocessor(
+            ModelTask.ObjectDetection,
+            ctx => new ImagePreprocessor(ctx.InputNames[0], ctx.Manifest));
+
+        ProcessorRegistry.RegisterPostprocessor(
+            ModelTask.ObjectDetection,
+            ctx => new DetectionPostprocessor(ctx.Manifest));
     }
 #pragma warning restore CA2255
 
