@@ -27,6 +27,7 @@ public class GenerationTests
         public int AttentionMaskLength = -1;
         public int PastSequenceLength = -1;
         public long[]? Positions;
+        public bool? UseCacheBranch;
     }
 
     /// <summary>
@@ -68,6 +69,8 @@ public class GenerationTests
                     ? feeds["past_key_values.0.key"].Tensor.Shape.Dimensions[2] : -1,
                 Positions = feeds.ContainsKey("position_ids")
                     ? feeds["position_ids"].Tensor.AsInt64().Span.ToArray() : null,
+                UseCacheBranch = feeds.ContainsKey("use_cache_branch")
+                    ? ReadBoolFeed(feeds["use_cache_branch"].Tensor) : null,
             };
             Records.Add(record);
 
@@ -117,6 +120,15 @@ public class GenerationTests
     }
 
     private static float[] Clone(float[] a) => (float[])a.Clone();
+
+    /// <summary>Reads a single-element use_cache_branch feed as a bool, regardless of declared dtype.</summary>
+    private static bool ReadBoolFeed(Tensor tensor) => tensor switch
+    {
+        Tensor<bool> tb => tb.Span[0],
+        Tensor<int> ti => ti.Span[0] != 0,
+        Tensor<long> tl => tl.Span[0] != 0,
+        _ => throw new InvalidOperationException($"Unexpected use_cache_branch tensor type {tensor.GetType().Name}."),
+    };
 
     private static FakeEngine NoCacheEngine(Func<int, float[]> logits, bool rank2 = false) =>
         new(new[] { In("input_ids") }, new[] { Out("logits") }, logits, rank2);
@@ -444,6 +456,108 @@ public class GenerationTests
         Assert.True(generator.UsesKvCache);
         Assert.Equal(0, engine.Records[0].PastSequenceLength); // empty past built from [1,2,0,4]
         Assert.Equal(2, engine.Records[1].PastSequenceLength); // threaded present (prompt of length 2)
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // use_cache_branch (Optimum "merged" decoder exports)
+    // ----------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A "merged" decoder engine: KV-cache inputs/outputs plus a <c>use_cache_branch</c> input of the
+    /// requested dtype. The empty past is still declared so the first pass can bind it.
+    /// </summary>
+    private static FakeEngine MergedEngine(ElementType branchDtype, Func<int, float[]> logits)
+    {
+        var inputs = new[]
+        {
+            In("input_ids"),
+            In("attention_mask"),
+            In("use_cache_branch", branchDtype, new[] { 1 }),
+            In("past_key_values.0.key", ElementType.Float32, new[] { 1, 2, 1, 4 }),
+            In("past_key_values.0.value", ElementType.Float32, new[] { 1, 2, 1, 4 }),
+        };
+        var outputs = new[] { Out("logits"), Out("present.0.key"), Out("present.0.value") };
+        return new FakeEngine(inputs, outputs, logits);
+    }
+
+    [Fact]
+    public void UseCacheBranch_IsDetected_FromInputNames()
+    {
+        Assert.True(new TextGenerator(MergedEngine(ElementType.Boolean, _ => OneHot(8, 7))).FeedsUseCacheBranch);
+        Assert.False(new TextGenerator(KvCacheEngine(_ => OneHot(8, 7))).FeedsUseCacheBranch);
+        Assert.False(new TextGenerator(NoCacheEngine(_ => OneHot(8, 7))).FeedsUseCacheBranch);
+    }
+
+    [Fact]
+    public void UseCacheBranch_IsFalseOnPrefill_AndTrueOnCachedSteps()
+    {
+        var engine = MergedEngine(ElementType.Boolean, _ => OneHot(8, 7));
+        var generator = new TextGenerator(engine);
+
+        generator.Generate(new long[] { 10, 11, 12 }, new GenerationConfig { MaxNewTokens = 3, DoSample = false });
+
+        Assert.Equal(3, engine.Records.Count);
+        // Prefill (past == null) selects the no-past branch; every subsequent cached step selects it.
+        Assert.Equal(new bool?[] { false, true, true }, engine.Records.Select(r => r.UseCacheBranch).ToArray());
+
+        // Empty past is still fed on the prefill pass so the merged graph's bindings all exist.
+        Assert.Equal(0, engine.Records[0].PastSequenceLength);
+        Assert.Contains("past_key_values.0.key", engine.Records[0].FeedNames);
+        Assert.Contains("use_cache_branch", engine.Records[0].FeedNames);
+    }
+
+    [Fact]
+    public void UseCacheBranch_AdaptsToInt64Dtype()
+    {
+        // When the model declares use_cache_branch as int64, 0/1 are fed in that dtype. A recording
+        // engine captures the actual fed tensor so we can assert both its dtype and its values.
+        Tensor? prefillFeed = null;
+        Tensor? cachedFeed = null;
+        var inputs = new[]
+        {
+            In("input_ids"),
+            In("use_cache_branch", ElementType.Int64, new[] { 1 }),
+            In("past_key_values.0.key", ElementType.Float32, new[] { 1, 2, 1, 4 }),
+            In("past_key_values.0.value", ElementType.Float32, new[] { 1, 2, 1, 4 }),
+        };
+        var outputs = new[] { Out("logits"), Out("present.0.key"), Out("present.0.value") };
+        var engine = new RecordingBranchEngine(inputs, outputs, _ => OneHot(8, 7),
+            (call, feed) => { if (call == 0) prefillFeed = feed; else cachedFeed ??= feed; });
+
+        new TextGenerator(engine).Generate(new long[] { 5 }, new GenerationConfig { MaxNewTokens = 2, DoSample = false });
+
+        Assert.IsType<Tensor<long>>(prefillFeed);
+        Assert.IsType<Tensor<long>>(cachedFeed);
+        Assert.Equal(0L, ((Tensor<long>)prefillFeed!).Span[0]);   // false on prefill
+        Assert.Equal(1L, ((Tensor<long>)cachedFeed!).Span[0]);    // true on cached step
+    }
+
+    /// <summary>A KV-cache engine that forwards the use_cache_branch feed to a callback for dtype checks.</summary>
+    private sealed class RecordingBranchEngine : IExecutionEngine
+    {
+        private readonly FakeEngine _inner;
+        private readonly Action<int, Tensor> _onBranch;
+        private int _call;
+
+        public RecordingBranchEngine(
+            IReadOnlyList<TensorInfo> inputs, IReadOnlyList<TensorInfo> outputs,
+            Func<int, float[]> logits, Action<int, Tensor> onBranch)
+        {
+            _inner = new FakeEngine(inputs, outputs, logits);
+            _onBranch = onBranch;
+        }
+
+        public IReadOnlyList<TensorInfo> Inputs => _inner.Inputs;
+        public IReadOnlyList<TensorInfo> Outputs => _inner.Outputs;
+
+        public IReadOnlyDictionary<string, NamedTensor> Run(IReadOnlyDictionary<string, NamedTensor> feeds)
+        {
+            if (feeds.TryGetValue("use_cache_branch", out NamedTensor? b)) _onBranch(_call, b.Tensor);
+            _call++;
+            return _inner.Run(feeds);
+        }
+
+        public void Dispose() => _inner.Dispose();
     }
 
     [Fact]

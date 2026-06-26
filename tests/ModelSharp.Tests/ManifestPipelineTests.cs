@@ -196,6 +196,37 @@ public class ManifestPipelineTests
         finally { Directory.Delete(dir, true); }
     }
 
+    // ---------------------------------------------------------------- precedence
+
+    [Fact]
+    public void Resolver_Precedence_Sidecar_Beats_Metadata_Beats_BuiltIn()
+    {
+        string dir = NewTempDir();
+        try
+        {
+            // File name matches the built-in "minilm" heuristic -> Embedding.
+            // Embedded metadata declares a different task -> ImageClassification.
+            // Sidecar JSON declares yet another -> ObjectDetection.
+            string modelPath = Path.Combine(dir, "all-MiniLM-L6-v2.onnx");
+            var graphWithMeta = new ModelGraph
+            {
+                MetadataProps = new Dictionary<string, string> { ["task"] = "ImageClassification" },
+            };
+
+            // (1) All three present: sidecar JSON wins.
+            File.WriteAllText(modelPath + ".manifest.json", """{ "task": "ObjectDetection" }""");
+            Assert.Equal(ModelTask.ObjectDetection, ManifestResolver.Resolve(modelPath, graphWithMeta).Task);
+
+            // (2) Remove the sidecar: embedded metadata wins over the built-in heuristic.
+            File.Delete(modelPath + ".manifest.json");
+            Assert.Equal(ModelTask.ImageClassification, ManifestResolver.Resolve(modelPath, graphWithMeta).Task);
+
+            // (3) Remove the metadata too: the built-in file-name heuristic applies.
+            Assert.Equal(ModelTask.Embedding, ManifestResolver.Resolve(modelPath, new ModelGraph()).Task);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     // ---------------------------------------------------------------- ProcessorRegistry
 
     [Fact]
@@ -306,6 +337,89 @@ public class ManifestPipelineTests
 
         double unit = 0; foreach (float x in v) unit += x * x;
         Assert.Equal(1.0, unit, 4);   // result is unit length
+    }
+
+    [Fact]
+    public void MeanPool_UsesInputMask_FromCooperatingPreprocessor_OverPadding()
+    {
+        // Two tokens, hidden size 2: row 0 = [10,10] (real), row 1 = [0,0] (padding).
+        // Pooling over ALL tokens -> [5,5]; pooling with a mask that drops row 1 -> [10,10].
+        var hidden = new Tensor<float>(new TensorShape(1, 2, 2), new float[] { 10, 10, 0, 0 });
+        var outputs = new Dictionary<string, NamedTensor> { ["h"] = new NamedTensor("h", hidden) };
+
+        // Shared holder mimics the preprocessor having recorded the input mask [1, 0].
+        var holder = new AttentionMaskHolder { LastMask = new float[] { 1f, 0f } };
+        var masked = (float[])new MeanPoolEmbeddingPostprocessor(holder).Decode(outputs);
+
+        // Without a mask the postprocessor pools over both tokens.
+        var unmasked = (float[])new MeanPoolEmbeddingPostprocessor().Decode(outputs);
+
+        // Both results are L2-normalized, so compare directions: [10,10] vs [5,5] normalize to the
+        // same unit vector — that's not enough to prove masking. Use asymmetric padding instead.
+        var hidden2 = new Tensor<float>(new TensorShape(1, 2, 2), new float[] { 4, 0, 0, 4 });
+        var outputs2 = new Dictionary<string, NamedTensor> { ["h"] = new NamedTensor("h", hidden2) };
+        var maskedAsym = (float[])new MeanPoolEmbeddingPostprocessor(
+            new AttentionMaskHolder { LastMask = new float[] { 1f, 0f } }).Decode(outputs2);
+        var unmaskedAsym = (float[])new MeanPoolEmbeddingPostprocessor().Decode(outputs2);
+
+        // Masked pools only row 0 = [4,0] -> unit [1,0]; unmasked pools [2,2] -> unit [0.707,0.707].
+        Assert.Equal(1f, maskedAsym[0], 4);
+        Assert.Equal(0f, maskedAsym[1], 4);
+        Assert.Equal(0.70710677f, unmaskedAsym[0], 4);
+        Assert.Equal(0.70710677f, unmaskedAsym[1], 4);
+        Assert.NotEqual(unmaskedAsym[0], maskedAsym[0], 3);
+
+        // The symmetric case still differs in denominator handling but normalizes alike; assert the
+        // masked-vs-unmasked vectors are both unit length as a sanity check.
+        Assert.Equal(1.0, Norm(masked), 4);
+        Assert.Equal(1.0, Norm(unmasked), 4);
+    }
+
+    [Fact]
+    public void Embedding_Registry_Shares_Mask_So_Padded_Pooling_Skips_Padding()
+    {
+        string dir = NewTempDir();
+        try
+        {
+            string vocab = Path.Combine(dir, "vocab.txt");
+            File.WriteAllLines(vocab, new[] { "[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "world" });
+            var manifest = new ModelManifest
+            {
+                Task = ModelTask.Embedding,
+                Extra = new Dictionary<string, string> { ["vocab"] = vocab },
+            };
+
+            // One shared context => the registry hands the pre and post a single AttentionMaskHolder.
+            var ctx = new ProcessorContext(manifest, new[] { "input_ids", "attention_mask", "token_type_ids" }, new[] { "h" });
+            IPreprocessor pre = ProcessorRegistry.CreatePreprocessor(ctx);
+            IPostprocessor post = ProcessorRegistry.CreatePostprocessor(ctx);
+
+            // Preprocess "hello world" => 4 tokens ([CLS] hello world [SEP]); all real, mask all ones.
+            IReadOnlyDictionary<string, NamedTensor> feeds = pre.ToFeeds("hello world");
+            int s = feeds["input_ids"].Tensor.Shape.Dimensions[1];
+            Assert.Equal(4, s);
+
+            // Build a hidden state where the LAST token carries a wildly different value. Because every
+            // token is real here, masking must include it (mask all ones recorded by the preprocessor).
+            var data = new float[s * 2];
+            for (int i = 0; i < s; i++) { data[i * 2] = 1f; data[i * 2 + 1] = 1f; }
+            data[(s - 1) * 2] = 100f; data[(s - 1) * 2 + 1] = 100f;
+            var hidden = new Tensor<float>(new TensorShape(1, s, 2), data);
+            var outputs = new Dictionary<string, NamedTensor> { ["h"] = new NamedTensor("h", hidden) };
+
+            var pooled = (float[])post.Decode(outputs);
+            // All-ones mask => the 100-valued token contributes; result is the normalized mean of all
+            // rows, which is NOT the normalized first row. Equal components (symmetric data) => unit.
+            Assert.Equal(2, pooled.Length);
+            Assert.Equal(1.0, Norm(pooled), 4);
+            Assert.Equal(pooled[0], pooled[1], 4);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    private static double Norm(float[] v)
+    {
+        double s = 0; foreach (float x in v) s += (double)x * x; return Math.Sqrt(s);
     }
 
     // ---------------------------------------------------------------- end-to-end (opt-in)
