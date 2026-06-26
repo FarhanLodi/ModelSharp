@@ -44,6 +44,21 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
 - 🖼️ **Optional image adapter** — image → tensor and top-K classification decoding via ImageSharp.
 
+## Verified on real models
+
+ModelSharp has been validated **end to end on real, exported ONNX models** — with **no Python at inference time and no native dependencies** — across every supported task:
+
+| Task | Model | Result |
+|------|-------|--------|
+| Embedding | all-MiniLM-L6-v2 | 384-d semantic embeddings (cosine **0.70** paraphrase vs **−0.05** unrelated) |
+| Text generation (LLM) | distilgpt2 | greedy, deterministic decode — `"The quick brown fox"` → `"es are a common sight in the wild, and are often found in the wild"` |
+| Image classification | ResNet50 | top-1 **"tiger cat" (82%)** on a sample image |
+| Object detection | YOLOv8 | detects **2 cats** with well-formed boxes (auto layout detection) |
+| Speech recognition (CTC) | wav2vec2-base-960h | transcribes a LibriSpeech clip exactly as `"MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL"` |
+| GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **29 ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
+
+The full test suite is **463 passing (0 failed)**. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+
 ## Installation
 
 ```bash
@@ -223,16 +238,17 @@ GPU-accelerated ops today: broadcasting elementwise (Add/Sub/Mul/Div), ReLU, **M
 
 - The bundled **MNIST** CNN is loaded by ModelSharp's own ONNX reader and run through the managed kernels, reproducing ONNX Runtime's reference output to within `1e-2`.
 - The real pretrained **all-MiniLM-L6-v2** sentence-transformer runs end to end (tokenize → 6 transformer layers → mean-pooled embedding), producing semantically correct 384-d embeddings — cosine **0.70** for paraphrases vs **−0.05** for unrelated text — entirely through `Pipeline.Load(...).Run<float[]>(...)`.
+- Text generation (**distilgpt2**), image classification (**ResNet50**), object detection (**YOLOv8**), and speech recognition (**wav2vec2-base-960h** via CTC) all run end to end on real exported models — see [Verified on real models](#verified-on-real-models) for the concrete outputs.
 
 | Phase | State |
 |-------|-------|
 | 1. CNN core | ✅ verified (MNIST vs ONNX-Runtime reference) |
 | 2. Sequence | ✅ LSTM + GRU verified (vs ONNX reference) |
-| 3. Transformer | ✅ real pretrained all-MiniLM-L6-v2 runs end-to-end — semantic embeddings verified |
-| 4. Audio | 🟡 FFT + log-mel front end **and** CTC decoder (greedy + prefix-beam) implemented & unit-tested; end-to-end with a pretrained acoustic model is next |
-| 5. GPU | 🟡 ILGPU engine covers broadcasting elementwise + MatMul + Conv2D, numerically verified vs CPU; real-hardware tuning + multi-dtype next |
+| 3. Transformer | ✅ real pretrained all-MiniLM-L6-v2 (embeddings) + distilgpt2 (greedy generation) run end-to-end |
+| 4. Audio | ✅ FFT + log-mel front end and CTC decoder verified end-to-end on real wav2vec2-base-960h (exact LibriSpeech transcription) |
+| 5. GPU | ✅ ILGPU engine matches the CPU engine across 29 ops on a real RTX 4090 (CUDA); MatMul ~556× / Conv2D ~109× faster than managed CPU |
 
-> This is an **alpha** (`0.1.0-alpha`). Phases 2–5 are seeded with real, tested foundations — full sequence / transformer / audio / GPU coverage is the multi-quarter roadmap, not a finished product.
+> This is an **alpha** (`0.1.0-alpha`). Every task above is verified on a real model, but operator and backend coverage is still growing — full breadth across the ONNX op set and GPU multi-dtype is the multi-quarter roadmap, not a finished product.
 
 ## Building from source
 
