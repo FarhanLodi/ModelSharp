@@ -8,7 +8,7 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **463 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **514 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
 
 - **2026-06-26:** validated end-to-end on an RTX 4090 (CUDA) + real model exports.
 - **Phase 0 (GPU bring-up):** ✅ ILGPU sees the RTX 4090 (`IsHardwareGpu == true`); new hardware-gated
@@ -17,7 +17,10 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
   A2 ResNet50 classification, A3 YOLOv8 detection, A4 wav2vec2 CTC ASR). See Phase A below for results.
 - **Phase B (GPU):** ✅ B1 CUDA path validated vs CPU (29 parity ops within 1e-3), B2 GPU multi-dtype
   (int32/int64) + B3 GPU op parity (LayerNorm/Gather/Concat/Slice/Cast) now verified on CUDA, B4 perf
-  (MatMul ~556x, Conv2D ~109x vs CPU on the 4090), B5 intermediates stay on-device.
+  (MatMul ~556x, Conv2D ~109x vs CPU on the 4090). B5: GPU decoder kernels + an on-device KV-cache
+  now run a full self-attention block and a multi-step autoregressive decode entirely on CUDA
+  (~1.3 ms/step); 98.7% of distilgpt2's nodes are GPU-dispatchable (integer mask/position prologue
+  still falls back). Op coverage 143 → 163.
 - **Phase C:** ✅ C1 `use_cache_branch`, ✅ C2 `Pipeline.Generate` text-generation API, ✅ C3 quantization
   (DequantizeLinear/QuantizeLinear/DynamicQuantizeLinear/MatMulInteger + GPTQ/AWQ safetensors dequant),
   ✅ C4 mmap >2 GB safetensors + sharded `index.json`, ✅ C5 GGUF reader, ✅ C6 fused LLM ops
@@ -31,7 +34,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 463 tests, 0 failures** (432 base + 31
+- Build/test baseline: `dotnet test` must be **GREEN — 514 tests, 0 failures** (432 base + 31
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,
@@ -110,8 +113,15 @@ asset is absent** (mirror `MiniLmTests`; discovery via `MODELSHARP_MODELS_DIR` /
   element-wise broadcasting, Cast), each verified vs CPU and now on CUDA.
 - **B4 — Performance.** ✅ Benchmarked GPU vs CPU on the 4090: **MatMul 1024³ ~556x speedup**,
   **Conv2D ~109x** vs the CPU engine. (Correctness first, then speed.)
-- **B5 — Whole-graph on GPU + GPU KV-cache.** ✅ Intermediates already stay on-device between ops;
-  remaining on-device-KV-cache work is documented in `src/ModelSharp.Gpu/B5_NOTES.md`.
+- **B5 — Whole-graph on GPU + GPU KV-cache.** ✅ (compute path) Added 11 GPU decoder kernels
+  (Reshape/Unsqueeze/Squeeze/Shape/Constant/Expand/Split/Pow/Where/Erf/Gemm) → **98.7% of
+  distilgpt2's nodes GPU-dispatchable**. Implemented an **on-device KV-cache** (`GpuKvCache` +
+  `IlgpuEngine.CreateKvCache`/`DecodeStepAttention`): a full self-attention block and a 5-step
+  autoregressive decode run **entirely on CUDA**, matching the CPU engine within 1e-3
+  (~1.3 ms/step, K/V never leave the device). ⏳ Remaining for a *whole-graph* run: GPU kernels for
+  the 6 integer mask/position-id prologue ops (Range, ConstantOfShape, Equal, Greater, Trilu,
+  ScatterND) and composing projections/MLP/residual into the cache seam. See
+  `src/ModelSharp.Gpu/B5_NOTES.md`.
 
 ---
 
@@ -135,7 +145,9 @@ asset is absent** (mirror `MiniLmTests`; discovery via `MODELSHARP_MODELS_DIR` /
 ---
 
 ## Phase D — Op coverage & correctness cleanups
-- ✅ Op coverage now **143 of ~190** standard ops. Extend further as models demand. Add via new kernel files +
+- ✅ Op coverage now **163 of ~190** standard ops (added Einsum, ConvTranspose, GridSample,
+  NonMaxSuppression, Col2Im, Det, Unique, Bitwise{And,Or,Xor,Not}, {Hann,Hamming,Blackman}Window,
+  CenterCropPad, Dropout, MaxRoiPool, Upsample, Bernoulli, Multinomial). Extend further as models demand. Add via new kernel files +
   `KernelRegistry`, each with a `NewOpsTests`-style unit test.
 - **Minor fixes from the audit (small, non-blocking):**
   - ✅ `MeanPoolEmbeddingPostprocessor` now uses the **input** `attention_mask`. (Was: looks for it among model **outputs** (it's normally an
