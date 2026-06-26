@@ -157,3 +157,21 @@ public sealed class ReduceSumSquareKernel : ReduceKernelBase
     protected override float Init => 0f;
     protected override float Combine(float acc, float x) => acc + x * x;
 }
+
+/// <summary>Log of the sum over the given axes (ONNX <c>ReduceLogSum</c>): <c>log(Σ x)</c>.</summary>
+public sealed class ReduceLogSumKernel : ReduceKernelBase
+{
+    public override string OpType => "ReduceLogSum";
+    protected override float Init => 0f;
+    protected override float Combine(float acc, float x) => acc + x;
+    protected override float Postprocess(float acc, int count) => MathF.Log(acc);
+}
+
+/// <summary>Log of the sum of exponentials over the given axes (ONNX <c>ReduceLogSumExp</c>): <c>log(Σ exp(x))</c>.</summary>
+public sealed class ReduceLogSumExpKernel : ReduceKernelBase
+{
+    public override string OpType => "ReduceLogSumExp";
+    protected override float Init => 0f;
+    protected override float Combine(float acc, float x) => acc + MathF.Exp(x);
+    protected override float Postprocess(float acc, int count) => MathF.Log(acc);
+}

@@ -16,6 +16,14 @@ public sealed record DecoderModelOptions
     /// <summary>Name of the position-ids input. Fed only when the model declares it. Default <c>position_ids</c>.</summary>
     public string PositionIdsName { get; init; } = "position_ids";
 
+    /// <summary>
+    /// Name of the boolean <c>use_cache_branch</c> input found in Optimum "merged" decoder exports,
+    /// which unify the prefill (no-past) and decode (with-past) graphs into one. Fed only when the
+    /// model declares it: <c>false</c> on the first/prefill pass, <c>true</c> on every cached step.
+    /// Default <c>use_cache_branch</c>.
+    /// </summary>
+    public string UseCacheBranchName { get; init; } = "use_cache_branch";
+
     /// <summary>Name of the logits output. Default <c>logits</c>; if absent the first non-cache output is used.</summary>
     public string LogitsOutputName { get; init; } = "logits";
 
