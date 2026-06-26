@@ -12,6 +12,30 @@ public sealed class CosKernel : UnaryKernel { public override string OpType => "
 /// <summary>Elementwise tangent.</summary>
 public sealed class TanKernel : UnaryKernel { public override string OpType => "Tan"; protected override float Apply(float x) => MathF.Tan(x); }
 
+/// <summary>Elementwise arcsine.</summary>
+public sealed class AsinKernel : UnaryKernel { public override string OpType => "Asin"; protected override float Apply(float x) => MathF.Asin(x); }
+
+/// <summary>Elementwise arccosine.</summary>
+public sealed class AcosKernel : UnaryKernel { public override string OpType => "Acos"; protected override float Apply(float x) => MathF.Acos(x); }
+
+/// <summary>Elementwise arctangent.</summary>
+public sealed class AtanKernel : UnaryKernel { public override string OpType => "Atan"; protected override float Apply(float x) => MathF.Atan(x); }
+
+/// <summary>Elementwise hyperbolic sine.</summary>
+public sealed class SinhKernel : UnaryKernel { public override string OpType => "Sinh"; protected override float Apply(float x) => MathF.Sinh(x); }
+
+/// <summary>Elementwise hyperbolic cosine.</summary>
+public sealed class CoshKernel : UnaryKernel { public override string OpType => "Cosh"; protected override float Apply(float x) => MathF.Cosh(x); }
+
+/// <summary>Elementwise inverse hyperbolic sine.</summary>
+public sealed class AsinhKernel : UnaryKernel { public override string OpType => "Asinh"; protected override float Apply(float x) => MathF.Asinh(x); }
+
+/// <summary>Elementwise inverse hyperbolic cosine.</summary>
+public sealed class AcoshKernel : UnaryKernel { public override string OpType => "Acosh"; protected override float Apply(float x) => MathF.Acosh(x); }
+
+/// <summary>Elementwise inverse hyperbolic tangent.</summary>
+public sealed class AtanhKernel : UnaryKernel { public override string OpType => "Atanh"; protected override float Apply(float x) => MathF.Atanh(x); }
+
 /// <summary>Elementwise reciprocal (1/x).</summary>
 public sealed class ReciprocalKernel : UnaryKernel { public override string OpType => "Reciprocal"; protected override float Apply(float x) => 1f / x; }
 
