@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/ModelSharp.Gpu/ModelSharp.Gpu.csproj" />
+    <Project Path="src/ModelSharp.Hub/ModelSharp.Hub.csproj" />
     <Project Path="src/ModelSharp.ImageSharp/ModelSharp.ImageSharp.csproj" />
     <Project Path="src/ModelSharp/ModelSharp.csproj" />
   </Folder>
