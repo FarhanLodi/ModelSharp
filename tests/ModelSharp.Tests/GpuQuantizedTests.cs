@@ -458,6 +458,29 @@ public class GpuQuantizedTests
             g, f, cuda: false);
     }
 
+    /// <summary>
+    /// The tiled int8 GEMM and the naïve one-thread-per-output kernel must be BIT-EXACT to each other (and to the
+    /// CPU reference) across every shape / dtype / zero-point form — int32 wraparound semantics preserved. Runs on
+    /// the ILGPU CPU accelerator so it covers every machine (no CUDA needed); the kernel logic is identical on CUDA.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MatMulIntegerCases))]
+    public void MatMulInteger_TiledVsNaive_BitExact_CpuAccel(
+        int m, int k, int n, bool aSigned, bool bSigned, string zpKind, int seed, int[]? batch)
+    {
+        var (g, f) = BuildMatMulIntegerRaw(m, k, n, aSigned, bSigned, zpKind, seed, batch);
+        using var cpu = new ManagedCpuEngine(g);
+        using var tiled = new IlgpuEngine(g, preferCpu: true);
+        using var naive = new IlgpuEngine(g, preferCpu: true) { UseNaiveIntGemm = true };
+
+        int[] cOut = ((Tensor<int>)cpu.Run(f)["Y"].Tensor).Span.ToArray();
+        int[] tiledOut = ((Tensor<int>)tiled.Run(f)["Y"].Tensor).Span.ToArray();
+        int[] naiveOut = ((Tensor<int>)naive.Run(f)["Y"].Tensor).Span.ToArray();
+        Assert.Equal(cOut, tiledOut);
+        Assert.Equal(cOut, naiveOut);
+        Assert.Equal(naiveOut, tiledOut);
+    }
+
     // ============================================================================================
     //  Cuda_* — same graphs on real hardware CUDA (skips cleanly when absent)
     // ============================================================================================

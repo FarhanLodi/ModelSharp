@@ -70,9 +70,9 @@ public sealed class GatherElementsKernel : IKernel
 /// Supports <c>reduction</c> none/add/mul/min/max for Float32; integer/bool data support
 /// <c>reduction=none</c> only. Dtype-preserving for <c>data</c>.
 /// </summary>
-public sealed class ScatterElementsKernel : IKernel
+public class ScatterElementsKernel : IKernel
 {
-    public string OpType => "ScatterElements";
+    public virtual string OpType => "ScatterElements";
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -152,4 +152,15 @@ public sealed class ScatterElementsKernel : IKernel
         }
         return y;
     }
+}
+
+/// <summary>
+/// ONNX <c>Scatter</c> (deprecated since opset 11, replaced by <c>ScatterElements</c>). Identical
+/// element-scatter semantics along <c>axis</c>; the only difference is that the legacy op has no
+/// <c>reduction</c> attribute, so it always assigns. Implemented as a thin <see cref="OpType"/>
+/// override of <see cref="ScatterElementsKernel"/> so old exports keep running.
+/// </summary>
+public sealed class ScatterKernel : ScatterElementsKernel
+{
+    public override string OpType => "Scatter";
 }

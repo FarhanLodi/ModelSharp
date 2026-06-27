@@ -85,25 +85,42 @@ public class GpuMatMulIntegerPerfTests
 
         var (graph, feeds) = BuildIntGemm(M, K, N, seed);
 
-        using var gpu = new IlgpuEngine(graph, preferCpu: false);
-        Assert.True(gpu.IsHardwareGpu, $"{what}: expected hardware GPU, got '{gpu.AcceleratorName}'");
-        using var cpu = new ManagedCpuEngine(graph);
+        // Shared GPU box: skip cleanly (don't fail) if a co-tenant process holds VRAM so the large int8
+        // buffers can't be allocated — same treatment as "no CUDA available".
+        try
+        {
+            using var gpuTiled = new IlgpuEngine(graph, preferCpu: false);
+            Assert.True(gpuTiled.IsHardwareGpu, $"{what}: expected hardware GPU, got '{gpuTiled.AcceleratorName}'");
+            using var gpuNaive = new IlgpuEngine(graph, preferCpu: false) { UseNaiveIntGemm = true };
+            using var cpu = new ManagedCpuEngine(graph);
 
-        // Correctness: the native int32 result must equal the CPU reference exactly.
-        int[] gOut = ((Tensor<int>)gpu.Run(feeds)["Y"].Tensor).Span.ToArray();
-        int[] cOut = ((Tensor<int>)cpu.Run(feeds)["Y"].Tensor).Span.ToArray();
-        Assert.Equal(cOut, gOut);
+            // Correctness: BOTH the tiled and the naïve int32 results must equal the CPU reference exactly,
+            // and therefore each other (bit-exact int32 wraparound semantics).
+            int[] cOut = ((Tensor<int>)cpu.Run(feeds)["Y"].Tensor).Span.ToArray();
+            int[] tiledOut = ((Tensor<int>)gpuTiled.Run(feeds)["Y"].Tensor).Span.ToArray();
+            int[] naiveOut = ((Tensor<int>)gpuNaive.Run(feeds)["Y"].Tensor).Span.ToArray();
+            Assert.Equal(cOut, tiledOut);
+            Assert.Equal(cOut, naiveOut);
 
-        gpu.Run(feeds);                                  // warmup (kernel JIT)
-        double gpuMs = TimeMs(() => gpu.Run(feeds), gpuIters);
-        cpu.Run(feeds);                                  // warmup
-        double cpuMs = TimeMs(() => cpu.Run(feeds), cpuIters);
+            gpuTiled.Run(feeds);                              // warmup (kernel JIT)
+            double tiledMs = TimeMs(() => gpuTiled.Run(feeds), gpuIters);
+            gpuNaive.Run(feeds);                              // warmup
+            double naiveMs = TimeMs(() => gpuNaive.Run(feeds), gpuIters);
+            cpu.Run(feeds);                                   // warmup
+            double cpuMs = TimeMs(() => cpu.Run(feeds), cpuIters);
 
-        double gop = 2.0 * M * N * K / 1e9;              // multiply-add per output element
-        _out.WriteLine($"{what}  MatMulInteger {M}x{K}x{N} on '{gpu.AcceleratorName}':");
-        _out.WriteLine($"  native GPU: {gpuMs,9:F3} ms  ({gop / (gpuMs / 1000.0),8:F1} GOP/s)");
-        _out.WriteLine($"  CPU fallbk: {cpuMs,9:F3} ms  ({gop / (cpuMs / 1000.0),8:F1} GOP/s)");
-        _out.WriteLine($"  speedup (CPU-fallback / native-GPU): {cpuMs / gpuMs:F1}x");
+            double gop = 2.0 * M * N * K / 1e9;               // multiply-add per output element
+            _out.WriteLine($"{what}  MatMulInteger {M}x{K}x{N} on '{gpuTiled.AcceleratorName}':");
+            _out.WriteLine($"  tiled GPU : {tiledMs,9:F3} ms  ({gop / (tiledMs / 1000.0),8:F1} GOP/s)");
+            _out.WriteLine($"  naive GPU : {naiveMs,9:F3} ms  ({gop / (naiveMs / 1000.0),8:F1} GOP/s)");
+            _out.WriteLine($"  CPU ref   : {cpuMs,9:F3} ms  ({gop / (cpuMs / 1000.0),8:F1} GOP/s)");
+            _out.WriteLine($"  speedup tiled-vs-naive : {naiveMs / tiledMs:F2}x");
+            _out.WriteLine($"  speedup tiled-vs-CPUref: {cpuMs / tiledMs:F1}x");
+        }
+        catch (Exception ex) when (ex.Message.Contains("out of memory"))
+        {
+            _out.WriteLine($"{what}: GPU out of memory (co-tenant holding VRAM); skipping. [{ex.Message}]");
+        }
     }
 
     /// <summary>Square 2048³ INT8 GEMM — a generic large-tile throughput point.</summary>
