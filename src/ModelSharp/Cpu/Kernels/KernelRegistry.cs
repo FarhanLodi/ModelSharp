@@ -166,6 +166,7 @@ public sealed class KernelRegistry
                                     // Unique/CenterCropPad/Dropout/ConvTranspose/GridSample/MaxRoiPool/
                                     // Col2Im/Upsample/NonMaxSuppression/Bernoulli/Multinomial
         .AddControlFlowOps()        // If/Loop/Scan (subgraph execution via the GraphContext runner hook)
-        .AddSequenceOps()           // Sequence*/Optional* families (non-tensor SeqValue plumbing)
-        .AddQLinearOps();           // QLinearConv/MatMul/Add/Mul/GlobalAveragePool + ConvInteger
+        .AddSequenceOps()           // Sequence*/Optional*/SequenceMap families (non-tensor SeqValue plumbing)
+        .AddQLinearOps()            // QLinearConv/MatMul/Add/Mul/GlobalAveragePool + ConvInteger
+        .AddMoreStandardOps();      // CastLike/Scatter/RNN/AffineGrid/RoiAlign/DeformConv/NLLLoss/SoftmaxCrossEntropyLoss
 }

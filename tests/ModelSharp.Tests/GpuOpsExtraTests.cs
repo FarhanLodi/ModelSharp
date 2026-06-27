@@ -132,4 +132,203 @@ public class GpuOpsExtraTests
         });
         AssertGpuMatchesCpu(g, Feeds(("x", Rand(new[] { 2, 3, 4 }, 11))), 1e-3f);
     }
+
+    // ===========================================================================================
+    //  New native float kernels (B-GPU-2): unary/activation, ReduceMax/Min/Prod, variadic
+    //  Min/Max/Sum/Mean, Clip, Pad, Tile. Each runs the ILGPU CPU accelerator vs the managed CPU
+    //  engine (so it covers parity on any machine, no CUDA needed) — the device-routing/native-kernel
+    //  logic is identical on CUDA. A few are re-run on hardware CUDA in GpuCudaParityTests.
+    // ===========================================================================================
+
+    // ---- extra native unary float ops / activations ----
+
+    [Fact] public void Ilgpu_Sign_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Sign"), Feeds(("x", T(new[] { 2, 3 }, -2f, -0.5f, 0f, 0.5f, 3f, -7f))));
+
+    [Fact] public void Ilgpu_Floor_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Floor"), Feeds(("x", T(new[] { 2, 3 }, -2.3f, -0.5f, 0.4f, 1.5f, 2.9f, -7.1f))));
+
+    [Fact] public void Ilgpu_Ceil_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Ceil"), Feeds(("x", T(new[] { 2, 3 }, -2.3f, -0.5f, 0.4f, 1.5f, 2.9f, -7.1f))));
+
+    [Fact] public void Ilgpu_Round_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Round"), Feeds(("x", T(new[] { 2, 4 }, -2.5f, -1.5f, -0.5f, 0.5f, 1.5f, 2.5f, 0.49f, -0.51f))));
+
+    [Fact] public void Ilgpu_Softplus_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Softplus"), Feeds(("x", Rand(new[] { 2, 4 }, 20, -4f, 4f))), 1e-3f);
+
+    [Fact] public void Ilgpu_Mish_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Mish"), Feeds(("x", Rand(new[] { 2, 4 }, 21, -4f, 4f))), 1e-3f);
+
+    [Fact] public void Ilgpu_HardSwish_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("HardSwish"), Feeds(("x", Rand(new[] { 2, 4 }, 22, -5f, 5f))), 1e-3f);
+
+    [Fact] public void Ilgpu_HardSigmoid_Default_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("HardSigmoid"), Feeds(("x", Rand(new[] { 2, 4 }, 23, -8f, 8f))), 1e-3f);
+
+    [Fact] public void Ilgpu_HardSigmoid_Explicit_Matches_Cpu() =>
+        AssertGpuMatchesCpu(
+            Unary("HardSigmoid", new Dictionary<string, object> { ["alpha"] = 0.1f, ["beta"] = 0.6f }),
+            Feeds(("x", Rand(new[] { 2, 4 }, 24, -8f, 8f))), 1e-3f);
+
+    [Fact] public void Ilgpu_Elu_Default_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Elu"), Feeds(("x", Rand(new[] { 2, 4 }, 25, -4f, 4f))), 1e-3f);
+
+    [Fact] public void Ilgpu_Elu_Alpha_Matches_Cpu() =>
+        AssertGpuMatchesCpu(
+            Unary("Elu", new Dictionary<string, object> { ["alpha"] = 1.5f }),
+            Feeds(("x", Rand(new[] { 2, 4 }, 26, -4f, 4f))), 1e-3f);
+
+    [Fact] public void Ilgpu_Selu_Default_Matches_Cpu() =>
+        AssertGpuMatchesCpu(Unary("Selu"), Feeds(("x", Rand(new[] { 2, 4 }, 27, -4f, 4f))), 1e-3f);
+
+    // ---- ReduceMax / ReduceMin / ReduceProd ----
+
+    [Theory]
+    [InlineData("ReduceMax", 1L)]
+    [InlineData("ReduceMax", 0L)]
+    [InlineData("ReduceMin", 1L)]
+    [InlineData("ReduceMin", 0L)]
+    [InlineData("ReduceProd", 1L)]
+    [InlineData("ReduceProd", 0L)]
+    public void Ilgpu_ReduceMaxMinProd_Axis1_Matches_Cpu(string op, long keepdims)
+    {
+        var g = Unary(op, new Dictionary<string, object>
+        {
+            ["axes"] = new long[] { 1 },
+            ["keepdims"] = keepdims,
+        });
+        // Keep ReduceProd values near 1 so the running product stays well-conditioned.
+        AssertGpuMatchesCpu(g, Feeds(("x", Rand(new[] { 2, 3, 4 }, 30, 0.5f, 1.5f))), 1e-3f);
+    }
+
+    [Fact]
+    public void Ilgpu_ReduceMax_AllAxes_Matches_Cpu()
+    {
+        var g = Unary("ReduceMax", new Dictionary<string, object> { ["keepdims"] = 0L });
+        AssertGpuMatchesCpu(g, Feeds(("x", Rand(new[] { 3, 5 }, 31, -3f, 3f))), 1e-3f);
+    }
+
+    // ---- variadic Min / Max / Sum / Mean (with broadcasting) ----
+
+    private static ModelGraph Variadic(string op, int inputs) => new ModelGraph
+    {
+        Inputs = Enumerable.Range(0, inputs).Select(i => $"x{i}").ToArray(),
+        Outputs = new[] { "y" },
+        Nodes = new[] { new GraphNode(op, op.ToLowerInvariant(),
+            Enumerable.Range(0, inputs).Select(i => $"x{i}").ToArray(), new[] { "y" }) },
+    };
+
+    [Theory]
+    [InlineData("Min")]
+    [InlineData("Max")]
+    [InlineData("Sum")]
+    [InlineData("Mean")]
+    public void Ilgpu_Variadic_ThreeInputs_Matches_Cpu(string op)
+    {
+        var g = Variadic(op, 3);
+        AssertGpuMatchesCpu(g, Feeds(
+            ("x0", Rand(new[] { 2, 3 }, 40)),
+            ("x1", Rand(new[] { 2, 3 }, 41)),
+            ("x2", Rand(new[] { 2, 3 }, 42))), 1e-4f);
+    }
+
+    [Theory]
+    [InlineData("Min")]
+    [InlineData("Max")]
+    [InlineData("Sum")]
+    [InlineData("Mean")]
+    public void Ilgpu_Variadic_Broadcast_Matches_Cpu(string op)
+    {
+        var g = Variadic(op, 3);
+        AssertGpuMatchesCpu(g, Feeds(
+            ("x0", Rand(new[] { 2, 3 }, 43)),       // [2,3]
+            ("x1", Rand(new[] { 1, 3 }, 44)),       // broadcast row
+            ("x2", Rand(new[] { 2, 1 }, 45))), 1e-4f); // broadcast col
+    }
+
+    // ---- Clip ----
+
+    [Fact]
+    public void Ilgpu_Clip_Attrs_Matches_Cpu()
+    {
+        var g = Unary("Clip", new Dictionary<string, object> { ["min"] = -0.5f, ["max"] = 0.5f });
+        AssertGpuMatchesCpu(g, Feeds(("x", Rand(new[] { 3, 4 }, 50, -2f, 2f))));
+    }
+
+    [Fact]
+    public void Ilgpu_Clip_MinMaxInputs_Matches_Cpu()
+    {
+        var g = new ModelGraph
+        {
+            Inputs = new[] { "x" },
+            Outputs = new[] { "y" },
+            Nodes = new[] { new GraphNode("Clip", "clip", new[] { "x", "lo", "hi" }, new[] { "y" }) },
+            Initializers = new Dictionary<string, Tensor>
+            {
+                ["lo"] = new Tensor<float>(new TensorShape(), new[] { -0.3f }),
+                ["hi"] = new Tensor<float>(new TensorShape(), new[] { 0.7f }),
+            },
+        };
+        AssertGpuMatchesCpu(g, Feeds(("x", Rand(new[] { 3, 4 }, 51, -2f, 2f))));
+    }
+
+    // ---- Pad (constant / edge / reflect) ----
+
+    private static ModelGraph PadGraph(long[] pads, string mode, float value)
+    {
+        var attrs = new Dictionary<string, object> { ["mode"] = mode };
+        if (mode == "constant") attrs["value"] = value;
+        return new ModelGraph
+        {
+            Inputs = new[] { "x" },
+            Outputs = new[] { "y" },
+            Nodes = new[] { new GraphNode("Pad", "pad", new[] { "x", "pads" }, new[] { "y" }, attrs) },
+            Initializers = new Dictionary<string, Tensor>
+            {
+                ["pads"] = new Tensor<long>(new TensorShape(pads.Length), pads),
+            },
+        };
+    }
+
+    [Fact]
+    public void Ilgpu_Pad_Constant_Matches_Cpu() =>
+        AssertGpuMatchesCpu(PadGraph(new long[] { 1, 2, 1, 0 }, "constant", 0.5f),
+            Feeds(("x", Rand(new[] { 2, 3 }, 60))));
+
+    [Fact]
+    public void Ilgpu_Pad_Edge_Matches_Cpu() =>
+        AssertGpuMatchesCpu(PadGraph(new long[] { 2, 1, 1, 2 }, "edge", 0f),
+            Feeds(("x", Rand(new[] { 3, 4 }, 61))));
+
+    [Fact]
+    public void Ilgpu_Pad_Reflect_Matches_Cpu() =>
+        AssertGpuMatchesCpu(PadGraph(new long[] { 2, 2, 2, 2 }, "reflect", 0f),
+            Feeds(("x", Rand(new[] { 4, 5 }, 62))));
+
+    [Fact]
+    public void Ilgpu_Pad_Negative_Crop_Matches_Cpu() =>
+        AssertGpuMatchesCpu(PadGraph(new long[] { -1, 0, 0, -1 }, "constant", 0f),
+            Feeds(("x", Rand(new[] { 3, 4 }, 63))));
+
+    // ---- Tile ----
+
+    private static ModelGraph TileGraph(long[] reps) => new ModelGraph
+    {
+        Inputs = new[] { "x" },
+        Outputs = new[] { "y" },
+        Nodes = new[] { new GraphNode("Tile", "tile", new[] { "x", "reps" }, new[] { "y" }) },
+        Initializers = new Dictionary<string, Tensor>
+        {
+            ["reps"] = new Tensor<long>(new TensorShape(reps.Length), reps),
+        },
+    };
+
+    [Fact]
+    public void Ilgpu_Tile_2D_Matches_Cpu() =>
+        AssertGpuMatchesCpu(TileGraph(new long[] { 2, 3 }), Feeds(("x", Rand(new[] { 2, 3 }, 70))));
+
+    [Fact]
+    public void Ilgpu_Tile_3D_Matches_Cpu() =>
+        AssertGpuMatchesCpu(TileGraph(new long[] { 1, 2, 2 }), Feeds(("x", Rand(new[] { 2, 2, 3 }, 71))));
 }

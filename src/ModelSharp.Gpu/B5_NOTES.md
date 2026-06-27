@@ -406,3 +406,61 @@ device↔host round-trip and the host double-precision GEMM are **gone** for `Ma
    `DynamicQuantize`/`Dequantize` to eliminate the last lightweight round-trips. With the native GEMM in place, a
    7B INT8 decode on a 4090 is memory-bandwidth bound (weights ~7 GB/token-pass), i.e. tens of tokens/s is the
    expected regime once the asset is present.
+
+---
+
+## B-GPU-2 — more native kernels + shared-memory-tiled int8 GEMM
+
+This pass (a) moves a batch of high-frequency ops off the per-op CPU fallback onto native device kernels, and
+(b) replaces the naïve one-thread-per-output `MatMulInteger` GEMM with a shared-memory-tiled kernel.
+
+### Tiled int8 GEMM (`GpuKernels.MatMulIntegerTiledK`)
+
+- **Design.** A 2-D grouped launch of `IntTile×IntTile` (16×16 = 256) threads computes one `M×N` output tile per
+  group. Each K-step stages an `IntTile×IntTile` block of A′ and B′ into flat 1-D shared memory (one element per
+  thread, coalesced), `Group.Barrier()`s, then accumulates the tile's partial dot product; a second barrier
+  guards the next stage. Edge tiles (M/N/K not a multiple of 16) read zeros into shared memory and skip the
+  out-of-range store. One grouped launch per broadcast-resolved batch (serialized on the default stream).
+- **Zero points are pre-subtracted on the host** into int32 `A′ = A − a_zp`, `B′ = B − b_zp` (covering absent /
+  per-tensor / per-row-A / per-column-B). The kernel then does plain int32 multiply-accumulate, **bit-identical**
+  to the naïve kernel's `(A−az)·(B−bz)` int32 fold — and to the CPU `MatMulIntegerKernel`'s `(int)` cast of its
+  int64 accumulator for in-range models. `int32` wraparound semantics preserved.
+- **DP4A.** ILGPU 1.5.3 exposes no portable `__dp4a` / 4×int8-dot intrinsic that JIT-lowers across the
+  CUDA *and* CPU backends, so the kernel stays an **int32-accumulate tiled** GEMM (correct + portable, tested on
+  the CPU accelerator on every machine). DP4A would be a CUDA-only follow-up behind a backend probe; the tiling
+  is the portable, test-covered win.
+- **Benchmark.** `GpuMatMulIntegerPerfTests` times tiled vs naïve vs CPU-ref on `2048³` and an LLM-decode-shaped
+  `[32,4096]×[4096,4096]`, asserts both GPU kernels are element-exact vs CPU first, then logs the
+  `tiled-vs-naive` and `tiled-vs-CPUref` speedups (no ratio hard-asserted — hardware-dependent). The naïve kernel
+  is kept and reachable via the `IlgpuEngine.UseNaiveIntGemm` test seam for the head-to-head. OOM-skips cleanly.
+
+### New native float kernels (were CPU-fallback)
+
+- **Extra unary / activations** (one thread per element, each mirrors its CPU kernel exactly):
+  `Sign`, `Floor`, `Ceil`, `Round` (banker's), `Softplus`, `Mish`, `HardSwish`, `HardSigmoid` (α,β),
+  `Elu` (α), `Selu` (α,γ), `Clip` (min/max from inputs or attrs). Integer inputs (rare; e.g. int `Sign`) still
+  fall through to the CPU kernel so dtype stays correct.
+- **`ReduceMax` / `ReduceMin` / `ReduceProd`** — an op-selected device reduce (`GpuKernels.ReduceOpK`) sharing the
+  exact host-side axis-resolution / offset-precompute and row-major fold order of the existing Sum/Mean reduce.
+- **Variadic `Min` / `Max` / `Sum` / `Mean`** — an accumulator buffer seeded with the op identity, each input
+  folded in via `GpuKernels.VariadicFoldK` (NumPy broadcasting), Mean's divide a final scalar-broadcast pass.
+  Only when every input is a device float (matches the CPU kernel's float-only path); otherwise CPU fallback.
+- **`Pad`** (constant / edge / reflect, float) and **`Tile`** (float) — a host-precomputed per-output-element
+  source offset gathered on-device via the existing Gather kernel; Pad's constant fill written into the padded
+  positions on-device with a scalar-broadcast `Where`. Integer/bool Pad/Tile stay on the CPU fallback (dtype).
+- **`Less`** added to the host-side `Equal`/`Greater` comparison path (bool outputs are host-resident in this
+  engine by design — never on the float compute path — so comparisons compute host-side, no device kernel).
+
+### What still falls back, by design
+
+- Quantized glue (`DynamicQuantize`/`Quantize`/`Dequantize`/`QLinear*`) — O(N) scalar passes, not GEMMs.
+- The long tail of low-frequency ops (RNN/signal/sequence/control-flow), int/bool elementwise & shape math, and
+  the integer/bool variants of the ops above — all correct via the per-op CPU fallback.
+
+### Tests
+
+- Parity for every new native kernel vs `ManagedCpuEngine`: CPU-accelerator `[Fact]`/`[Theory]` (run on any
+  machine) in `GpuOpsExtraTests`, plus hardware-CUDA re-runs in `GpuNativeOpsCudaTests` (assert `IsHardwareGpu`,
+  skip green with no CUDA, **skip on device `out of memory`**).
+- int8 GEMM bit-exactness: `GpuQuantizedTests.MatMulInteger_TiledVsNaive_BitExact_CpuAccel` asserts tiled == naïve
+  == CPU across all shape/dtype/zp cases; `GpuMatMulIntegerPerfTests` re-asserts on CUDA and logs the speedup.

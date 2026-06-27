@@ -29,7 +29,11 @@ public abstract class ReduceKernelBase : IKernel
     /// <inheritdoc />
     public void Execute(GraphNode node, GraphContext ctx)
     {
-        Tensor<float> x = ctx.Get(node.Inputs[0]);
+        // Dtype-aware: floats fold directly; integer inputs (e.g. ReduceSum over an int64 attention_mask)
+        // are folded in float and emitted back in their original integer dtype.
+        Tensor xt = ctx.GetTensor(node.Inputs[0]);
+        ElementType inType = xt.Dtype;
+        Tensor<float> x = xt as Tensor<float> ?? new Tensor<float>(xt.Shape, ReadAsFloat(xt));
         ReadOnlySpan<int> inDims = x.Shape.Dimensions;
         int rank = inDims.Length;
 
@@ -45,10 +49,8 @@ public abstract class ReduceKernelBase : IKernel
 
         if ((axes is null || axes.Length == 0) && noopEmpty)
         {
-            // Identity: copy through unchanged.
-            var copy = new Tensor<float>(x.Shape);
-            x.Span.CopyTo(copy.Span);
-            ctx.Set(node.Outputs[0], copy);
+            // Identity: copy through unchanged, preserving the input dtype.
+            ctx.Set(node.Outputs[0], xt);
             return;
         }
 
@@ -97,8 +99,23 @@ public abstract class ReduceKernelBase : IKernel
             for (int i = 0; i < rank; i++) if (!reduced[i]) list.Add(inDims[i]);
             finalDims = list.ToArray();
         }
-        ctx.Set(node.Outputs[0], new Tensor<float>(new TensorShape(finalDims), acc));
+        var outShape = new TensorShape(finalDims);
+        ctx.Set(node.Outputs[0], inType switch
+        {
+            ElementType.Int64 => new Tensor<long>(outShape, Array.ConvertAll(acc, v => (long)MathF.Round(v))),
+            ElementType.Int32 => new Tensor<int>(outShape, Array.ConvertAll(acc, v => (int)MathF.Round(v))),
+            _ => new Tensor<float>(outShape, acc),
+        });
     }
+
+    /// <summary>Reads any numeric tensor (float/int64/int32) as a float array for folding.</summary>
+    private static float[] ReadAsFloat(Tensor t) => t.Dtype switch
+    {
+        ElementType.Float32 => t.AsFloat().Buffer.ToArray(),
+        ElementType.Int64 => Array.ConvertAll(t.AsInt64().Buffer.ToArray(), v => (float)v),
+        ElementType.Int32 => Array.ConvertAll(t.AsInt32().Buffer.ToArray(), v => (float)v),
+        _ => throw new ModelSharpException($"Reduce does not support input dtype {t.Dtype}."),
+    };
 }
 
 /// <summary>Sum over the given axes (ONNX <c>ReduceSum</c>).</summary>
