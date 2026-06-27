@@ -8,7 +8,15 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **878 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **920 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+
+- **2026-06-27 (pass 9 — model hub + fp16 storage):** new optional **`ModelSharp.Hub`** package
+  (pure-managed, HttpClient only) — `HubPipeline.Load("alias")` / `ModelHub.Get("owner/repo/...")`
+  downloads a model **plus its ONNX external-data shards + tokenizer + config** (or GGUF / safetensors
+  / direct URL) into a local cache and runs it; resumable downloads, integrity check, HF token auth,
+  aliases. Verified with a live Hugging Face download (512 MB INT8 Qwen bundle + 8 companion files).
+  Also: **fp16 weight storage** — fp16 ONNX initializers load as compact `System.Half` (half the memory),
+  widened to float at the compute boundary so large fp16 models fit. Suite 878 → **920 green**.
 
 - **2026-06-27 (pass 8 — verification & hardening):** **bit-verified against ONNX Runtime** — Qwen-0.5B
   (`MatMulNBits`) and Mistral-7B (genai `GroupQueryAttention`) next-token logits match ORT *exactly*
@@ -17,17 +25,17 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
   Whisper-tiny transcribes correctly ("Mr. Quilter is the apostle…"). Added `local_window_size`
   (sliding-window attention), Sequence/Optional values across If/Loop/Scan subgraphs, ONNX `ImageDecoder`
   (ImageSharp), concurrency/thread-safety + malformed-model fuzzing tests, a loader allocation **DoS
-  guard**, and clean `ModelSharpException`s for missing execution-context values. Suite 847 → **878 green**.
+  guard**, and clean `ModelSharpException`s for missing execution-context values. Suite 847 → **920 green**.
 - **2026-06-27 (pass 7 — performance):** multithreaded (`Parallel.For`) + SIMD (`Vector<float>`) the
   CPU matmul/MatMulNBits/MatMulInteger/QLinear, attention (GQA/MHA), RMSNorm/LayerNorm, RoPE and Conv
   kernels; added **native GPU `MatMulNBits` + `GroupQueryAttention`**; confirmed single-token KV-cache
   decode. On the RTX 4090 (bit-identical outputs, just faster): **Mistral-7B INT4 forward 4m11s → ~16s
-  (~16×), Qwen-0.5B → ~2s, core suite 3m45s → 1m30s.** All pure-managed (no new deps). 802 → **878 green**.
+  (~16×), Qwen-0.5B → ~2s, core suite 3m45s → 1m30s.** All pure-managed (no new deps). 802 → **920 green**.
 - **2026-06-27 (pass 5 — scale & precision):** closed the last "at scale" gaps. Native on-device
   **`MatMulInteger` GEMM** (uint8/int8, bit-exact vs CPU) so quantized matmuls run on the GPU instead
   of the CPU fallback — the real INT8 gpt2 now decodes whole-graph on CUDA using it. **fp16/bf16 ONNX
   initializers** load (decoded to float32), so half-precision models run. **Whisper mel** features are
-  now bit-accurate via a true 400-point DFT (Bluestein). Suite 682 → **878 green**.
+  now bit-accurate via a true 400-point DFT (Bluestein). Suite 682 → **920 green**.
 
 - **2026-06-27 (pass 4 — breadth):** all 7 GGUF **grid-codebook IQ** families (IQ1/2/3) now
   dequantize (ggml lattice tables vendored from a pinned llama.cpp commit, MIT attribution in NOTICE);
@@ -83,7 +91,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 878 tests, 0 failures** (includes
+- Build/test baseline: `dotnet test` must be **GREEN — 920 tests, 0 failures** (includes
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,

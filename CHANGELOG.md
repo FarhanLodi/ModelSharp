@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~4m11s to ~16s (~16×) and Qwen-0.5B from ~9s to ~2s. All pure-managed, no new dependencies.
 
 ### Added
+- **`ModelSharp.Hub`** optional package: download models (+ external-data shards, tokenizer, config)
+  from Hugging Face / GGUF / safetensors / direct URL into a local cache and run them in one line
+  (`HubPipeline.Load`, `ModelHub.Get`). Resumable downloads, integrity verification, token auth,
+  friendly aliases. Pure-managed (HttpClient only); the core stays dependency-free.
+- fp16 weight storage: fp16 ONNX initializers load as compact `System.Half` (half the memory),
+  widened to float at the compute boundary (no per-kernel changes).
 - Real **INT4 LLMs run end-to-end**, including a **7B** (Mistral-7B-Instruct):
   ONNX **external-data** loading (`data_location=EXTERNAL`, memory-mapped) for
   >2 GB models; the `MatMulNBits` block-quant op; and the onnxruntime-genai
