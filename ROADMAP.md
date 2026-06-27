@@ -8,9 +8,15 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **549 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **572 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
 
-- **2026-06-27:** closed the last open items — whole-graph GPU dispatch (B5 prologue ops), GGUF
+- **2026-06-27 (pass 2):** the **full distilgpt2 graph now runs end-to-end on the GPU engine**
+  (`IlgpuEngine.Run`, all 1569 nodes, no CPU fallback) and matches the CPU engine's logits
+  (Δ ≤ 1.8e-4) + exact greedy argmax on CUDA; added a full GPU **decoder-layer** through the
+  on-device KV-cache seam; **control-flow ops** (If/Loop/Scan) with ONNX subgraph parsing/execution;
+  **GGUF IQ4** dequant + asset-gated real-GGUF e2e test; **DFT FFT** fast path + opset-20 axis-input;
+  NuGet packaging metadata + CHANGELOG (v0.2.0-alpha). Suite 549 → **572 green**.
+- **2026-06-27:** closed the prior open items — whole-graph GPU dispatch (B5 prologue ops), GGUF
   quantized-tensor dequantization, and the signal-processing op family. Suite 514 → **549 green**.
 - **2026-06-26:** validated end-to-end on an RTX 4090 (CUDA) + real model exports.
 - **Phase 0 (GPU bring-up):** ✅ ILGPU sees the RTX 4090 (`IsHardwareGpu == true`); new hardware-gated
@@ -23,7 +29,10 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
   now run a full self-attention block and a multi-step autoregressive decode entirely on CUDA
   (~1.3 ms/step). **B5 whole-graph closeout (2026-06-27):** added the 6 integer mask/position-id
   prologue ops on the GPU engine (Range, ConstantOfShape, Equal, Greater, Trilu, ScatterND) →
-  **100% of distilgpt2's nodes are now GPU-dispatchable** (no fallbacks). Op coverage 143 → 166.
+  100% of distilgpt2's nodes GPU-dispatchable. **Pass 2 (2026-06-27):** the int/float routing in
+  `IlgpuEngine.Run` (Gather/binary-op host paths for int index math) is now complete, so the **full
+  distilgpt2 graph executes end-to-end on the GPU** matching CPU logits (Δ ≤ 1.8e-4) + exact argmax —
+  no fallback; plus a full GPU decoder layer over the on-device KV-cache. Op coverage 143 → 169.
 - **Phase C:** ✅ C1 `use_cache_branch`, ✅ C2 `Pipeline.Generate` text-generation API, ✅ C3 quantization
   (DequantizeLinear/QuantizeLinear/DynamicQuantizeLinear/MatMulInteger + GPTQ/AWQ safetensors dequant),
   ✅ C4 mmap >2 GB safetensors + sharded `index.json`, ✅ C5 GGUF reader **+ quantized-tensor
@@ -38,7 +47,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 549 tests, 0 failures** (includes
+- Build/test baseline: `dotnet test` must be **GREEN — 572 tests, 0 failures** (includes
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,
@@ -150,7 +159,8 @@ asset is absent** (mirror `MiniLmTests`; discovery via `MODELSHARP_MODELS_DIR` /
 ---
 
 ## Phase D — Op coverage & correctness cleanups
-- ✅ Op coverage now **166 of ~190** standard ops (added DFT/STFT/MelWeightMatrix signal family;
+- ✅ Op coverage now **169 of ~190** standard ops (added control-flow If/Loop/Scan with full ONNX
+  subgraph parsing + execution, and the DFT/STFT/MelWeightMatrix signal family;
   earlier: Einsum, ConvTranspose, GridSample,
   NonMaxSuppression, Col2Im, Det, Unique, Bitwise{And,Or,Xor,Not}, {Hann,Hamming,Blackman}Window,
   CenterCropPad, Dropout, MaxRoiPool, Upsample, Bernoulli, Multinomial). Extend further as models demand. Add via new kernel files +
@@ -169,4 +179,6 @@ an **embedding** model (already done), an **image classifier**, an **object dete
 and a **text-completion LLM** — all now proven end-to-end on **real models on CPU**, with the **GPU path
 validated on CUDA** (RTX 4090). Each is proven by an opt-in test against a real model asset; the
 real-model tests live behind `MODELSHARP_MODELS_DIR` / repo-relative `models/` discovery and **skip when
-the assets are absent**. (7B-class on the GPU via quantization remains the next scaling target.)
+the assets are absent**. The **full distilgpt2 graph now also runs end-to-end on the GPU engine**
+(matching CPU). (Proving a **7B-class** quantized model on the GPU — which needs the large model
+asset present — remains the next scaling target.)

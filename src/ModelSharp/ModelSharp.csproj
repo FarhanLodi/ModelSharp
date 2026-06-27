@@ -10,9 +10,28 @@
     <RootNamespace>ModelSharp</RootNamespace>
     <AssemblyName>ModelSharp</AssemblyName>
     <PackageId>ModelSharp</PackageId>
+    <Version>0.2.0-alpha</Version>
+    <Authors>Farhan Lodi</Authors>
+    <Description>Universal, manifest-driven, pure-managed model inference for .NET. All-in-one: ONNX loader, multi-dtype CPU engine, tensors, pipeline, plus audio (FFT/log-mel) and text (WordPiece) front ends — zero external, zero-native dependencies.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-    <Description>Universal, manifest-driven, pure-managed model inference for .NET. All-in-one: ONNX loader, multi-dtype CPU engine (46 ops, float/int64/int32/bool), tensors, pipeline, plus audio (FFT/log-mel) and text (WordPiece) front ends — zero external dependencies.</Description>
-    <Version>0.1.0-alpha</Version>
+    <PackageProjectUrl>https://github.com/FarhanLodi/ModelSharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/FarhanLodi/ModelSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>onnx;inference;ml;machine-learning;managed;tensor;pure-managed</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- White-box tests reach internal helpers (e.g. GgmlTypeInfo, DftCore) while keeping the public API minimal. -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>ModelSharp.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 
 </Project>
