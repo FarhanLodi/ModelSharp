@@ -23,12 +23,13 @@ public class Qwen05bFp16Tests
     public Qwen05bFp16Tests(ITestOutputHelper output) => _out = output;
 
     private const string ModelRel = "qwen05b-q4/model_fp16.onnx";
+    private const string HubSpec = "onnx-community/Qwen2.5-0.5B-Instruct/onnx/model_fp16.onnx";
     private const int KvHeads = 2, HeadDim = 64, Vocab = 151936;
 
     [Fact]
     public void Qwen05b_Fp16_StoredCompactly_And_RunsCoherently()
     {
-        if (!RealModelAssets.TryPath(ModelRel, out string path)) { _out.WriteLine("Qwen fp16 not found; skipping."); return; }
+        if (!RealModelAssets.TryResolveOrDownload(ModelRel, HubSpec, out string path, log: _out.WriteLine)) { _out.WriteLine("Qwen fp16 not found; skipping."); return; }
 
         ModelGraph g = OnnxModelLoader.LoadModel(path);
 

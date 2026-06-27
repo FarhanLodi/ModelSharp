@@ -19,7 +19,27 @@ public class GpuDistilGpt2AuditTests
     private readonly ITestOutputHelper _out;
     public GpuDistilGpt2AuditTests(ITestOutputHelper output) => _out = output;
 
-    private const string ModelPath = "/home/x16/models/distilgpt2.onnx";
+    /// <summary>
+    /// Local-only discovery of <c>distilgpt2.onnx</c>: <c>MODELSHARP_MODELS_DIR</c> → a repo-relative
+    /// <c>models/</c> dir found by walking up from the test output directory. Skips cleanly when absent.
+    /// </summary>
+    private static bool TryFindModel(out string path)
+    {
+        string? env = Environment.GetEnvironmentVariable("MODELSHARP_MODELS_DIR");
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(env))
+            candidates.Add(Path.Combine(env, "distilgpt2.onnx"));
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            candidates.Add(Path.Combine(dir.FullName, "models", "distilgpt2.onnx"));
+            dir = dir.Parent;
+        }
+        foreach (string c in candidates)
+            if (File.Exists(c)) { path = c; return true; }
+        path = candidates.Count > 0 ? candidates[0] : "distilgpt2.onnx";
+        return false;
+    }
 
     // The op types the GPU engine's Run switch dispatches (mirror IlgpuEngine.Run exactly).
     private static readonly HashSet<string> GpuSupported = new(StringComparer.Ordinal)
@@ -37,13 +57,13 @@ public class GpuDistilGpt2AuditTests
     [Fact]
     public void Audit_DistilGpt2_Gpu_Op_Coverage()
     {
-        if (!File.Exists(ModelPath))
+        if (!TryFindModel(out string modelPath))
         {
-            _out.WriteLine($"distilgpt2 not present at {ModelPath}; skipping audit.");
+            _out.WriteLine("distilgpt2 not present (looked under MODELSHARP_MODELS_DIR / repo models/); skipping audit.");
             return;
         }
 
-        ModelGraph graph = OnnxModelLoader.LoadModel(ModelPath);
+        ModelGraph graph = OnnxModelLoader.LoadModel(modelPath);
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (GraphNode n in graph.Nodes)
             counts[n.OpType] = counts.TryGetValue(n.OpType, out int c) ? c + 1 : 1;

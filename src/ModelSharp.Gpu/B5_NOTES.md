@@ -165,7 +165,7 @@ and the six integer/mask prologue ops Range/ConstantOfShape/Equal/Greater/Trilu/
 two fixes above the **whole graph clears**.
 
 `GpuWholeGraphTests.Cuda_DistilGpt2_WholeGraph_Logits_Match_Cpu` is asset-gated (discovers `distilgpt2.onnx`
-via `MODELSHARP_MODELS_DIR` → repo-relative `models/` → `/home/x16/models`) and CUDA-gated; it skips cleanly
+via `MODELSHARP_MODELS_DIR` → repo-relative `models/`) and CUDA-gated; it skips cleanly
 when either is absent. When the model **is** present the whole-graph `Run` is **REQUIRED** — any exception is a
 hard failure (the report-and-skip fallback was removed) and so is a numeric mismatch. It runs the full ONNX
 graph through `IlgpuEngine.Run` with empty (seq-0) `past_key_values.*` float feeds and asserts last-position
@@ -344,7 +344,7 @@ The test drives the **whole quantized graph** through `IlgpuEngine.Run` for seve
 `ManagedCpuEngine` (max|Δ| < 5e-2) and that **GPU argmax == CPU argmax at every step**, so the decoded id
 sequence is coherent and deterministic on the GPU engine. A CPU-accelerator routing `[Fact]` runs the full
 INT8 graph everywhere; the `Cuda_*` test re-runs it on the RTX 4090. Discovery is via
-`MODELSHARP_MODELS_DIR` → repo `models/` → `/home/x16/models/gpt2-quantized.onnx`, skipping cleanly if absent
+`MODELSHARP_MODELS_DIR` → repo `models/`, skipping cleanly if absent
 (never hard-fails on a missing download). The asset is gitignored (267 MB; not committed).
 
 (An ONNXRuntime reference greedy-decoded `"The quick brown fox"` → ids `[274, 389, 257, 1310]` deterministically,

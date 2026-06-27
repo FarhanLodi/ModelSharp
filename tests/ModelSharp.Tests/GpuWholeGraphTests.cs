@@ -22,9 +22,9 @@ namespace ModelSharp.Tests;
 /// directly (empty-past Concat-then-MatMul) without needing any model file.
 ///
 /// <para>Asset-gated like <see cref="GpuLlmTests"/>: discovers <c>distilgpt2.onnx</c> via
-/// <c>MODELSHARP_MODELS_DIR</c> → repo-relative <c>models/</c> → the repo's conventional
-/// <c>/home/x16/models</c>, and skips cleanly when the model is absent OR when there is no CUDA device. Shares
-/// the serialized <c>CudaGpu</c> collection so only one CUDA context is live at a time.</para>
+/// <c>MODELSHARP_MODELS_DIR</c> → repo-relative <c>models/</c>, and skips cleanly when the model is absent OR
+/// when there is no CUDA device. Shares the serialized <c>CudaGpu</c> collection so only one CUDA context is
+/// live at a time.</para>
 /// </summary>
 [Collection("CudaGpu")]
 public class GpuWholeGraphTests
@@ -138,7 +138,7 @@ public class GpuWholeGraphTests
 
     private static bool TryFindModel(out string path)
     {
-        // Precedence mirrors RealModelAssets, plus the conventional repo models dir the other GPU tests use.
+        // Precedence mirrors RealModelAssets: MODELSHARP_MODELS_DIR → a repo-relative models/ dir.
         string? env = Environment.GetEnvironmentVariable("MODELSHARP_MODELS_DIR");
         var candidates = new List<string>();
         if (!string.IsNullOrWhiteSpace(env))
@@ -149,11 +149,10 @@ public class GpuWholeGraphTests
             candidates.Add(Path.Combine(dir.FullName, "models", "distilgpt2.onnx"));
             dir = dir.Parent;
         }
-        candidates.Add("/home/x16/models/distilgpt2.onnx");
 
         foreach (string c in candidates)
             if (File.Exists(c)) { path = c; return true; }
-        path = candidates[0];
+        path = candidates.Count > 0 ? candidates[0] : "distilgpt2.onnx";
         return false;
     }
 
@@ -234,7 +233,7 @@ public class GpuWholeGraphTests
         }
         if (!TryFindModel(out string modelPath))
         {
-            _out.WriteLine($"WholeGraph: distilgpt2.onnx not found (looked under MODELSHARP_MODELS_DIR / models/ / /home/x16/models); skipping.");
+            _out.WriteLine($"WholeGraph: distilgpt2.onnx not found (looked under MODELSHARP_MODELS_DIR / repo models/); skipping.");
             return;
         }
 
