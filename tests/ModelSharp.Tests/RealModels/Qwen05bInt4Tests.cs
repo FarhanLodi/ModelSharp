@@ -27,6 +27,7 @@ public class Qwen05bInt4Tests
     public Qwen05bInt4Tests(ITestOutputHelper output) => _out = output;
 
     private const string ModelRel = "qwen05b-q4/model_q4.onnx";
+    private const string HubSpec = "onnx-community/Qwen2.5-0.5B-Instruct/onnx/model_q4.onnx";
     private const int KvHeads = 2, HeadDim = 64, Vocab = 151936;
 
     private static bool HardwareGpuAvailable()
@@ -42,7 +43,7 @@ public class Qwen05bInt4Tests
     [Fact]
     public void Qwen05b_Int4_Loads_And_FullOpCoverage()
     {
-        if (!RealModelAssets.TryPath(ModelRel, out string path)) { _out.WriteLine("Qwen-0.5B not found; skipping."); return; }
+        if (!RealModelAssets.TryResolveOrDownload(ModelRel, HubSpec, out string path, log: _out.WriteLine)) { _out.WriteLine("Qwen-0.5B not found; skipping."); return; }
 
         ModelGraph g = OnnxModelLoader.LoadModel(path);
         _out.WriteLine($"Loaded Qwen-0.5B q4: {g.Nodes.Count} nodes, {g.Initializers.Count} initializers.");
@@ -60,7 +61,7 @@ public class Qwen05bInt4Tests
     [Fact]
     public void Qwen05b_Int4_ForwardPass_ProducesCoherentLogits()
     {
-        if (!RealModelAssets.TryPath(ModelRel, out string path)) { _out.WriteLine("Qwen-0.5B not found; skipping."); return; }
+        if (!RealModelAssets.TryResolveOrDownload(ModelRel, HubSpec, out string path, log: _out.WriteLine)) { _out.WriteLine("Qwen-0.5B not found; skipping."); return; }
 
         ModelGraph g = OnnxModelLoader.LoadModel(path);
         long[] tokenIds = { 9707, 11, 1879, 0 }; // arbitrary valid ids

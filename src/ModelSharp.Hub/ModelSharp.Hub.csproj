@@ -9,9 +9,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>ModelSharp.Hub</PackageId>
-    <Version>0.2.0-alpha</Version>
+    <Version>1.0.0</Version>
     <Authors>Farhan Lodi</Authors>
-    <Description>Model acquisition for ModelSharp — download and cache ONNX / GGUF / safetensors models (and their external-data + tokenizer files) from Hugging Face Hub or any URL, then run them in one line via Pipeline.FromHub. Pure-managed (HttpClient only); no third-party dependencies.</Description>
+    <Description>Model acquisition for ModelSharp — download and cache ONNX / GGUF / safetensors models (and their external-data + tokenizer files) from Hugging Face Hub or any URL, then run them in one line via HubPipeline.Load. Pure-managed (HttpClient only); no third-party dependencies.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/FarhanLodi/ModelSharp</PackageProjectUrl>
     <RepositoryUrl>https://github.com/FarhanLodi/ModelSharp</RepositoryUrl>
