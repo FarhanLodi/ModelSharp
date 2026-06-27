@@ -38,7 +38,8 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
 - 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types (token ids, masks, and shape tensors included).
-- 🧠 **191 operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control-flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*` ops included.
+- 🧠 **200 operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control-flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*`/`MatMulNBits` ops included.
+- 🧮 **Real INT4 / INT8 LLMs** — runs quantized ONNX LLMs end-to-end, including a **7B** (`MatMulNBits` INT4 + genai `GroupQueryAttention`) loaded from **>2 GB external-data** files.
 - ♻️ **Runs *any* model on the GPU** — the ILGPU backend executes natively-supported ops on-device and transparently falls back to the CPU kernel for the rest, so any CPU-runnable model also runs through the GPU engine.
 - 🔁 **Encoder-decoder generation** — T5 / BART / MarianMT-style seq2seq (encoder-once + cross-attention KV-cached decode), alongside decoder-only LLM generation.
 - 🔤 **Built-in tokenizers** — WordPiece (BERT) and byte-level BPE (GPT-2 / RoBERTa), pure managed.
@@ -60,8 +61,10 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
 | GPU LLM path | distilgpt2 on CUDA | the **full 1569-node graph runs end-to-end through the GPU engine** (no CPU fallback), matching the CPU engine's logits (Δ ≤ 1.8e-4) and exact greedy argmax; a full decoder layer + multi-step decode run on an **on-device KV-cache** |
 | Quantized LLM on GPU | INT8 gpt2 (ONNX, dynamic-quant) | the whole quantized graph (48× `DynamicQuantizeLinear`→`MatMulInteger`) runs through the GPU engine and **greedy-decodes with the exact same argmax as the CPU engine** at every step |
+| **INT4 LLM (7B)** | **Mistral-7B-Instruct v0.3** (genai INT4) | the real **5 GB external-data** model loads and runs a **full forward pass end-to-end** (`MatMulNBits` + genai `GroupQueryAttention` with packed-QKV + rotary), producing a confident next-token prediction |
+| INT4 LLM (fast) | Qwen2.5-0.5B-Instruct (INT4 q4) | loads + forward pass in ~9 s, coherent next-token logits (`MatMulNBits` + decomposed attention) |
 
-The full test suite is **715 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` and `fp16`/`bf16` initializers, dtype-generic Gather, a native on-device `MatMulInteger` GEMM), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, and Whisper-style ASR runs through the seq2seq path (exact 400-point DFT mel front-end). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **802 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` and `fp16`/`bf16` initializers, dtype-generic Gather, a native on-device `MatMulInteger` GEMM), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, real **INT4 LLMs** (Qwen-0.5B and Mistral-**7B**, via `MatMulNBits` + genai `GroupQueryAttention` + ONNX **external-data** loading) run end-to-end, and Whisper-style ASR runs through the seq2seq path (exact 400-point DFT mel front-end). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 
