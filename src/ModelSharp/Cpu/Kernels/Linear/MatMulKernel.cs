@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
@@ -47,36 +48,79 @@ public sealed class MatMulKernel : IKernel
         if (!bWas1D) outDims.Add(N);
         var y = new Tensor<float>(new TensorShape(outDims.ToArray()));
 
-        System.Span<float> sa = a.Span, sb = b.Span, sy = y.Span;
-        var coord = new int[batchRank];
-        int aOff = 0, bOff = 0;   // in matrix units
+        // Capture the backing buffers (Memory<T>) so the parallel lambdas can re-acquire spans;
+        // Span<T> is a ref struct and cannot be hoisted into a closure.
+        System.Memory<float> ma = a.Buffer, my = y.Buffer;
 
-        for (int bi = 0; bi < totalBatch; bi++)
+        // Pre-transpose each distinct B batch matrix from [K,N] (column-strided) into row-major
+        // [N,K] so the inner dot is fully contiguous and SIMD-friendly. The transposed cache is
+        // indexed by the broadcast B-batch offset (bOff), so broadcast/shared B matrices are only
+        // transposed once.
+        var bTransposed = new float[totalBatch][];
         {
-            int aBase = aOff * aMat, bBase = bOff * bMat, oBase = bi * oMat;
-            for (int m = 0; m < M; m++)
+            var coordT = new int[batchRank];
+            System.Span<float> sbAll = b.Span;
+            int bOffT = 0;
+            var seen = new System.Collections.Generic.Dictionary<int, float[]>();
+            for (int bi = 0; bi < totalBatch; bi++)
             {
-                int aRow = aBase + m * K;
-                int oRow = oBase + m * N;
-                for (int n = 0; n < N; n++)
+                if (!seen.TryGetValue(bOffT, out float[]? bt))
                 {
-                    float sum = 0f;
-                    for (int kk = 0; kk < K; kk++) sum += sa[aRow + kk] * sb[bBase + kk * N + n];
-                    sy[oRow + n] = sum;
+                    bt = new float[bMat];
+                    int bBase = bOffT * bMat;
+                    for (int kk = 0; kk < K; kk++)
+                    {
+                        int src = bBase + kk * N;
+                        for (int n = 0; n < N; n++) bt[n * K + kk] = sbAll[src + n];
+                    }
+                    seen[bOffT] = bt;
+                }
+                bTransposed[bi] = bt;
+
+                for (int ax = batchRank - 1; ax >= 0; ax--)
+                {
+                    coordT[ax]++;
+                    bOffT += bBS[ax];
+                    if (coordT[ax] < outBatch[ax]) break;
+                    coordT[ax] = 0;
+                    bOffT -= bBS[ax] * outBatch[ax];
                 }
             }
+        }
 
-            for (int ax = batchRank - 1; ax >= 0; ax--)
+        // Map each batch index to its A-matrix offset (in matrix units) up front so the per-row
+        // work is embarrassingly parallel over flattened (batch × M) output rows.
+        var aOffOf = new int[totalBatch];
+        {
+            var coordA = new int[batchRank];
+            int aOff = 0;
+            for (int bi = 0; bi < totalBatch; bi++)
             {
-                coord[ax]++;
-                aOff += aBS[ax];
-                bOff += bBS[ax];
-                if (coord[ax] < outBatch[ax]) break;
-                coord[ax] = 0;
-                aOff -= aBS[ax] * outBatch[ax];
-                bOff -= bBS[ax] * outBatch[ax];
+                aOffOf[bi] = aOff;
+                for (int ax = batchRank - 1; ax >= 0; ax--)
+                {
+                    coordA[ax]++;
+                    aOff += aBS[ax];
+                    if (coordA[ax] < outBatch[ax]) break;
+                    coordA[ax] = 0;
+                    aOff -= aBS[ax] * outBatch[ax];
+                }
             }
         }
+
+        long totalRows = (long)totalBatch * M;
+        MatMulParallel.For(checked((int)totalRows), (long)K * N, row =>
+        {
+            int bi = row / M;
+            int m = row % M;
+            System.ReadOnlySpan<float> sa = ma.Span;
+            System.Span<float> sy = my.Span;
+            float[] bt = bTransposed[bi];
+            int aRow = aOffOf[bi] * aMat + m * K;
+            int oRow = bi * oMat + m * N;
+            for (int n = 0; n < N; n++)
+                sy[oRow + n] = MatMulParallel.Dot(sa, aRow, bt.AsSpan(n * K, K), K);
+        });
 
         ctx.Set(node.Outputs[0], y);
     }

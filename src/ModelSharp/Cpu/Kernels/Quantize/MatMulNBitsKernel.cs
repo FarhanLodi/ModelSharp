@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using ModelSharp.Cpu.Kernels.Internal;
+using ModelSharp.Cpu.Kernels.Linear;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
@@ -138,49 +139,60 @@ public sealed class MatMulNBitsKernel : IKernel
         outDims[aDims.Length - 1] = N;
         var y = new Tensor<float>(new TensorShape(outDims));
 
-        Span<float> sa = a.Span, sy = y.Span, sScales = scales.Span;
-        Span<byte> sb = b.Span;
-
         int bRowBytes = nBlocksPerRow * blobSize;
         byte mask = (byte)((1 << bits) - 1);
-        var w = new float[K];   // scratch dequantized weight row, reused per output column
 
-        for (int n = 0; n < N; n++)
+        // Capture backing buffers so the per-column parallel lambdas can re-acquire spans
+        // (Span<T> is a ref struct and cannot be hoisted into a closure). The weight scratch is
+        // allocated per column iteration (thread-local) so columns never share state.
+        Memory<float> ma = a.Buffer, my = y.Buffer, mScales = scales.Buffer;
+        Memory<byte> mb = b.Buffer;
+        float[]? zpFloatLocal = zpFloat;
+        byte[]? zpPackedLocal = zpPacked;
+        int bitsLocal = bits, blockSizeLocal = blockSize, nBlocksLocal = nBlocksPerRow;
+        int blobSizeLocal = blobSize, zpRowBytesLocal = zpRowBytes, KLocal = K, NLocal = N, MLocal = M;
+        float defaultZpLocal = defaultZp;
+
+        // Parallelise over the N output columns: each column dequantizes one weight row into a
+        // thread-local scratch vector and dots it against every activation row with SIMD. Distinct
+        // columns write distinct output positions (stride N), so there is no contention.
+        MatMulParallel.For(N, (long)KLocal * (MLocal + 1), n =>
         {
-            // Dequantize weight row n into w[0..K).
-            int bRowBase = n * bRowBytes;
-            int scaleRowBase = n * nBlocksPerRow;
-            int zpRowBase = n * zpRowBytes;
+            ReadOnlySpan<float> sa = ma.Span;
+            Span<float> sy = my.Span;
+            ReadOnlySpan<float> sScales = mScales.Span;
+            ReadOnlySpan<byte> sb = mb.Span;
 
-            for (int bk = 0; bk < nBlocksPerRow; bk++)
+            Span<float> w = KLocal <= 4096 ? stackalloc float[KLocal] : new float[KLocal];
+
+            int bRowBase = n * bRowBytes;
+            int scaleRowBase = n * nBlocksLocal;
+            int zpRowBase = n * zpRowBytesLocal;
+
+            for (int bk = 0; bk < nBlocksLocal; bk++)
             {
                 float scale = sScales[scaleRowBase + bk];
 
                 float zp;
-                if (zpFloat is not null) zp = zpFloat[scaleRowBase + bk];
-                else if (zpPacked is not null) zp = UnpackNBit(zpPacked, zpRowBase, bk, bits, mask);
-                else zp = defaultZp;
+                if (zpFloatLocal is not null) zp = zpFloatLocal[scaleRowBase + bk];
+                else if (zpPackedLocal is not null) zp = UnpackNBit(zpPackedLocal, zpRowBase, bk, bitsLocal, mask);
+                else zp = defaultZpLocal;
 
-                int blobBase = bRowBase + bk * blobSize;
-                int kStart = bk * blockSize;
-                int kEnd = Math.Min(kStart + blockSize, K);
+                int blobBase = bRowBase + bk * blobSizeLocal;
+                int kStart = bk * blockSizeLocal;
+                int kEnd = Math.Min(kStart + blockSizeLocal, KLocal);
                 for (int k = kStart; k < kEnd; k++)
                 {
                     int inBlock = k - kStart;               // index within the block
-                    int q = UnpackNBit(sb, blobBase, inBlock, bits, mask);
+                    int q = UnpackNBit(sb, blobBase, inBlock, bitsLocal, mask);
                     w[k] = (q - zp) * scale;
                 }
             }
 
-            // Accumulate Y[m, n] = Σ_k A[m, k] * w[k] for every A row.
-            for (int m = 0; m < M; m++)
-            {
-                int aRow = m * K;
-                float sum = 0f;
-                for (int k = 0; k < K; k++) sum += sa[aRow + k] * w[k];
-                sy[m * N + n] = sum;
-            }
-        }
+            // Accumulate Y[m, n] = Σ_k A[m, k] * w[k] for every A row (SIMD inner dot).
+            for (int m = 0; m < MLocal; m++)
+                sy[m * NLocal + n] = MatMulParallel.Dot(sa, m * KLocal, w, KLocal);
+        });
 
         ctx.Set(node.Outputs[0], y);
     }
@@ -191,7 +203,7 @@ public sealed class MatMulNBitsKernel : IKernel
     /// for <c>bits = 4</c> the even index is the low nibble and the odd index the high nibble; for
     /// <c>bits = 8</c> one value per byte.
     /// </summary>
-    private static int UnpackNBit(Span<byte> data, int baseByte, int index, int bits, byte mask)
+    private static int UnpackNBit(ReadOnlySpan<byte> data, int baseByte, int index, int bits, byte mask)
     {
         if (bits == 8) return data[baseByte + index];
         // bits == 4

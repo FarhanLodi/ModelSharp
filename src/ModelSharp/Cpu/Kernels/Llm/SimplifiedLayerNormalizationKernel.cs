@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
@@ -16,6 +17,9 @@ namespace ModelSharp.Cpu.Kernels.Llm;
 public sealed class SimplifiedLayerNormalizationKernel : IKernel
 {
     public string OpType => "SimplifiedLayerNormalization";
+
+    /// <summary>Below this many elements (rows × norm) the row loop stays serial.</summary>
+    private const long NormThreshold = 1L << 16;
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -35,20 +39,26 @@ public sealed class SimplifiedLayerNormalizationKernel : IKernel
         bool wantInv = node.Outputs.Count > 1 && node.Outputs[1].Length > 0;
         var invStd = wantInv ? new Tensor<float>(new TensorShape(outer)) : null;
 
-        Span<float> xs = x.Span, ys = y.Span, sc = scale.Span;
-        Span<float> invs = invStd is null ? default : invStd.Span;
+        // Flat backing arrays so each row can be handled in a Parallel.For body.
+        float[] xs = KernelSimd.Array(x);
+        float[] ys = KernelSimd.Array(y);
+        float[] sc = KernelSimd.Array(scale);
+        float[]? invs = invStd is null ? null : KernelSimd.Array(invStd);
 
-        for (int o = 0; o < outer; o++)
+        void Row(int o)
         {
             int b = o * norm;
-            float sumSq = 0f;
-            for (int i = 0; i < norm; i++) { float v = xs[b + i]; sumSq += v * v; }
+            float sumSq = KernelSimd.SumSquares(xs, b, norm);
             float inv = 1f / MathF.Sqrt(sumSq / norm + eps);
-            if (invStd is not null) invs[o] = inv;
-
-            for (int i = 0; i < norm; i++)
-                ys[b + i] = xs[b + i] * inv * sc[i];
+            if (invs is not null) invs[o] = inv;
+            KernelSimd.NormApply(ys, b, xs, b, inv, sc, null, norm);
         }
+
+        // Parallelize across the independent rows when the work is large enough.
+        if ((long)outer * norm >= NormThreshold)
+            Parallel.For(0, outer, Row);
+        else
+            for (int o = 0; o < outer; o++) Row(o);
 
         ctx.Set(node.Outputs[0], y);
         if (invStd is not null) ctx.Set(node.Outputs[1], invStd);

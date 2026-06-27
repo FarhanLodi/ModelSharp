@@ -129,28 +129,51 @@ public sealed class QLinearMatMulKernel : IKernel
         outDims[batchRank] = M; outDims[batchRank + 1] = N;
         var y = new float[totalBatch * oMat];
 
-        var coord = new int[batchRank];
-        int aOff = 0, bOff = 0;
-        for (int bi = 0; bi < totalBatch; bi++)
+        // Precompute per-batch A/B offsets so output rows parallelise cleanly, and transpose each
+        // distinct B matrix from [K,N] (column-strided) to row-major [N,K] once for a contiguous,
+        // SIMD-friendly inner dot.
+        var aOffOf = new int[totalBatch];
+        var bOffOf = new int[totalBatch];
         {
-            int aBase = aOff * aMat, bBase = bOff * bMat, oBase = bi * oMat;
-            for (int m = 0; m < M; m++)
+            var coord = new int[batchRank];
+            int aOff = 0, bOff = 0;
+            for (int bi = 0; bi < totalBatch; bi++)
             {
-                int aRow = aBase + m * K, oRow = oBase + m * N;
-                for (int nn = 0; nn < N; nn++)
+                aOffOf[bi] = aOff; bOffOf[bi] = bOff;
+                for (int ax = batchRank - 1; ax >= 0; ax--)
                 {
-                    float sum = 0f;
-                    for (int kk = 0; kk < K; kk++) sum += a[aRow + kk] * b[bBase + kk * N + nn];
-                    y[oRow + nn] = sum;
+                    coord[ax]++; aOff += aBS[ax]; bOff += bBS[ax];
+                    if (coord[ax] < outBatch[ax]) break;
+                    coord[ax] = 0; aOff -= aBS[ax] * outBatch[ax]; bOff -= bBS[ax] * outBatch[ax];
                 }
             }
-            for (int ax = batchRank - 1; ax >= 0; ax--)
-            {
-                coord[ax]++; aOff += aBS[ax]; bOff += bBS[ax];
-                if (coord[ax] < outBatch[ax]) break;
-                coord[ax] = 0; aOff -= aBS[ax] * outBatch[ax]; bOff -= bBS[ax] * outBatch[ax];
-            }
         }
+
+        var bTransposed = new System.Collections.Generic.Dictionary<int, float[]>();
+        foreach (int bOff in bOffOf)
+        {
+            if (bTransposed.ContainsKey(bOff)) continue;
+            var bt = new float[bMat];
+            int bBase = bOff * bMat;
+            for (int kk = 0; kk < K; kk++)
+            {
+                int src = bBase + kk * N;
+                for (int nn = 0; nn < N; nn++) bt[nn * K + kk] = b[src + nn];
+            }
+            bTransposed[bOff] = bt;
+        }
+
+        long totalRows = (long)totalBatch * M;
+        Linear.MatMulParallel.For(checked((int)totalRows), (long)K * N, row =>
+        {
+            int bi = row / M;
+            int m = row % M;
+            float[] bt = bTransposed[bOffOf[bi]];
+            int aRow = aOffOf[bi] * aMat + m * K;
+            int oRow = bi * oMat + m * N;
+            for (int nn = 0; nn < N; nn++)
+                y[oRow + nn] = Linear.MatMulParallel.Dot(a, aRow, bt.AsSpan(nn * K, K), K);
+        });
         return (y, new TensorShape(outDims));
     }
 }

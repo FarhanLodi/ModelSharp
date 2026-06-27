@@ -168,7 +168,7 @@ public class GqaGenaiTests
     [Fact]
     public void PackedQkv_Rotary_HalfSplit_MatchesManual()
     {
-        int s = 2, headDim = 4, numHeads = 1, kvHeads = 1;
+        int s = 2, headDim = 4;
         // packed hidden = (1 + 2)*4 = 12: [Q(4) | K(4) | V(4)].
         float[] q0 = { 1, 2, 3, 4 }, k0 = { 1, 0, 1, 0 }, v0 = { 1, 1, 1, 1 };
         float[] q1 = { 0, 1, 0, 1 }, k1 = { 2, 1, 0, 1 }, v1 = { 2, 2, 2, 2 };

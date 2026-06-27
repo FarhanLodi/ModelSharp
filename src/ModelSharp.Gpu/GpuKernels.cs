@@ -558,6 +558,241 @@ internal static class GpuKernels
     }
 
     /// <summary>
+    /// Block-wise n-bit (INT4/INT8) quantized matmul — the Microsoft contrib op <c>MatMulNBits</c>.
+    /// Computes <c>Y[m, n] = Σ_k A[m, k] · W[n, k]</c> where <c>W[n, k] = (q − zp[n, b]) · scale[n, b]</c>
+    /// is the on-the-fly dequantization of the packed weight row <c>n</c>, block <c>b = k / blockSize</c>.
+    /// One thread per output element across the flattened <c>[M, N]</c> output (M = product of A's leading
+    /// dims). The packed weights <paramref name="b"/> (<c>[N · nBlocksPerRow · blobSize]</c> bytes, widened
+    /// to int per byte), per-(row,block) <paramref name="scales"/> (<c>[N · nBlocksPerRow]</c>), and zero
+    /// points all live on the device.
+    ///
+    /// <para><b>Zero point selection (branchless via <paramref name="zpMode"/>):</b>
+    /// 0 = default symmetric <c>2^(bits-1)</c> (the <paramref name="zpFloat"/>/<paramref name="zpPacked"/>
+    /// buffers are unused 1-element sentinels); 1 = float per-(row,block) in <paramref name="zpFloat"/>
+    /// indexed <c>n·nBlocksPerRow + b</c>; 2 = packed n-bit in <paramref name="zpPacked"/>, the same
+    /// least-significant-first nibble packing as <paramref name="b"/>, row stride
+    /// <paramref name="zpRowBytes"/>. Mirrors the CPU <c>MatMulNBitsKernel</c> bit-for-bit in dequant
+    /// semantics (nibble order, default zp, accumulation order); float accumulation differs only by the
+    /// usual GPU vs CPU rounding.</para>
+    /// </summary>
+    internal static void MatMulNBitsK(
+        Index1D idx,
+        ArrayView<float> a,
+        ArrayView<int> b,
+        ArrayView<float> scales,
+        ArrayView<float> zpFloat,
+        ArrayView<int> zpPacked,
+        ArrayView<float> y,
+        MatMulNBitsParams p)
+    {
+        int gid = idx.X;
+        int N = p.N;
+        int K = p.K;
+        int m = gid / N;
+        int n = gid - m * N;
+
+        int bits = p.Bits;
+        int mask = (1 << bits) - 1;
+        float defaultZp = 1 << (bits - 1);
+        int bRowBase = n * p.NBlocksPerRow * p.BlobSize;
+        int scaleRowBase = n * p.NBlocksPerRow;
+        int zpRowBase = n * p.ZpRowBytes;
+        int aRow = m * K;
+
+        float sum = 0f;
+        for (int bk = 0; bk < p.NBlocksPerRow; bk++)
+        {
+            float scale = scales[scaleRowBase + bk];
+
+            float zp;
+            if (p.ZpMode == 1) zp = zpFloat[scaleRowBase + bk];
+            else if (p.ZpMode == 2) zp = UnpackNBitK(zpPacked, zpRowBase, bk, bits, mask);
+            else zp = defaultZp;
+
+            int blobBase = bRowBase + bk * p.BlobSize;
+            int kStart = bk * p.BlockSize;
+            int kEnd = kStart + p.BlockSize;
+            if (kEnd > K) kEnd = K;
+            for (int k = kStart; k < kEnd; k++)
+            {
+                int inBlock = k - kStart;
+                int q = UnpackNBitK(b, blobBase, inBlock, bits, mask);
+                float w = (q - zp) * scale;
+                sum += a[aRow + k] * w;
+            }
+        }
+        y[gid] = sum;
+    }
+
+    /// <summary>
+    /// Unpacks the <paramref name="index"/>-th <paramref name="bits"/>-bit value from a byte-per-int region
+    /// starting at <paramref name="baseByte"/>, least-significant-first (bits=4: even index = low nibble,
+    /// odd = high nibble; bits=8: one value per byte). Mirrors the CPU <c>MatMulNBitsKernel.UnpackNBit</c>.
+    /// </summary>
+    private static int UnpackNBitK(ArrayView<int> data, int baseByte, int index, int bits, int mask)
+    {
+        if (bits == 8) return data[baseByte + index];
+        int byteOff = baseByte + (index >> 1);
+        int shift = (index & 1) * 4;
+        return (data[byteOff] >> shift) & mask;
+    }
+
+    /// <summary>
+    /// In-place RoPE on a <c>[B, S, heads·headDim]</c> float buffer (NeoX half-split or GPT-J interleaved),
+    /// one thread per (b, s, head, j) rotary pair. The token at sequence index <c>s</c> uses cos/sin cache
+    /// row <c>pastSeq + s</c> (clamped to <paramref name="maxPos"/>−1); cos/sin caches are
+    /// <c>[maxPos, half]</c>. Mirrors the CPU GQA <c>ApplyRotary</c>: <paramref name="interleaved"/> ≠ 0
+    /// pairs <c>(2j, 2j+1)</c>, else <c>(j, j+rotHalf)</c>. Channels beyond the rotary span are untouched
+    /// (this kernel only launches over the rotHalf pairs). The grid is
+    /// <c>[batch · seq · heads · rotHalf]</c>.
+    /// </summary>
+    internal static void RotaryK(
+        Index1D idx,
+        ArrayView<float> buf,
+        ArrayView<float> cos,
+        ArrayView<float> sin,
+        int seq,
+        int heads,
+        int headDim,
+        int rotHalf,
+        int half,
+        int pastSeq,
+        int maxPos,
+        int interleaved)
+    {
+        int gid = idx.X;
+        int j = gid % rotHalf;
+        int t = gid / rotHalf;
+        int h = t % heads;
+        int t2 = t / heads;
+        int s = t2 % seq;
+        int b = t2 / seq;
+
+        int pos = pastSeq + s;
+        if (pos >= maxPos) pos = maxPos - 1;
+        int cacheBase = pos * half;
+        float c = cos[cacheBase + j];
+        float sn = sin[cacheBase + j];
+
+        int rowBase = ((b * seq + s) * heads + h) * headDim;
+        int i0, i1;
+        if (interleaved != 0) { i0 = rowBase + 2 * j; i1 = i0 + 1; }
+        else { i0 = rowBase + j; i1 = rowBase + j + rotHalf; }
+        float va = buf[i0];
+        float vb = buf[i1];
+        buf[i0] = va * c - vb * sn;
+        buf[i1] = vb * c + va * sn;
+    }
+
+    /// <summary>
+    /// Copies a step's per-token K (or V) — laid out <c>[B, kvSeq, kvNumHeads·headDim]</c> — into a present
+    /// cache laid out <c>[B, kvNumHeads, totalSeq, headDim]</c> at sequence offset <paramref name="pastSeq"/>.
+    /// One thread per (b, s, g, d) element. Mirrors the CPU GQA's new-K/V scatter. (Past K/V, when present,
+    /// is staged into the cache by a separate device→device copy on the host side.)
+    /// </summary>
+    internal static void GqaScatterKvK(
+        Index1D idx,
+        ArrayView<float> src,
+        ArrayView<float> present,
+        int kvSeq,
+        int kvNumHeads,
+        int headDim,
+        int totalSeq,
+        int pastSeq)
+    {
+        int gid = idx.X;
+        int d = gid % headDim;
+        int t = gid / headDim;
+        int g = t % kvNumHeads;
+        int t2 = t / kvNumHeads;
+        int s = t2 % kvSeq;
+        int b = t2 / kvSeq;
+
+        int kvHid = kvNumHeads * headDim;
+        int srcOff = (b * kvSeq + s) * kvHid + g * headDim + d;
+        int dstOff = ((b * kvNumHeads + g) * totalSeq + pastSeq + s) * headDim + d;
+        present[dstOff] = src[srcOff];
+    }
+
+    /// <summary>
+    /// Grouped-query attention core: for each (b, h, qi) computes causal scaled-dot-product attention of the
+    /// query against the cached present-K/V and writes the context into <paramref name="outBuf"/>
+    /// (<c>[B, qSeq, numHeads·headDim]</c>). One thread per (b, h, qi) — i.e. per output row of headDim
+    /// elements. Present K/V are <c>[B, kvNumHeads, totalSeq, headDim]</c>; query head <c>h</c> reads KV head
+    /// <c>h / groupSize</c> (repeat-KV). Causal bound: key positions <c>0 … min(pastSeq+qi, seqBound[b])</c>.
+    /// Scores are computed, max-subtracted, exponentiated and normalized inline (no scratch buffer — the
+    /// two-pass online form), then the V-weighted sum is accumulated — matching the CPU GQA accumulation
+    /// order. <paramref name="seqBounds"/> is the per-batch last-valid-key index (<c>seqlens_k</c>), or a
+    /// single-element buffer of <c>totalSeq−1</c> when absent (selected by <paramref name="hasSeqBound"/>).
+    /// </summary>
+    internal static void GqaAttentionK(
+        Index1D idx,
+        ArrayView<float> q,
+        ArrayView<float> presentK,
+        ArrayView<float> presentV,
+        ArrayView<float> outBuf,
+        ArrayView<int> seqBounds,
+        int qSeq,
+        int numHeads,
+        int kvNumHeads,
+        int headDim,
+        int totalSeq,
+        int pastSeq,
+        int groupSize,
+        float scale,
+        int hasSeqBound)
+    {
+        int gid = idx.X;
+        int qi = gid % qSeq;
+        int t = gid / qSeq;
+        int h = t % numHeads;
+        int b = t / numHeads;
+
+        int g = h / groupSize;
+        int qHid = numHeads * headDim;
+        int qRow = (b * qSeq + qi) * qHid + h * headDim;
+
+        int seqBound = hasSeqBound != 0 ? seqBounds[b] : totalSeq - 1;
+        int kLimit = pastSeq + qi;
+        if (kLimit > seqBound) kLimit = seqBound;
+
+        // Pass 1: max score.
+        float mx = float.NegativeInfinity;
+        for (int kj = 0; kj <= kLimit; kj++)
+        {
+            int kBase = ((b * kvNumHeads + g) * totalSeq + kj) * headDim;
+            float dot = 0f;
+            for (int d = 0; d < headDim; d++) dot += q[qRow + d] * presentK[kBase + d];
+            float sc = dot * scale;
+            if (sc > mx) mx = sc;
+        }
+
+        // Pass 2: sum of exps.
+        float sum = 0f;
+        for (int kj = 0; kj <= kLimit; kj++)
+        {
+            int kBase = ((b * kvNumHeads + g) * totalSeq + kj) * headDim;
+            float dot = 0f;
+            for (int d = 0; d < headDim; d++) dot += q[qRow + d] * presentK[kBase + d];
+            sum += MathF.Exp(dot * scale - mx);
+        }
+        float inv = sum > 0f ? 1f / sum : 0f;
+
+        // Pass 3: V-weighted sum.
+        int outRow = (b * qSeq + qi) * qHid + h * headDim;
+        for (int d = 0; d < headDim; d++) outBuf[outRow + d] = 0f;
+        for (int kj = 0; kj <= kLimit; kj++)
+        {
+            int kBase = ((b * kvNumHeads + g) * totalSeq + kj) * headDim;
+            float dot = 0f;
+            for (int d = 0; d < headDim; d++) dot += q[qRow + d] * presentK[kBase + d];
+            float w = MathF.Exp(dot * scale - mx) * inv;
+            int vBase = ((b * kvNumHeads + g) * totalSeq + kj) * headDim;
+            for (int d = 0; d < headDim; d++) outBuf[outRow + d] += w * presentV[vBase + d];
+        }
+    }
+
+    /// <summary>
     /// Elementwise <c>Where</c>: <c>cond != 0 ? x : y</c>, with NumPy-style broadcasting over all three
     /// operands. <paramref name="cond"/> is supplied as a float buffer (0/1). One thread per output element.
     /// Mirrors the CPU <c>WhereKernel</c> (float value path).
@@ -586,6 +821,41 @@ internal static class GpuKernels
             yOff += c * sY[ax];
         }
         outBuf[i] = cond[cOff] != 0f ? x[xOff] : y[yOff];
+    }
+}
+
+/// <summary>
+/// Blittable bundle of scalar <c>MatMulNBits</c> layout parameters passed by value to
+/// <see cref="GpuKernels.MatMulNBitsK"/>. Packed into a struct because the kernel needs more scalars than the
+/// 15-arg <c>LoadAutoGroupedStreamKernel</c> generic delegate arity allows.
+/// </summary>
+public readonly struct MatMulNBitsParams
+{
+    /// <summary>Flattened A rows (product of A's leading dims).</summary>
+    public readonly int M;
+    /// <summary>Contraction dimension.</summary>
+    public readonly int K;
+    /// <summary>Output columns (weight rows).</summary>
+    public readonly int N;
+    /// <summary>Quantization bit width (4 or 8).</summary>
+    public readonly int Bits;
+    /// <summary>Block size along K.</summary>
+    public readonly int BlockSize;
+    /// <summary>Blocks per weight row = ceil(K / BlockSize).</summary>
+    public readonly int NBlocksPerRow;
+    /// <summary>Packed bytes per block = ceil(BlockSize · Bits / 8).</summary>
+    public readonly int BlobSize;
+    /// <summary>Packed zero-point bytes per weight row = ceil(NBlocksPerRow · Bits / 8).</summary>
+    public readonly int ZpRowBytes;
+    /// <summary>Zero-point selector: 0 = default symmetric, 1 = float per-(row,block), 2 = packed n-bit.</summary>
+    public readonly int ZpMode;
+
+    /// <summary>Bundles all MatMulNBits scalar parameters.</summary>
+    public MatMulNBitsParams(int m, int k, int n, int bits, int blockSize,
+        int nBlocksPerRow, int blobSize, int zpRowBytes, int zpMode)
+    {
+        M = m; K = k; N = n; Bits = bits; BlockSize = blockSize;
+        NBlocksPerRow = nBlocksPerRow; BlobSize = blobSize; ZpRowBytes = zpRowBytes; ZpMode = zpMode;
     }
 }
 

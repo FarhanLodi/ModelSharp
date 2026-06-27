@@ -123,8 +123,18 @@ public sealed class TextGenerator
         int generatedCount = 0;
         bool cache = _kvCache.IsCacheMode;
 
-        // pastInputName -> tensor, threaded from the previous step's present.* outputs.
+        // pastInputName -> tensor, threaded from the previous step's present.* outputs. Reused across
+        // steps so the threading map is allocated once, not per token.
         Dictionary<string, Tensor>? past = null;
+
+        // Hot-loop scratch, allocated once and reused on every step to keep the decode loop
+        // allocation-free apart from the engine's own outputs:
+        //  - the feed dictionary is cleared + repopulated rather than reallocated;
+        //  - the attention_mask buffer is filled with ones up to the prompt length and only grown
+        //    (one extra "1" appended) per generated token, never reallocated unless capacity is hit;
+        //  - a 1-element scratch backs the single-token input_ids / position_ids during decode.
+        var feeds = new Dictionary<string, NamedTensor>(StringComparer.Ordinal);
+        var maskState = _attentionMaskInfo is not null ? new MaskBuffer(sequence.Count) : null;
 
         while (true)
         {
@@ -136,7 +146,7 @@ public sealed class TextGenerator
             int chunkLength = (!cache || past is null) ? sequence.Count : 1;
             int startPosition = sequence.Count - chunkLength;
 
-            IReadOnlyDictionary<string, NamedTensor> feeds = BuildFeeds(sequence, chunkLength, startPosition, cache, past);
+            BuildFeeds(feeds, maskState, sequence, chunkLength, startPosition, cache, past);
             IReadOnlyDictionary<string, NamedTensor> outputs = _engine.Run(feeds);
 
             float[] logitsRow = ExtractLastPositionLogits(outputs);
@@ -146,7 +156,10 @@ public sealed class TextGenerator
             sequence.Add(next);
             generatedCount++;
 
-            if (cache) past = CapturePresent(outputs);
+            // Thread present.* -> past_key_values.* for the next step. We hold the engine's output
+            // tensors by reference and feed them straight back as next-step past: no per-step copy or
+            // re-tokenization of the KV cache. Reuses the same map instance across steps.
+            if (cache) past = CapturePresent(outputs, past);
 
             yield return next;
 
@@ -154,24 +167,30 @@ public sealed class TextGenerator
         }
     }
 
-    /// <summary>Builds the feed dictionary for one step.</summary>
-    private IReadOnlyDictionary<string, NamedTensor> BuildFeeds(
+    /// <summary>
+    /// Populates the (reused) feed dictionary for one step in place. Clears the previous step's
+    /// entries first, then rebinds input_ids / attention_mask / position_ids / use_cache_branch /
+    /// past_key_values for the current chunk.
+    /// </summary>
+    private void BuildFeeds(
+        Dictionary<string, NamedTensor> feeds, MaskBuffer? maskState,
         List<long> sequence, int chunkLength, int startPosition, bool cache, Dictionary<string, Tensor>? past)
     {
-        var feeds = new Dictionary<string, NamedTensor>(StringComparer.Ordinal);
+        feeds.Clear();
 
-        // input_ids: the chunk being processed this step.
+        // input_ids: the chunk being processed this step. In decode mode this is a single token.
         var ids = new long[chunkLength];
         for (int i = 0; i < chunkLength; i++) ids[i] = sequence[startPosition + i];
         feeds[_options.InputIdsName] = new NamedTensor(
             _options.InputIdsName, BuildIntTensor(_inputIdsInfo, new TensorShape(1, chunkLength), ids));
 
         // attention_mask: ones over every token the model attends to so far (past + current chunk).
+        // Grown in place from a persistent buffer so each decode step appends a single "1" instead of
+        // reallocating and refilling a full-length array.
         if (_attentionMaskInfo is not null)
         {
             int maskLength = sequence.Count;
-            var mask = new long[maskLength];
-            for (int i = 0; i < maskLength; i++) mask[i] = 1;
+            Memory<long> mask = maskState!.OnesUpTo(maskLength);
             feeds[_options.AttentionMaskName] = new NamedTensor(
                 _options.AttentionMaskName, BuildIntTensor(_attentionMaskInfo, new TensorShape(1, maskLength), mask));
         }
@@ -195,7 +214,8 @@ public sealed class TextGenerator
                 _options.UseCacheBranchName, BuildBoolTensor(_useCacheBranchInfo, useCache));
         }
 
-        // past_key_values: empty on the first pass, otherwise the previous present.* outputs.
+        // past_key_values: empty on the first pass, otherwise the previous present.* outputs threaded
+        // straight through (no copy).
         if (cache)
         {
             if (past is null)
@@ -209,14 +229,17 @@ public sealed class TextGenerator
                     feeds[kvp.Key] = new NamedTensor(kvp.Key, kvp.Value);
             }
         }
-
-        return feeds;
     }
 
-    /// <summary>Rebinds the engine's present.* outputs to their past_key_values.* input names for the next step.</summary>
-    private Dictionary<string, Tensor> CapturePresent(IReadOnlyDictionary<string, NamedTensor> outputs)
+    /// <summary>
+    /// Rebinds the engine's present.* outputs to their past_key_values.* input names for the next
+    /// step. The present tensors are taken by reference (no copy / no re-prefill); only the small
+    /// name->tensor map is updated, reusing <paramref name="reuse"/> when one already exists.
+    /// </summary>
+    private Dictionary<string, Tensor> CapturePresent(
+        IReadOnlyDictionary<string, NamedTensor> outputs, Dictionary<string, Tensor>? reuse)
     {
-        var map = new Dictionary<string, Tensor>(_kvCache.Pairs.Count, StringComparer.Ordinal);
+        Dictionary<string, Tensor> map = reuse ?? new Dictionary<string, Tensor>(_kvCache.Pairs.Count, StringComparer.Ordinal);
         foreach (KvCachePair pair in _kvCache.Pairs)
         {
             if (!outputs.TryGetValue(pair.PresentOutput, out NamedTensor? present))
@@ -291,11 +314,20 @@ public sealed class TextGenerator
     /// receives int32 instead.
     /// </summary>
     private static Tensor BuildIntTensor(TensorInfo? info, TensorShape shape, long[] values)
+        => BuildIntTensor(info, shape, (Memory<long>)values);
+
+    /// <summary>
+    /// Builds an integer feed tensor from an int64 span. When the binding is declared int64 the buffer
+    /// is wrapped without a copy (so a reused backing array threads straight into the feed); int32
+    /// bindings are narrowed into a fresh buffer.
+    /// </summary>
+    private static Tensor BuildIntTensor(TensorInfo? info, TensorShape shape, Memory<long> values)
     {
         if (info?.ElementType == ElementType.Int32)
         {
-            var buffer = new int[values.Length];
-            for (int i = 0; i < values.Length; i++) buffer[i] = checked((int)values[i]);
+            ReadOnlySpan<long> src = values.Span;
+            var buffer = new int[src.Length];
+            for (int i = 0; i < src.Length; i++) buffer[i] = checked((int)src[i]);
             return new Tensor<int>(shape, buffer);
         }
         return new Tensor<long>(shape, values);
@@ -387,5 +419,43 @@ public sealed class TextGenerator
         foreach (int eos in config.EosTokenIds)
             if (eos == token) return true;
         return false;
+    }
+
+    /// <summary>
+    /// A grow-only buffer of all-ones int64 attention-mask values, reused across decode steps. The
+    /// attention mask is always a run of <c>1</c>s of the current sequence length, so each step only
+    /// needs the buffer to be at least that long; we fill any newly exposed tail with <c>1</c> once
+    /// and hand back a length-bounded view, avoiding a fresh full-length allocation per token.
+    /// </summary>
+    private sealed class MaskBuffer
+    {
+        private long[] _ones;
+        private int _filled;
+
+        public MaskBuffer(int initialLength)
+        {
+            int cap = Math.Max(initialLength, 1);
+            _ones = new long[cap];
+            // _filled left at 0; OnesUpTo fills lazily on first use.
+        }
+
+        /// <summary>Returns a view of <paramref name="length"/> ones, growing/filling the buffer as needed.</summary>
+        public Memory<long> OnesUpTo(int length)
+        {
+            if (length > _ones.Length)
+            {
+                int cap = _ones.Length;
+                while (cap < length) cap *= 2;
+                Array.Resize(ref _ones, cap);
+                // Resize preserves existing (already-filled) ones; the new tail is zero-filled and
+                // will be set below.
+            }
+            if (length > _filled)
+            {
+                for (int i = _filled; i < length; i++) _ones[i] = 1;
+                _filled = length;
+            }
+            return new Memory<long>(_ones, 0, length);
+        }
     }
 }

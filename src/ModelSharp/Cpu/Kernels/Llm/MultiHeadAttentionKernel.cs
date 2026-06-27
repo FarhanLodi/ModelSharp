@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
@@ -36,6 +37,9 @@ namespace ModelSharp.Cpu.Kernels.Llm;
 public sealed class MultiHeadAttentionKernel : IKernel
 {
     public string OpType => "MultiHeadAttention";
+
+    /// <summary>Serial below this many inner MACs (units × keys × head_dim); see GQA.</summary>
+    private const long ParallelThreshold = 1L << 18;
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -172,46 +176,76 @@ public sealed class MultiHeadAttentionKernel : IKernel
         }
 
         var outT = new Tensor<float>(new TensorShape(batch, qSeq, vHidden));
-        Span<float> outSpan = outT.Span;
-        Span<float> scores = new float[totalSeq];
 
+        // Fold the optional Q-bias into a dense per-head Q buffer [B, num_heads, Sq, qHead]
+        // once, so the inner Q·K can be a plain SIMD dot (K/V bias is already folded into
+        // present_key/value during the scatter above). Without bias this is just a repack.
+        float[] qPacked = new float[(long)batch * numHeads * qSeq * qHead <= int.MaxValue
+            ? batch * numHeads * qSeq * qHead : throw new ModelSharpException("MultiHeadAttention tensor too large.")];
         for (int b = 0; b < batch; b++)
         for (int h = 0; h < numHeads; h++)
         for (int qi = 0; qi < qSeq; qi++)
         {
             int qRow = (b * qSeq + qi) * qHidden + h * qHead;
+            int dst = ((b * numHeads + h) * qSeq + qi) * qHead;
+            for (int d = 0; d < qHead; d++)
+            {
+                float qv = qSpan[qRow + d];
+                if (bias is not null) qv += biasSpan[h * qHead + d];
+                qPacked[dst + d] = qv;
+            }
+        }
+
+        // Parallelize over the independent (batch × head × query_position) units; each writes
+        // a disjoint [vHead] output slice. Q·K and attn·V are SIMD-vectorized.
+        float[] pkArr = KernelSimd.Array(presentK);
+        float[] pvArr = KernelSimd.Array(presentV);
+        float[] outArr = KernelSimd.Array(outT);
+        Tensor<float>? maskT = mask;
+        int totalUnits = batch * numHeads * qSeq;
+        bool parallel = (long)totalUnits * totalSeq * Math.Max(qHead, vHead) >= ParallelThreshold;
+
+        void Compute(int unit, float[] scores)
+        {
+            int qi = unit % qSeq;
+            int hb = unit / qSeq;
+            int h = hb % numHeads;
+            int b = hb / numHeads;
+
+            int qBase = ((b * numHeads + h) * qSeq + qi) * qHead;
+            int kvHeadBase = (b * numHeads + h) * totalSeq;
 
             // scores[k] = scale * (Q · K_k) + mask.
             float mx = float.NegativeInfinity;
             for (int kj = 0; kj < totalSeq; kj++)
             {
-                int kBase = ((b * numHeads + h) * totalSeq + kj) * qHead;
-                float dot = 0f;
-                for (int d = 0; d < qHead; d++)
-                {
-                    float qv = qSpan[qRow + d];
-                    if (bias is not null) qv += biasSpan[h * qHead + d];
-                    dot += qv * pk[kBase + d];
-                }
-                float sc = dot * scale + MaskAdd(mask, batch, numHeads, qSeq, totalSeq, b, h, qi, kj);
+                float dot = KernelSimd.Dot(qPacked, qBase, pkArr, (kvHeadBase + kj) * qHead, qHead);
+                float sc = dot * scale + MaskAdd(maskT, batch, numHeads, qSeq, totalSeq, b, h, qi, kj);
                 scores[kj] = sc;
                 if (sc > mx) mx = sc;
             }
 
-            // softmax.
             float sum = 0f;
             for (int kj = 0; kj < totalSeq; kj++) { float e = MathF.Exp(scores[kj] - mx); scores[kj] = e; sum += e; }
             float inv = sum > 0f ? 1f / sum : 0f;
 
-            // context = Σ_k softmax_k · V_k.
             int outRow = (b * qSeq + qi) * vHidden + h * vHead;
-            for (int d = 0; d < vHead; d++) outSpan[outRow + d] = 0f;
+            System.Array.Clear(outArr, outRow, vHead);
             for (int kj = 0; kj < totalSeq; kj++)
-            {
-                float w = scores[kj] * inv;
-                int vBase = ((b * numHeads + h) * totalSeq + kj) * vHead;
-                for (int d = 0; d < vHead; d++) outSpan[outRow + d] += w * pv[vBase + d];
-            }
+                KernelSimd.AxpyInto(outArr, outRow, pvArr, (kvHeadBase + kj) * vHead, scores[kj] * inv, vHead);
+        }
+
+        if (parallel)
+        {
+            Parallel.For(0, totalUnits,
+                () => new float[totalSeq],
+                (unit, _, scores) => { Compute(unit, scores); return scores; },
+                _ => { });
+        }
+        else
+        {
+            float[] scores = new float[totalSeq];
+            for (int unit = 0; unit < totalUnits; unit++) Compute(unit, scores);
         }
 
         ctx.Set(node.Outputs[0], outT);

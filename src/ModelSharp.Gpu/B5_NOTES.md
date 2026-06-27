@@ -464,3 +464,93 @@ This pass (a) moves a batch of high-frequency ops off the per-op CPU fallback on
   skip green with no CUDA, **skip on device `out of memory`**).
 - int8 GEMM bit-exactness: `GpuQuantizedTests.MatMulInteger_TiledVsNaive_BitExact_CpuAccel` asserts tiled == naïve
   == CPU across all shape/dtype/zp cases; `GpuMatMulIntegerPerfTests` re-asserts on CUDA and logs the speedup.
+
+---
+
+# Native on-device `MatMulNBits` (INT4/INT8 block-quant) + `GroupQueryAttention` (this pass)
+
+The two heavyweight quantized-LLM contrib ops that the onnxruntime-genai INT4 LLM exports (Qwen-0.5B,
+Mistral-7B, Phi-3, Llama) lean on — `MatMulNBits` (block-wise INT4/INT8 weight-quantized linear) and
+`GroupQueryAttention` (packed-QKV grouped-query attention with in-op rotary + KV-cache) — previously had **no
+native case** in the engine switch, so each hit `RunCpuFallback`: download the float inputs, run the scalar CPU
+kernel, re-upload. For a 7B INT4 model those two ops *are* essentially the whole decoder, so the fallback
+round-trip dominated runtime. Both are now **first-class native GPU ops**, with the float compute path staying
+on the device and no per-op host round-trip.
+
+## `MatMulNBits` — dequant-in-kernel block-quant GEMM
+
+- **Kernel** (`GpuKernels.MatMulNBitsK`, one thread per output element across the flattened `[M, N]`). A (float
+  `[..., K]`) lives on the device; the packed quantized B (`[N, nBlocksPerRow, blobSize]` uint8, widened one int
+  per byte), the per-`(row, block)` `scales`, and the zero points are uploaded. Each thread walks the K-blocks of
+  its weight row, **unpacks each n-bit code and dequantizes `W[n,k] = (q − zp) · scale` inside the kernel**, and
+  accumulates `Σ_k A[m,k]·W[n,k]` in float — writing the float `[..., N]` result directly. No host dequant scratch.
+- **Bit-for-bit dequant semantics** vs the CPU `MatMulNBitsKernel`: least-significant-first nibble packing (bits=4:
+  even index = low nibble, odd = high nibble; bits=8: one byte/value), default symmetric zero point `2^(bits-1)`
+  when absent, partial last block (`K % blockSize`), and the same per-block accumulation order. `g_idx` with a
+  non-trivial block permutation throws (matches CPU).
+- **Zero-point forms** (branchless via a `zpMode` selector in the `MatMulNBitsParams` struct): `0` = default
+  symmetric, `1` = float per-`(row, block)` (`zpFloat[n·nBlocksPerRow+b]`), `2` = packed n-bit (same nibble
+  packing as B, row stride `zpRowBytes`). Unused zp buffers are 1-element sentinels.
+- **Arity note:** ILGPU 1.5.3's `LoadAutoGroupedStreamKernel<…>` caps at **15 generic params (incl. `Index1D`)**.
+  The 9 scalar layout params are bundled into a blittable `MatMulNBitsParams` struct (like `ConvParams`) so the
+  delegate is `Index1D + 6 views + 1 struct`. (`GqaAttentionK` lands at exactly 15 and is fine as-is.)
+- Wired as `case "MatMulNBits": RunMatMulNBits(...)`. The float result is a normal device `DeviceValue`, so the
+  downstream Add/residual/LayerNorm chain consumes it on-device with no round-trip.
+
+## `GroupQueryAttention` — attention on the device
+
+`RunGroupQueryAttention` does the whole op on the accelerator, composing three new kernels with device→device copies:
+
+1. **Packed-QKV split** (genai layout: K/V input names empty, `query` holds Q|K|V concat on the last dim) — split
+   per `(b, s)` row into device Q/K/V buffers `[B, S, heads·head_dim]` via `SubView.CopyTo` (no host round-trip).
+   The unpacked layout copies the separate K/V into fresh mutable buffers (rotary mutates Q/K in place).
+2. **In-op rotary** (`do_rotary=1`): `GpuKernels.RotaryK`, one thread per `(b, s, head, j)` rotary pair, applies
+   RoPE to Q and K (not V) using the `cos`/`sin` caches indexed by absolute position `pastSeq+s`. Both NeoX
+   half-split (`rotary_interleaved=0`) and GPT-J interleaved (`=1`) conventions, mirroring the CPU `ApplyRotary`.
+3. **present-K/V build**: past `[B, kvh, pastSeq, hd]` staged into present `[B, kvh, totalSeq, hd]` by per-head
+   `SubView.CopyTo`, then the new K/V scattered in at offset `pastSeq` by `GpuKernels.GqaScatterKvK`.
+4. **Attention core** (`GpuKernels.GqaAttentionK`, one thread per `(b, h, qi)` output row): repeat-KV grouping
+   (`g = h / groupSize`), **causal** bound `min(pastSeq+qi, seqlens_k[b])`, an online two-pass softmax
+   (max → Σexp → V-weighted sum) over the cached prefix — matching the CPU GQA accumulation order. The `output`
+   and (when named) `present_key`/`present_value` are device outputs.
+
+`scale` defaults to `1/√head_dim`; `seqlens_k`/`total_sequence_length` tolerated; `local_window_size` not
+implemented (treated as disabled), same as the CPU kernel. Wired as `case "GroupQueryAttention": RunGroupQueryAttention(...)`.
+
+## Do the Qwen/Mistral graphs now run these ops native?
+
+Yes for the two target ops: a genai INT4 graph's INT4 linears (`MatMulNBits`) and every attention block
+(`GroupQueryAttention`) now dispatch to the device kernels above — the float compute path is resident on the
+accelerator with **no per-op host round-trip** for them. The remaining genai glue (`RotaryEmbedding` outside GQA
+if any, `SkipSimplifiedLayerNormalization`, etc.) still uses native float kernels where they exist and the per-op
+CPU fallback otherwise (lightweight, not the GEMM/attention hot-spots). A full end-to-end Qwen/Mistral run is
+asset-gated (the 7B export is not committed); the op-level native path and CPU-parity are proven by the tests below.
+
+## Tests (`tests/ModelSharp.Tests/GpuQuantizedLlmOpsTests.cs`)
+
+Parity vs `ManagedCpuEngine` to a **relative** tolerance (`1e-3·max(1,|cpu|) + 1e-4` absolute floor — GPU float
+accumulation differs slightly from the CPU reference, so relative, not bit-exact). Each case is a CPU-accelerator
+`[Theory]` (runs on **every machine, no CUDA**) plus a CUDA re-run in the nested `Cuda` class
+(`[Collection("CudaGpu")]`, asserts `IsHardwareGpu`, skips cleanly on no-CUDA **and** on device `out of memory`).
+
+- `MatMulNBits_Native_Parity_CpuAccel` (10 cases): bits 4 & 8, block sizes 4/8/16/32, partial last block, all three
+  zero-point forms (default / float per-block / packed n-bit), various M×K×N incl. odd N.
+- `Gqa_Packed_Parity_CpuAccel` (5 cases): packed-QKV with/without rotary, repeat-KV group sizes (incl. MHA where
+  kv==q heads), batch>1 — asserts `output` + `present_key` + `present_value`.
+- `Gqa_DecodeWithPast_Parity_CpuAccel` (3 cases): unpacked single-token decode over a non-empty past with
+  `seqlens_k`, asserting the context and the appended present-K/V.
+
+Verified locally on the ILGPU **CPU accelerator** (standalone, outside the shared project build): native GPU vs
+`ManagedCpuEngine` `maxΔ = 0` across MatMulNBits (INT4 default-zp, INT8 packed-zp), GQA packed+rotary
+(`output`/`present_key`/`present_value`), and GQA decode-with-past — all well within tolerance.
+
+## Note for the central build
+
+- New **public** type `ModelSharp.Gpu.MatMulNBitsParams` (blittable struct, mirrors `ConvParams`) — additive,
+  no existing API changed.
+- Edits confined to the allowed file-set: `IlgpuEngine.cs`, `GpuKernels.cs`, `B5_NOTES.md`, and the **new**
+  `GpuQuantizedLlmOpsTests.cs`. No `.csproj`, core, CPU, or generation files touched.
+- Per the boundary, `dotnet build`/`dotnet test` were **not** run (shared bin/obj). Compilation was verified by a
+  standalone `csc` build of the three Gpu sources (exit 0) and of the new test file (exit 0); functional parity
+  was verified by a standalone run on the ILGPU CPU accelerator. The parent should run the full suite to
+  integrate.
