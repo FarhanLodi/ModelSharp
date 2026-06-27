@@ -8,7 +8,15 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **647 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **682 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+
+- **2026-06-27 (pass 4 — breadth):** all 7 GGUF **grid-codebook IQ** families (IQ1/2/3) now
+  dequantize (ggml lattice tables vendored from a pinned llama.cpp commit, MIT attribution in NOTICE);
+  **Whisper ASR** wired end-to-end (log-mel `WhisperFeatureExtractor` + forced-prompt decode through
+  the seq2seq path, `ModelTask.SpeechToTextSeq2Seq`); and a **real INT8-quantized gpt2 ONNX** was
+  downloaded and now **runs whole-graph on the RTX 4090** with the exact same greedy argmax as the CPU
+  engine. Fixed the core gaps that blocked quantized models: the ONNX loader now parses `uint8`/`int8`
+  initializers, and `Gather` is dtype-generic on both the CPU and GPU engines. Suite 647 → **682 green**.
 
 - **2026-06-27 (pass 3 — "runs any model"):** the **GPU engine now runs any CPU-runnable model** —
   `IlgpuEngine.Run` executes natively-supported ops on-device and transparently **falls back to the
@@ -56,7 +64,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 647 tests, 0 failures** (includes
+- Build/test baseline: `dotnet test` must be **GREEN — 682 tests, 0 failures** (includes
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,

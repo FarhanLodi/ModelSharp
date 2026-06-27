@@ -79,6 +79,48 @@ public static class ModelSharpPipeline
         return new Pipeline(decoderEngine, encoderEngine, manifest, generator, generation);
     }
 
+    /// <summary>
+    /// Loads a two-file Whisper speech-to-text model — an audio (log-mel) encoder ONNX plus an
+    /// autoregressive text decoder ONNX (decoder-with-past or merged) — and wires a
+    /// <see cref="Generation.Seq2SeqGenerator"/> + Whisper front end. The manifest's task must be
+    /// <see cref="ModelTask.SpeechToTextSeq2Seq"/>; tokenizer files, mel-bin count, language/task and
+    /// special-token ids come from <c>Manifest.Extra</c> (see <see cref="WhisperProcessor"/>).
+    /// </summary>
+    /// <param name="encoderPath">Path to the Whisper encoder ONNX file (takes <c>input_features</c>).</param>
+    /// <param name="decoderPath">Path to the Whisper decoder ONNX file (with-past or merged form preferred).</param>
+    /// <param name="manifest">The resolved manifest (task = SpeechToTextSeq2Seq, tokenizer + Whisper hints under Extra).</param>
+    public static Pipeline LoadWhisper(string encoderPath, string decoderPath, ModelManifest manifest)
+    {
+        if (encoderPath is null) throw new ArgumentNullException(nameof(encoderPath));
+        if (decoderPath is null) throw new ArgumentNullException(nameof(decoderPath));
+        if (manifest is null) throw new ArgumentNullException(nameof(manifest));
+        if (manifest.Task != ModelTask.SpeechToTextSeq2Seq)
+            throw new ModelSharpException(
+                $"LoadWhisper requires a manifest with Task = SpeechToTextSeq2Seq; got '{manifest.Task}'.");
+
+        ModelGraph encoderGraph = OnnxModelLoader.LoadModel(encoderPath);
+        ModelGraph decoderGraph = OnnxModelLoader.LoadModel(decoderPath);
+        var encoderEngine = new ManagedCpuEngine(encoderGraph);
+        var decoderEngine = new ManagedCpuEngine(decoderGraph);
+        return BuildWhisper(encoderEngine, decoderEngine, manifest);
+    }
+
+    /// <summary>Builds a Whisper speech-to-text pipeline from already-constructed encoder and decoder engines.</summary>
+    public static Pipeline BuildWhisper(IExecutionEngine encoderEngine, IExecutionEngine decoderEngine, ModelManifest manifest)
+    {
+        if (encoderEngine is null) throw new ArgumentNullException(nameof(encoderEngine));
+        if (decoderEngine is null) throw new ArgumentNullException(nameof(decoderEngine));
+        if (manifest is null) throw new ArgumentNullException(nameof(manifest));
+
+        List<string> inputNames = decoderEngine.Inputs.Select(i => i.Name).ToList();
+        List<string> outputNames = decoderEngine.Outputs.Select(o => o.Name).ToList();
+        var ctx = new ProcessorContext(manifest, inputNames, outputNames);
+
+        var whisper = new WhisperProcessor(ctx);
+        Seq2SeqGenerator generator = whisper.CreateGenerator(encoderEngine, decoderEngine);
+        return new Pipeline(decoderEngine, encoderEngine, manifest, generator, whisper);
+    }
+
     /// <summary>Builds a pipeline from an already-loaded graph and resolved manifest.</summary>
     public static Pipeline Build(ModelGraph graph, ModelManifest manifest)
     {
@@ -105,6 +147,11 @@ public static class ModelSharpPipeline
         // and decoder roles. The standard two-file export uses ModelSharpPipeline.LoadSeq2Seq instead.
         if (manifest.Task == ModelTask.Seq2SeqGeneration)
             return BuildSeq2Seq(engine, engine, manifest);
+
+        // Whisper (speech-to-text seq2seq) from a single combined graph; the standard two-file export uses
+        // ModelSharpPipeline.LoadWhisper. Transcribe is the entry point, not Run<T>.
+        if (manifest.Task == ModelTask.SpeechToTextSeq2Seq)
+            return BuildWhisper(engine, engine, manifest);
 
         IPreprocessor pre = ProcessorRegistry.CreatePreprocessor(ctx);
         IPostprocessor post = ProcessorRegistry.CreatePostprocessor(ctx);

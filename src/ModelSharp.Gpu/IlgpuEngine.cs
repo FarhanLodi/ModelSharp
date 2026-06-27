@@ -1070,6 +1070,9 @@ public sealed class IlgpuEngine : IExecutionEngine
             ElementType.Int64 => HostGatherFlat<long>(data.AsInt64(), outDims, srcOff, n),
             ElementType.Int32 => HostGatherFlat<int>(data.AsInt32(), outDims, srcOff, n),
             ElementType.Boolean => HostGatherFlat<bool>(data.AsBool(), outDims, srcOff, n),
+            ElementType.UInt8 => HostGatherFlat<byte>((Tensor<byte>)data, outDims, srcOff, n),
+            ElementType.Int8 => HostGatherFlat<sbyte>((Tensor<sbyte>)data, outDims, srcOff, n),
+            ElementType.Float64 => HostGatherFlat<double>((Tensor<double>)data, outDims, srcOff, n),
             _ => HostGatherFlat<float>(data.AsFloat(), outDims, srcOff, n),
         };
     }

@@ -174,17 +174,18 @@ public class GgufIqDequantTests
     }
 
     [Fact]
-    public void GridCodebookIqFamilies_StillThrow()
+    public void GridCodebookIqFamilies_NowSupported()
     {
-        // These need large published lattice/grid tables; ModelSharp does not approximate them.
+        // The grid-codebook families are now backed by the verbatim-vendored ggml grids
+        // (GgufIqGrids), so they dequantize rather than throw. A full super-block of zero bytes is a
+        // valid input (grid index 0, sign 0, scale 0) and must produce QK_K=256 finite floats.
         foreach (GgmlType t in new[]
         {
             GgmlType.IQ2_XXS, GgmlType.IQ2_XS, GgmlType.IQ2_S,
             GgmlType.IQ3_XXS, GgmlType.IQ3_S, GgmlType.IQ1_S, GgmlType.IQ1_M,
         })
         {
-            Assert.False(GgufDequant.IsSupported(t), $"{t} should remain unsupported");
-            int size = 256; // all of these are QK_K=256 super-block types
+            Assert.True(GgufDequant.IsSupported(t), $"{t} should now be supported");
             int typeSize = t switch
             {
                 GgmlType.IQ2_XXS => 66,
@@ -196,8 +197,9 @@ public class GgufIqDequantTests
                 GgmlType.IQ1_M => 56,
                 _ => 0,
             };
-            Assert.Throws<ModelSharpException>(
-                () => GgufDequant.Dequantize(new byte[typeSize], t, size));
+            float[] got = GgufDequant.Dequantize(new byte[typeSize], t, 256);
+            Assert.Equal(256, got.Length);
+            foreach (float f in got) Assert.True(float.IsFinite(f));
         }
     }
 }

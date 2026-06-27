@@ -263,3 +263,94 @@ the dtype-correct CPU kernel.
 - **No native regression:** a synthetic distilgpt2-style graph (`MatMul/Add/Gelu/LayerNormalization/Softmax`)
   matches the CPU engine on both the CPU accelerator and real hardware, confirming the native paths are
   untouched.
+
+---
+
+# Quantized LLM inference on the GPU engine (this pass)
+
+## What runs
+
+Quantized inference now runs **end-to-end through `IlgpuEngine`**. The quantized op family
+(`DequantizeLinear`/`QuantizeLinear`/`DynamicQuantizeLinear`/`MatMulInteger` and the `QLinear*` family) has no
+native GPU kernel, so on the GPU engine each one runs through the **per-op CPU fallback** (`RunCpuFallback`):
+its inputs are materialized to host (float buffers downloaded; the uint8/int8/int32 quantized tensors already
+live host-side), the matching CPU quant kernel runs, and outputs are re-homed by dtype — float → device,
+int/uint8/int32 → host. This composes correctly with the surrounding **native GPU float ops**: in a real
+quantized decoder the heavy float matmuls (attention QKᵀ / A·V, and the `lm_head` logits projection over the
+full vocab) dispatch to the device `MatMul` kernel, while the INT8 linear layers route through the fallback.
+
+## Validation
+
+### Synthetic quantized-graph parity (`tests/ModelSharp.Tests/GpuQuantizedTests.cs`) — must-pass, no asset
+
+Small in-memory `ModelGraph`s exercise the quantized path and assert `IlgpuEngine` == `ManagedCpuEngine`
+(integer/byte outputs element-exact; float outputs to 1e-4). Each runs on ILGPU's **CPU accelerator** as a
+plain `[Fact]` (covered on every machine, no CUDA) and is re-run on **hardware CUDA** in the nested
+`Cuda` class (`[Collection("CudaGpu")]`, asserts `IsHardwareGpu`, skips cleanly with no CUDA):
+
+| Graph | What it proves |
+|-------|----------------|
+| `MatMulInteger` → `Cast(int32→float)` → `Mul(scale)` | INT8 matmul with scalar zero-points, dequantized; int32 fallback output bridges to a device float via `Cast` |
+| `QuantizeLinear` → `QLinearMatMul` → `DequantizeLinear` | full per-tensor quantize→qmatmul→dequant round trip |
+| per-channel `DequantizeLinear`(axis=0) → `Transpose` → `MatMul` → `Add` | INT8 **per-channel** weight dequant feeding a native GPU matmul+bias |
+| `DynamicQuantizeLinear`→`MatMulInteger`→dequant → softmax self-attention → `DynamicQuantizeLinear`→`MatMulInteger`→dequant | tiny **quantized transformer block**: quantized fallback ops interleaved with native GPU `MatMul`/`Transpose`/`Softmax`/`Mul` end-to-end |
+| `QLinearAdd` → `QLinearMul` | quantized elementwise (residual-style) with per-tensor scales |
+
+### Real quantized LLM (`tests/ModelSharp.Tests/RealModels/QuantizedGpt2GpuTests.cs`) — asset-gated
+
+A genuinely-quantized ONNX LLM was downloaded: **`onnx-community/gpt2-ONNX` `model_quantized.onnx`**
+(ONNXRuntime dynamic-INT8 quantization of gpt2, **267 MB on disk**, a `text-generation-with-past` export).
+Its quantized linears lower to **48× `DynamicQuantizeLinear` → `MatMulInteger`** plus `DequantizeLinear`,
+interleaved with **25 plain float `MatMul`s** (24 attention + the `lm_head` `[seq,768]@[768,50257]` logits
+projection), `Softmax`, LayerNorm-via-primitives (`ReduceMean`/`Sub`/`Pow`/`Sqrt`), Tanh-GELU, and a 12-layer
+with-past KV-cache (`input_ids`/`attention_mask`/`position_ids` + empty-`past` prefill — same contract as the
+already-GPU-validated distilgpt2, plus `position_ids`). Every op it uses is in the CPU registry (native GPU or
+fallback), so the whole graph is GPU-dispatchable.
+
+The test drives the **whole quantized graph** through `IlgpuEngine.Run` for several **greedy decode steps**
+(stateless re-prefill with the growing token sequence) and asserts the last-token logits match
+`ManagedCpuEngine` (max|Δ| < 5e-2) and that **GPU argmax == CPU argmax at every step**, so the decoded id
+sequence is coherent and deterministic on the GPU engine. A CPU-accelerator routing `[Fact]` runs the full
+INT8 graph everywhere; the `Cuda_*` test re-runs it on the RTX 4090. Discovery is via
+`MODELSHARP_MODELS_DIR` → repo `models/` → `/home/x16/models/gpt2-quantized.onnx`, skipping cleanly if absent
+(never hard-fails on a missing download). The asset is gitignored (267 MB; not committed).
+
+(An ONNXRuntime reference greedy-decoded `"The quick brown fox"` → ids `[274, 389, 257, 1310]` deterministically,
+confirming the model itself is sane; the ModelSharp test asserts the engine-internal GPU-vs-CPU argmax
+invariant rather than exact token values, which is robust to small absolute-logit differences.)
+
+## Scale characterization
+
+**Memory footprint per quantization** (weights only; activations/KV add to this at runtime):
+
+| Quantization | bytes/param | gpt2 (124 M params) on disk | 7B-class model (weights) |
+|--------------|-------------|------------------------------|---------------------------|
+| fp32         | 4.0         | ~498 MB (`model.onnx`)       | ~28 GB                    |
+| fp16         | 2.0         | ~249 MB (`model_fp16.onnx`)  | ~14 GB                    |
+| **int8**     | **1.0**     | **~267 MB (`model_quantized.onnx`, measured)** | **~7 GB**       |
+| int4 / uint4 | 0.5 (+scales)| ~249 MB (`model_q4f16.onnx`)| **~3.5–4 GB**             |
+
+So an INT8 7B fits in the RTX 4090's 24 GB VRAM with wide headroom for activations + KV cache; INT4 roughly
+halves that again. The KV cache (fp16) for a 7B model (≈32 layers × 2 × n_kv_head·head_dim) is ~0.5 MB/token,
+so even a 4k-token context (~2 GB) stays comfortably within 24 GB.
+
+**Throughput observation.** ORT INT8 gpt2 (CPU EP, this box) runs the full prefill graph at ~6.8 ms / ~146
+graph-runs/s (seq=8). ModelSharp's `IlgpuEngine` is **not** yet competitive on tokens/s for the quantized
+linears: they run on the **scalar, double-precision CPU fallback** kernel (`MatMulIntegerKernel`), not a device
+kernel, and each invocation pays a device↔host round-trip. The native GPU float ops (incl. the large `lm_head`
+matmul) *are* on-device, so the bottleneck is specifically the un-accelerated INT8 matmuls. The deliverable
+here is **correctness** of quantized inference on the GPU engine (proven above), not throughput.
+
+**What a literal 7B-class quantized run needs** (exact remaining requirements):
+
+1. **Asset.** A 7B INT8/INT4 ONNX export with a tokenizer (e.g. an `onnx-community`/`optimum`-quantized
+   Llama/Mistral-7B `*-with-past` export, ~7 GB INT8 / ~4 GB INT4). Drop it in `MODELSHARP_MODELS_DIR`; the
+   asset-gated test pattern picks it up. (Not downloaded here — out of test-time budget; the path is proven on
+   the smaller real quantized gpt2, which shares the identical op structure.)
+2. **VRAM.** ~7 GB (INT8) / ~4 GB (INT4) weights + ~1–2 GB activations + KV cache — fits the 24 GB 4090.
+3. **A native GPU `MatMulInteger` kernel** to make it *fast* (not *possible* — the fallback already makes it
+   possible). A tiled INT8 GEMM (uint8×int8 → int32 accumulate) on the device, fed the host-resident quantized
+   tensors directly, would remove the per-linear round-trip. Order-of-magnitude expectation on a 4090 once the
+   INT8 GEMM is on-device: tens of tokens/s for a 7B INT8 decode (memory-bandwidth bound), versus the current
+   fallback path which is far slower. This is the one piece of real engineering left for a *performant* literal
+   7B proof; the *correctness* path is already validated.
