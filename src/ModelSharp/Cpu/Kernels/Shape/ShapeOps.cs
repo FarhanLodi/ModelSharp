@@ -68,6 +68,7 @@ public sealed class GatherKernel : IKernel
             ElementType.Boolean => Gather<bool>(data.AsBool(), indices, idims, axis),
             ElementType.UInt8 => Gather<byte>((Tensor<byte>)data, indices, idims, axis),
             ElementType.Int8 => Gather<sbyte>((Tensor<sbyte>)data, indices, idims, axis),
+            ElementType.Float16 => Gather<System.Half>((Tensor<System.Half>)data, indices, idims, axis),
             ElementType.Float64 => Gather<double>((Tensor<double>)data, indices, idims, axis),
             _ => Gather<float>(data.AsFloat(), indices, idims, axis),
         });

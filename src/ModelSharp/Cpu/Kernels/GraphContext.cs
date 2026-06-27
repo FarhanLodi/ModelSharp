@@ -99,10 +99,11 @@ public sealed class GraphContext
     internal IReadOnlyDictionary<string, SeqValue>? SeqValues => _seqValues;
 
     /// <summary>
-    /// Reads a tensor by name as float32, throwing if it hasn't been produced yet
-    /// or if its dtype is not Float32. Existing float kernels use this overload.
+    /// Reads a tensor by name as float32, throwing if it hasn't been produced yet. Float16 tensors
+    /// (compactly-stored fp16 weights) are transparently widened to float32 here, so every float
+    /// kernel works with fp16 models without per-kernel changes.
     /// </summary>
-    public Tensor<float> Get(string name) => GetTensor(name).AsFloat();
+    public Tensor<float> Get(string name) => GetTensor(name).ToFloat32();
 
     /// <summary>
     /// Reads a tensor by name preserving its dtype, throwing if it hasn't been

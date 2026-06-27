@@ -6,6 +6,7 @@ public enum ElementType
     Unknown = 0,
     Float32,
     Float64,
+    Float16,
     Int32,
     Int64,
     Int8,
