@@ -200,8 +200,11 @@ public static class OnnxModelLoader
         return (name, value);
     }
 
-    // ONNX TensorProto.DataType values we materialize.
-    private const long DtFloat = 1, DtUint8 = 2, DtInt8 = 3, DtInt32 = 6, DtInt64 = 7, DtBool = 9;
+    // ONNX TensorProto.DataType values we materialize. FLOAT16 (10) and BFLOAT16 (16)
+    // half-precision initializers are upconverted to float32 on load (the engine computes
+    // in float32), so they materialize as Tensor&lt;float&gt;.
+    private const long DtFloat = 1, DtUint8 = 2, DtInt8 = 3, DtInt32 = 6, DtInt64 = 7, DtBool = 9,
+        DtFloat16 = 10, DtBFloat16 = 16;
 
     private static (string Name, Tensor Tensor) ParseTensor(ReadOnlySpan<byte> bytes)
     {
@@ -307,6 +310,41 @@ public static class OnnxModelLoader
                 else if (int32Data is not null)
                     for (int k = 0; k < count && k < int32Data.Count; k++) data[k] = (sbyte)int32Data[k];
                 return (name, new Tensor<sbyte>(shape, data));
+            }
+            case DtFloat16:
+            {
+                // IEEE half-precision initializers are decoded to float32. In raw_data each
+                // element is a little-endian 16-bit value; otherwise ONNX packs them into
+                // int32_data (one value per int32, low 16 bits).
+                var data = new float[count];
+                if (hasRaw && count > 0)
+                {
+                    ReadOnlySpan<ushort> bits = MemoryMarshal.Cast<byte, ushort>(rawData);
+                    for (int k = 0; k < count && k < bits.Length; k++)
+                        data[k] = (float)BitConverter.UInt16BitsToHalf(bits[k]);
+                }
+                else if (int32Data is not null)
+                    for (int k = 0; k < count && k < int32Data.Count; k++)
+                        data[k] = (float)BitConverter.UInt16BitsToHalf((ushort)int32Data[k]);
+                return (name, new Tensor<float>(shape, data));
+            }
+            case DtBFloat16:
+            {
+                // bfloat16 initializers are decoded to float32. A bfloat16 value is simply the
+                // top 16 bits of a float32, so widening is (bits << 16) reinterpreted as float.
+                // raw_data holds little-endian 16-bit values; otherwise ONNX packs them into
+                // int32_data (one value per int32, low 16 bits).
+                var data = new float[count];
+                if (hasRaw && count > 0)
+                {
+                    ReadOnlySpan<ushort> bits = MemoryMarshal.Cast<byte, ushort>(rawData);
+                    for (int k = 0; k < count && k < bits.Length; k++)
+                        data[k] = BitConverter.Int32BitsToSingle(bits[k] << 16);
+                }
+                else if (int32Data is not null)
+                    for (int k = 0; k < count && k < int32Data.Count; k++)
+                        data[k] = BitConverter.Int32BitsToSingle((ushort)int32Data[k] << 16);
+                return (name, new Tensor<float>(shape, data));
             }
             default:
                 throw new ModelSharpException(
