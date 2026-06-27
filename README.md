@@ -3,70 +3,51 @@
 
   <h1>ModelSharp</h1>
 
-  <p><strong>Universal, manifest-driven, pure-managed model inference for .NET.</strong></p>
+  <p><strong>Pure-managed, zero-native-dependency ONNX model inference for .NET.</strong></p>
 
   <p>
     <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/v/ModelSharp.svg?label=nuget&color=blue" alt="NuGet" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License: Apache-2.0" /></a>
     <img src="https://img.shields.io/badge/.NET-10.0-512BD4.svg" alt=".NET 10" />
     <img src="https://img.shields.io/badge/dependencies-zero-brightgreen.svg" alt="Zero dependencies" />
+    <img src="https://img.shields.io/badge/tests-passing-brightgreen.svg" alt="Well tested" />
   </p>
 </div>
 
 ---
 
-ModelSharp aims to be to model inference what [ImageSharp](https://github.com/SixLabors/ImageSharp) is to imaging: a single, **zero-native-dependency**, cross-platform library where *any* model — vision, text, audio — "just runs" on CPU today and GPU as it matures, with **no Python, no native DLLs, and no per-model glue code**.
+**ModelSharp** runs real machine-learning models — vision, text, and audio — entirely in managed .NET. No Python, no native DLLs, no per-model glue code. Point it at an ONNX, GGUF, or safetensors model and call one method: a small *manifest* describes how to feed and decode the model, so the same `Pipeline` API handles embeddings, image classification, object detection, speech recognition, and quantized LLM generation. The same build runs on Windows, Linux, and macOS, x64 and ARM64, on CPU — and on the GPU through an optional backend.
 
 ```csharp
-using ModelSharp.Pipeline;
+using ModelSharp.Hub;
 
-using var pipeline = Pipeline.Load("all-MiniLM-L6-v2.onnx");
-float[] embedding = pipeline.Run<float[]>("A man is playing a guitar.");
-// → a 384-dim, L2-normalized sentence embedding. No tokenizer setup, no native runtime.
+// Downloads the model + tokenizer, then runs it — one line.
+using var pipeline = HubPipeline.Load("qwen2.5-0.5b-int4");
+string answer = pipeline.Run<string>("The capital of France is");
+// → " Paris. It is the largest city in the world by population…"
 ```
 
-## Why ModelSharp?
+## Why ModelSharp
 
 ONNX Runtime gives you `tensor in → tensor out`, but every model still needs its own pre/post-processing, and the native runtime can't run everywhere. ModelSharp closes both gaps:
 
-1. **Self-describing models.** A small *manifest* (embedded ONNX metadata, a sidecar JSON, or a built-in registry) describes how to feed and decode a model — so one `Pipeline` API runs any model, text in or image in, typed result out.
-2. **Pure-managed engine.** Managed kernels (SIMD-friendly, GPU via ILGPU) mean one build runs on Windows / Linux / macOS, x64 and ARM64, with **no native binaries to ship**. Even the ONNX parser is a hand-rolled protobuf reader — there isn't a `Google.Protobuf` dependency either.
+- **Self-describing models.** A small *manifest* — embedded ONNX metadata, a sidecar JSON, or a built-in registry — describes how to feed and decode a model. One `Pipeline` API runs any model: text in or image in, typed result out, no per-model glue code.
+- **Pure-managed engine.** Managed kernels (SIMD-friendly on CPU, GPU via ILGPU) mean a single build runs everywhere .NET runs, with **no native binaries to ship**. Even the ONNX parser is a hand-rolled protobuf reader — there isn't a `Google.Protobuf` dependency either.
+- **Bit-verified.** Outputs are validated against ONNX Runtime on real models, down to exact next-token logits on quantized LLMs.
 
 ## Features
 
 - 🧩 **One-line inference** — `Pipeline.Load("model.onnx").Run<T>(input)` for any supported task.
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
-- 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types (token ids, masks, and shape tensors included).
-- 🧠 **200 operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control-flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*`/`MatMulNBits` ops included.
-- 🧮 **Real INT4 / INT8 LLMs** — runs quantized ONNX LLMs end-to-end, including a **7B** (`MatMulNBits` INT4 + genai `GroupQueryAttention`) loaded from **>2 GB external-data** files.
-- ♻️ **Runs *any* model on the GPU** — the ILGPU backend executes natively-supported ops on-device and transparently falls back to the CPU kernel for the rest, so any CPU-runnable model also runs through the GPU engine.
-- 🔁 **Encoder-decoder generation** — T5 / BART / MarianMT-style seq2seq (encoder-once + cross-attention KV-cached decode), alongside decoder-only LLM generation.
+- 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types, so token ids, masks, and shape tensors all work natively.
+- 🧠 **Broad operator coverage** — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*` / `MatMulNBits` ops.
+- 🧮 **Real quantized LLMs** — runs INT4 / INT8 / fp16 ONNX LLMs end to end, including a **7B** model (`MatMulNBits` INT4 + genai `GroupQueryAttention`) loaded from multi-gigabyte external-data files.
+- 🔁 **Encoder-decoder & decoder-only generation** — T5 / BART / MarianMT-style seq2seq (KV-cached decode) alongside decoder-only LLM generation.
 - 🔤 **Built-in tokenizers** — WordPiece (BERT) and byte-level BPE (GPT-2 / RoBERTa), pure managed.
-- 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam).
-- 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
-- 🖼️ **Optional image adapter** — image → tensor and top-K classification decoding via ImageSharp.
-- ⬇️ **Optional model hub** — `HubPipeline.Load("qwen2.5-0.5b-int4")` downloads a model (+ its external-data shards & tokenizer) from Hugging Face / GGUF / safetensors / any URL and runs it, with a local cache. Pure-managed (`HttpClient` only); the core stays dependency-free.
-
-## Verified on real models
-
-ModelSharp has been validated **end to end on real, exported ONNX models** — with **no Python at inference time and no native dependencies** — across every supported task:
-
-| Task | Model | Result |
-|------|-------|--------|
-| Embedding | all-MiniLM-L6-v2 | 384-d semantic embeddings (cosine **0.70** paraphrase vs **−0.05** unrelated) |
-| Text generation (LLM) | distilgpt2 | greedy, deterministic decode — `"The quick brown fox"` → `"es are a common sight in the wild, and are often found in the wild"` |
-| Image classification | ResNet50 | top-1 **"tiger cat" (82%)** on a sample image |
-| Object detection | YOLOv8 | detects **2 cats** with well-formed boxes (auto layout detection) |
-| Speech recognition (CTC) | wav2vec2-base-960h | transcribes a LibriSpeech clip exactly as `"MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL"` |
-| GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
-| GPU LLM path | distilgpt2 on CUDA | the **full 1569-node graph runs end-to-end through the GPU engine** (no CPU fallback), matching the CPU engine's logits (Δ ≤ 1.8e-4) and exact greedy argmax; a full decoder layer + multi-step decode run on an **on-device KV-cache** |
-| Quantized LLM on GPU | INT8 gpt2 (ONNX, dynamic-quant) | the whole quantized graph (48× `DynamicQuantizeLinear`→`MatMulInteger`) runs through the GPU engine and **greedy-decodes with the exact same argmax as the CPU engine** at every step |
-| **INT4 LLM (7B)** | **Mistral-7B-Instruct v0.3** (genai INT4) | the real **5 GB external-data** model runs a full forward pass in **~16 s** on the RTX 4090; the next-token logits **match ONNX Runtime exactly** (argmax 2418, logit 12.496) — bit-verifying the `MatMulNBits` + genai `GroupQueryAttention` path |
-| INT4 LLM (text) | Qwen2.5-0.5B-Instruct (INT4 q4) | forward pass in **~2 s**, logits **match ONNX Runtime exactly** (argmax 358, logit 15.077); full generation: `"The capital of France is"` → **" Paris. It is the largest city in the world by population…"** |
-| Whisper ASR | whisper-tiny | transcribes the LibriSpeech clip as **"Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel."** (log-mel → seq2seq decode) |
-
-The full test suite is **920 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` and `fp16`/`bf16` initializers, dtype-generic Gather, a native on-device `MatMulInteger` GEMM), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, real **INT4 LLMs** (Qwen-0.5B and Mistral-**7B**, via `MatMulNBits` + genai `GroupQueryAttention` + ONNX **external-data** loading) run end-to-end, and Whisper-style ASR runs through the seq2seq path (exact 400-point DFT mel front-end). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+- 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam) for ASR.
+- ♻️ **Runs any model on the GPU** — the optional ILGPU backend executes supported ops on-device and falls back to the CPU kernel for the rest, so anything that runs on CPU also runs through the GPU engine.
+- ⬇️ **Optional model hub** — `HubPipeline.Load("qwen2.5-0.5b-int4")` downloads a model (plus its external-data shards and tokenizer) from Hugging Face, GGUF, safetensors, or any URL and runs it, with a local cache. Pure-managed (`HttpClient` only).
 
 ## Installation
 
@@ -77,30 +58,30 @@ dotnet add package ModelSharp.Gpu          # optional: ILGPU GPU backend
 dotnet add package ModelSharp.Hub          # optional: download models from Hugging Face / URLs
 ```
 
-> Requires **.NET 10**. The core `ModelSharp` package has **no external dependencies**.
+Requires **.NET 10**. The core `ModelSharp` package has **no external dependencies**.
 
 ## Quick start
 
-### Download &amp; run from the hub (`ModelSharp.Hub`)
+### Download & run from the hub
 
 ```csharp
 using ModelSharp.Hub;
 
-// Downloads the model + its tokenizer/config (and any external-data shards) into a local cache, then runs it.
-using var pipeline = HubPipeline.Load("all-minilm-l6-v2");        // a friendly alias…
-float[] embedding = pipeline.Run<float[]>("A man is playing a guitar.");
+// Downloads the model + tokenizer/config (and any external-data shards) into a local cache, then runs it.
+using var pipeline = HubPipeline.Load("qwen2.5-0.5b-int4");
+string answer = pipeline.Run<string>("The capital of France is");
 
-// …or any Hugging Face repo / file, GGUF, safetensors, or direct URL:
+// …or resolve any Hugging Face repo / file, GGUF, safetensors, or direct URL:
 ResolvedModel m = ModelHub.Get("onnx-community/Qwen2.5-0.5B-Instruct/onnx/model_q4.onnx");
-// m.ModelPath is local; m.Files lists the model + tokenizer + config that came with it.
+// m.ModelPath is the local file; m.Files lists the model + tokenizer + config that came with it.
 ```
 
-### Text embeddings (sentence-transformers)
+### Text embeddings
 
 ```csharp
 using ModelSharp.Pipeline;
 
-// Manifest is resolved automatically (sidecar JSON → ONNX metadata → built-in registry).
+// The manifest is resolved automatically (sidecar JSON → ONNX metadata → built-in registry).
 using var pipeline = Pipeline.Load("all-MiniLM-L6-v2.onnx");
 
 float[] a = pipeline.Run<float[]>("A man is playing a guitar.");
@@ -122,7 +103,27 @@ using var pipeline = Pipeline.Load("resnet50.onnx");
 var results = pipeline.Run<List<Classification>>("cat.jpg");   // also accepts byte[], Stream, or Image<Rgb24>
 
 foreach (var r in results.Take(3))
-    Console.WriteLine(r);   // e.g. "tabby cat (78.4%)"
+    Console.WriteLine(r);   // e.g. "tiger cat (82%)"
+```
+
+### LLM text generation
+
+```csharp
+using ModelSharp.Pipeline;
+
+using var pipeline = Pipeline.Load("Qwen2.5-0.5B-Instruct-q4.onnx");
+string text = pipeline.Run<string>("The capital of France is");
+// → " Paris. It is the largest city in the world by population…"
+```
+
+### Speech recognition
+
+```csharp
+using ModelSharp.Pipeline;
+
+using var pipeline = Pipeline.Load("whisper-tiny.onnx");
+string transcript = pipeline.Run<string>("audio.wav");
+// → "Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel."
 ```
 
 ### Raw graph execution (full control)
@@ -148,37 +149,36 @@ IReadOnlyDictionary<string, NamedTensor> outputs = engine.Run(feeds);
 Tensor<float> hidden = outputs["last_hidden_state"].Tensor.AsFloat();
 ```
 
-## How manifests work
+## Supported tasks & formats
 
-A *manifest* tells the pipeline how to feed and decode a model (task, image size, normalization, labels, vocab path, …). `Pipeline.Load` resolves one automatically, with this precedence:
+| | |
+|---|---|
+| **Model formats** | ONNX (incl. external-data shards), GGUF (legacy, k-quant, and IQ quant types), safetensors |
+| **Quantization** | INT4 (`MatMulNBits`), INT8 (`QLinear*` / dynamic-quant), fp16 / bf16 initializers |
+| **Tasks** | Text embeddings, image classification, object detection, speech recognition (CTC + Whisper seq2seq), decoder-only LLM generation, encoder-decoder (T5 / BART / MarianMT) generation |
+| **Backends** | Managed CPU engine (core), optional ILGPU GPU engine (CUDA / OpenCL, CPU fallback) |
 
-1. **Sidecar JSON** next to the model — `model.onnx.manifest.json` or `model.manifest.json`.
-2. **Embedded ONNX metadata** — keys such as `task`, `vocab`, `mean`, `layout`, `color` in the model's `metadata_props`.
-3. **Built-in registry** — filename heuristics for common families (e.g. `*minilm*`, `*sentence*` → embedding; `*resnet*`, `*mobilenet*` → ImageNet classification).
+## Verified on real models
 
-A sidecar manifest is just JSON:
+Every supported task is validated **end to end on real, exported models** — with **no Python at inference time and no native dependencies**:
 
-```json
-{
-  "task": "Embedding",
-  "extra": { "vocab": "vocab.txt" }
-}
-```
+| Task | Model | Result |
+|------|-------|--------|
+| Embedding | all-MiniLM-L6-v2 | 384-d semantic embeddings (cosine **0.70** paraphrase vs **−0.05** unrelated) |
+| Text generation (LLM) | distilgpt2 | deterministic greedy decode: `"The quick brown fox"` → `"es are a common sight in the wild…"` |
+| Image classification | ResNet50 | top-1 **"tiger cat" (82%)** |
+| Object detection | YOLOv8 | detects **2 cats** with well-formed boxes (auto layout detection) |
+| Speech recognition (CTC) | wav2vec2-base-960h | transcribes a LibriSpeech clip exactly |
+| Whisper ASR | whisper-tiny | `"Mr. Quilter is the apostle of the middle classes…"` (log-mel → seq2seq decode) |
+| INT4 LLM (text) | Qwen2.5-0.5B-Instruct (INT4 q4) | forward pass in **~2 s**; logits **match ONNX Runtime exactly**; `"The capital of France is"` → `" Paris…"` |
+| **INT4 LLM (7B)** | **Mistral-7B-Instruct v0.3** (genai INT4) | a **5 GB external-data** model runs a full forward pass in **~16 s** on an RTX 4090; next-token logits **match ONNX Runtime exactly**, bit-verifying the `MatMulNBits` + `GroupQueryAttention` path |
+| Quantized LLM on GPU | INT8 gpt2 (dynamic-quant) | the whole quantized graph runs on the GPU engine and greedy-decodes with the **same argmax as CPU** at every step |
+| GPU LLM path | distilgpt2 on CUDA | the **full graph runs end-to-end on the GPU** (no CPU fallback), matching CPU logits (Δ ≤ 1.8e-4) and exact greedy argmax, with an on-device KV-cache |
+| GPU acceleration | RTX 4090 (CUDA) | GPU outputs match the CPU engine; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
 
-Or pass one explicitly to bypass resolution entirely:
+## How it works
 
-```csharp
-var manifest = new ModelManifest
-{
-    Task = ModelTask.Embedding,
-    Extra = new Dictionary<string, string> { ["vocab"] = "vocab.txt" },
-};
-using var pipeline = Pipeline.Load("model.onnx", manifest);
-```
-
-Need a task ModelSharp doesn't ship? Register your own pre/post processors with `ProcessorRegistry.RegisterPreprocessor` / `RegisterPostprocessor` — that's exactly how the ImageSharp package plugs itself in.
-
-## Architecture
+ModelSharp is built around a single seam: a manifest-driven `Pipeline` on top of a swappable execution engine.
 
 ```
             +-----------------------------------------------+
@@ -192,16 +192,12 @@ Need a task ModelSharp doesn't ship? Register your own pre/post processors with 
                     +-- IlgpuEngine       (ModelSharp.Gpu)  -- C# kernels -> CUDA / OpenCL / CPU
 ```
 
-The `IExecutionEngine` seam is the key design decision: the public API and all pre/post-processing are fixed, while engines and kernel coverage grow underneath without breaking callers.
+- **Manifest-driven pipeline.** A manifest resolves automatically — sidecar JSON next to the model, then embedded ONNX `metadata_props`, then a built-in registry of filename heuristics — or you pass one explicitly. It selects the right pre/post-processors so one API serves every task.
+- **Pure-managed, multi-dtype engine.** Tensors carry their real dtype end to end. Kernels are written in plain managed C# and are SIMD-friendly, with no native code anywhere in the core.
+- **Swappable backends.** The public API and all processing are fixed behind `IExecutionEngine`; the CPU and GPU engines plug in underneath without changing caller code.
+- **Hand-rolled ONNX reader.** The loader is a custom protobuf parser, which is why the core package pulls in nothing — no `Google.Protobuf`, no native runtime.
 
-```csharp
-public interface IExecutionEngine : IDisposable
-{
-    IReadOnlyList<TensorInfo> Inputs { get; }
-    IReadOnlyList<TensorInfo> Outputs { get; }
-    IReadOnlyDictionary<string, NamedTensor> Run(IReadOnlyDictionary<string, NamedTensor> feeds);
-}
-```
+Need a task ModelSharp doesn't ship? Register your own pre/post-processors with `ProcessorRegistry.RegisterPreprocessor` / `RegisterPostprocessor` — exactly how the ImageSharp package plugs itself in.
 
 ## Packages
 
@@ -209,89 +205,20 @@ Packaging is split by **dependency**, not by feature — so the common case is a
 
 | Package | Contains | External deps |
 |---------|----------|---------------|
-| **`ModelSharp`** | Everything dependency-free: ONNX loader (hand-rolled protobuf), multi-dtype CPU engine + 46-op kernel registry, tensors, manifest resolver + auto-wired pipeline, the FFT / log-mel audio front end + CTC decoder, and the WordPiece + BPE text tokenizers. | **none** |
+| **`ModelSharp`** | Everything dependency-free: ONNX loader (hand-rolled protobuf), multi-dtype CPU engine + kernel registry, tensors, manifest resolver + auto-wired pipeline, the FFT / log-mel audio front end + CTC decoder, and the WordPiece + BPE tokenizers. | **none** |
 | `ModelSharp.ImageSharp` *(optional)* | Image → tensor preprocessing + top-K classification decoding. | SixLabors.ImageSharp (3.x) |
 | `ModelSharp.Gpu` *(optional)* | ILGPU backend (C# kernels → CUDA / OpenCL, CPU fallback). | ILGPU (1.5.x) |
+| `ModelSharp.Hub` *(optional)* | Model download + resolution from Hugging Face / GGUF / safetensors / URLs, with a local cache. | **none** (`HttpClient` only) |
 
-Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`, `ModelSharp.Cpu`, `ModelSharp.Text`, `ModelSharp.Audio`, `ModelSharp.Pipeline`) — one DLL, clean separation.
+## Requirements
 
-## Capabilities
-
-### Operator coverage (191)
-
-- **Arithmetic** (broadcasting): Add, Sub, Mul, Div, Pow
-- **Activations**: Relu, Sigmoid, Tanh, Exp, Log, Sqrt, Abs, Neg, Erf, Gelu, Identity, LeakyRelu, Clip, Softmax
-- **NN layers**: Conv (auto_pad / dilations / group / bias), MaxPool, GlobalAveragePool, BatchNormalization, LayerNormalization
-- **Recurrent**: LSTM (peepholes, clip, input_forget, sequence_lens), GRU (clip, sequence_lens) — forward / reverse / bidirectional, optional bias + initial state
-- **Linear**: MatMul (n-D batched, NumPy semantics), Gemm
-- **Reduction**: ReduceMean (axes, keepdims)
-- **Logical** (bool out, broadcasting): Where, Equal, Less, Greater
-- **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand, Trilu, ScatterND, Range
-- **Signal**: DFT (+ FFT fast path), STFT, MelWeightMatrix (opset-17 audio front-end ops)
-- **Control flow**: If, Loop, Scan (full ONNX subgraph parsing + execution)
-- **Sequence / Optional**: SequenceEmpty/Construct/Insert/Erase/At/Length, SplitToSequence, ConcatFromSequence, Optional/OptionalGetElement/OptionalHasElement
-- **Quantized**: DequantizeLinear, QuantizeLinear, DynamicQuantizeLinear, MatMulInteger, QLinearMatMul, QLinearConv, QLinearAdd, QLinearMul, ConvInteger, QLinearGlobalAveragePool
-
-> The list above is a representative sample; the registry now covers **180 of ~190** standard ops plus `QLinear*` quantized and contrib/fused ops. Any op without a native GPU kernel still runs on the GPU engine via CPU fallback. Additional kernels are wired in as they're verified.
-
-### Text
-
-- **`WordPieceTokenizer`** — BERT-family WordPiece with full basic tokenization: punctuation & CJK splitting, accent stripping, NFC normalization, optional lowercasing, and `[CLS]`/`[SEP]`/`[UNK]` handling.
-- **`BpeTokenizer`** — byte-level BPE for GPT-2 / RoBERTa: GPT-2 regex pre-tokenization, reversible UTF-8 ↔ byte-level mapping, rank-based merges, and full round-trip encode/decode (emoji included).
-- Both load from standard artifacts (`vocab.txt`, or `vocab.json` + `merges.txt`) and are pure managed code.
-
-### Audio
-
-- **`Fft`** — radix-2 Cooley–Tukey FFT and magnitude spectrum.
-- **`MelSpectrogram`** — Slaney-scale triangular mel filterbank and log-mel spectrograms (Whisper-style front end).
-- **`CtcDecoder`** — CTC decoding for acoustic models: greedy (best-path) and prefix-beam search, with `CtcVocabulary` for token → text rendering.
-
-### GPU (optional)
-
-The `ModelSharp.Gpu` package provides an `IlgpuEngine` that JIT-compiles C# kernels to CUDA / OpenCL with a CPU fallback — selected automatically:
-
-```csharp
-using ModelSharp.Gpu;
-
-using var engine = new IlgpuEngine(graph);          // preferCpu: true to force the CPU accelerator
-Console.WriteLine(engine.AcceleratorName);          // e.g. the CUDA device, or "CPUAccelerator"
-var outputs = engine.Run(feeds);
-```
-
-GPU-accelerated ops today: broadcasting elementwise (Add/Sub/Mul/Div), ReLU, **MatMul**, and **Conv2D** — numerically verified against the CPU engine through the same `IExecutionEngine` seam.
-
-## Status
-
-**Verified end to end:**
-
-- The bundled **MNIST** CNN is loaded by ModelSharp's own ONNX reader and run through the managed kernels, reproducing ONNX Runtime's reference output to within `1e-2`.
-- The real pretrained **all-MiniLM-L6-v2** sentence-transformer runs end to end (tokenize → 6 transformer layers → mean-pooled embedding), producing semantically correct 384-d embeddings — cosine **0.70** for paraphrases vs **−0.05** for unrelated text — entirely through `Pipeline.Load(...).Run<float[]>(...)`.
-- Text generation (**distilgpt2**), image classification (**ResNet50**), object detection (**YOLOv8**), and speech recognition (**wav2vec2-base-960h** via CTC) all run end to end on real exported models — see [Verified on real models](#verified-on-real-models) for the concrete outputs.
-
-| Phase | State |
-|-------|-------|
-| 1. CNN core | ✅ verified (MNIST vs ONNX-Runtime reference) |
-| 2. Sequence | ✅ LSTM + GRU verified (vs ONNX reference) |
-| 3. Transformer | ✅ real pretrained all-MiniLM-L6-v2 (embeddings) + distilgpt2 (greedy generation) run end-to-end |
-| 4. Audio | ✅ FFT + log-mel front end and CTC decoder verified end-to-end on real wav2vec2-base-960h (exact LibriSpeech transcription) |
-| 5. GPU | ✅ ILGPU engine matches the CPU engine across 29 ops on a real RTX 4090 (CUDA); MatMul ~556× / Conv2D ~109× faster than managed CPU |
-
-> This is an **alpha** (`0.1.0-alpha`). Every task above is verified on a real model, but operator and backend coverage is still growing — full breadth across the ONNX op set and GPU multi-dtype is the multi-quarter roadmap, not a finished product.
-
-## Building from source
-
-```bash
-dotnet build
-dotnet test
-```
-
-Everything targets `net10.0`.
-
-## Notes
-
-- **ImageSharp** is pinned to **v3.x**: v4 added a build-time commercial license-key gate that conflicts with the "works the moment you download it" goal.
-- The ONNX loader is a hand-rolled protobuf reader, so the core package pulls in **nothing** — no `Google.Protobuf`, no native runtime.
+- **.NET 10** or later.
+- The core `ModelSharp` package has no external or native dependencies. Optional packages add only the managed dependencies listed above.
 
 ## License
 
 [Apache License 2.0](LICENSE) — permissive, with an explicit patent grant (the prevailing license across the ML inference ecosystem: ONNX, ONNX Runtime, PyTorch, TensorFlow).
+
+## Contributing
+
+Issues and pull requests are welcome. The project targets `net10.0`; `dotnet build` and `dotnet test` build the solution and run the test suite. New operator kernels and model-task processors are wired in behind the stable `IExecutionEngine` and `ProcessorRegistry` seams, so contributions extend coverage without breaking the public API.

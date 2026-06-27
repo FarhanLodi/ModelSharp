@@ -81,6 +81,29 @@ public class GpuLlmTests
     private static GraphNode N(string op, string name, string[] inputs, string[] outputs,
         Dictionary<string, object>? attrs = null) => new GraphNode(op, name, inputs, outputs, attrs);
 
+    /// <summary>
+    /// Local-only discovery of <c>distilgpt2.onnx</c>: <c>MODELSHARP_MODELS_DIR</c> → a repo-relative
+    /// <c>models/</c> dir found by walking up from the test output directory. No download (no confident
+    /// distilgpt2 ONNX Hub repo); skips cleanly when absent.
+    /// </summary>
+    private static bool TryFindDistilGpt2(out string path)
+    {
+        string? env = Environment.GetEnvironmentVariable("MODELSHARP_MODELS_DIR");
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(env))
+            candidates.Add(System.IO.Path.Combine(env, "distilgpt2.onnx"));
+        var dir = new System.IO.DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            candidates.Add(System.IO.Path.Combine(dir.FullName, "models", "distilgpt2.onnx"));
+            dir = dir.Parent;
+        }
+        foreach (string c in candidates)
+            if (System.IO.File.Exists(c)) { path = c; return true; }
+        path = candidates.Count > 0 ? candidates[0] : "distilgpt2.onnx";
+        return false;
+    }
+
     // ---- Pow / Erf ----
 
     [Fact]
@@ -457,10 +480,10 @@ public class GpuLlmTests
     [Fact]
     public void DistilGpt2_Gpu_Coverage_Is_Complete()
     {
-        const string modelPath = "/home/x16/models/distilgpt2.onnx";
-        if (!System.IO.File.Exists(modelPath))
+        if (!TryFindDistilGpt2(out string modelPath))
         {
-            _out.WriteLine($"DistilGpt2Coverage: model not found at {modelPath}; skipping.");
+            _out.WriteLine("DistilGpt2Coverage: distilgpt2.onnx not found " +
+                           "(looked under MODELSHARP_MODELS_DIR / repo models/); skipping.");
             return;
         }
 

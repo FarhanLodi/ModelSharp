@@ -34,10 +34,12 @@ namespace ModelSharp.Tests.RealModels;
 /// decodes coherently and deterministically on the GPU engine (now exercising the native INT8 GEMM), GPU argmax
 /// == CPU argmax at every step.</para>
 ///
-/// <para>Discovers the asset via <c>MODELSHARP_MODELS_DIR</c> → repo-relative <c>models/</c> →
-/// <c>/home/x16/models</c> and SKIPS cleanly (green, no assertions) when the file is absent — never hard-fails on
-/// a missing download. The CUDA run additionally skips when no CUDA device is present; a CPU-accelerator routing
-/// variant runs the full quantized graph everywhere (no GPU required).</para>
+/// <para>Discovers the asset via <c>MODELSHARP_MODELS_DIR</c> → repo-relative <c>models/</c>, and (opt-in via
+/// <c>MODELSHARP_DOWNLOAD_MODELS=1</c>) self-downloads <c>onnx-community/gpt2-ONNX</c> <c>model_quantized.onnx</c>
+/// through <c>ModelSharp.Hub</c>. SKIPS cleanly (green, no assertions) when the file is absent and downloads are
+/// disabled, or on any network error — never hard-fails on a missing download. The CUDA run additionally skips when
+/// no CUDA device is present; a CPU-accelerator routing variant runs the full quantized graph everywhere (no GPU
+/// required).</para>
 /// </summary>
 public class QuantizedGpt2GpuTests
 {
@@ -52,6 +54,12 @@ public class QuantizedGpt2GpuTests
 
     private const string ModelFile = "gpt2-quantized.onnx";
 
+    /// <summary>
+    /// Hub spec for the genuinely-INT8 gpt2 export. Resolved locally first (MODELSHARP_MODELS_DIR / repo
+    /// <c>models/</c>); auto-downloaded only when <c>MODELSHARP_DOWNLOAD_MODELS=1</c>.
+    /// </summary>
+    private const string HubSpec = "onnx-community/gpt2-ONNX/onnx/model_quantized.onnx";
+
     private static bool HardwareGpuAvailable()
     {
         try
@@ -62,25 +70,8 @@ public class QuantizedGpt2GpuTests
         catch { return false; }
     }
 
-    private static bool TryFindModel(out string path)
-    {
-        string? env = Environment.GetEnvironmentVariable("MODELSHARP_MODELS_DIR");
-        var candidates = new List<string>();
-        if (!string.IsNullOrWhiteSpace(env))
-            candidates.Add(Path.Combine(env, ModelFile));
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null)
-        {
-            candidates.Add(Path.Combine(dir.FullName, "models", ModelFile));
-            dir = dir.Parent;
-        }
-        candidates.Add(Path.Combine("/home/x16/models", ModelFile));
-
-        foreach (string c in candidates)
-            if (File.Exists(c)) { path = c; return true; }
-        path = candidates.Count > 0 ? candidates[0] : ModelFile;
-        return false;
-    }
+    private bool TryFindModel(out string path)
+        => RealModelAssets.TryResolveOrDownload(ModelFile, HubSpec, out path, log: _out.WriteLine);
 
     /// <summary>
     /// Prefill feeds for the quantized gpt2 with-past export: <c>input_ids</c>/<c>attention_mask</c>/
