@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ModelSharp.Cpu.Kernels.Sequence;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
@@ -9,6 +10,17 @@ namespace ModelSharp.Cpu.Kernels;
 public sealed class GraphContext
 {
     private readonly Dictionary<string, Tensor> _values;
+
+    /// <summary>
+    /// Parallel name → non-tensor value map carrying the ONNX <c>Sequence*</c> / <c>Optional*</c>
+    /// runtime values (<see cref="SeqValue"/>). This is kept <b>separate</b> from the tensor map
+    /// so the established tensor plumbing (<see cref="Get"/>/<see cref="Set"/>/<see cref="Values"/>,
+    /// the subgraph runner, the public <c>Run</c> contract) is completely unaffected: tensor-only
+    /// graphs never touch this map. Sequence/optional values live only on the wire between nodes;
+    /// graph inputs/outputs remain tensors. Lazily allocated — null until a sequence/optional op
+    /// actually produces one.
+    /// </summary>
+    private Dictionary<string, SeqValue>? _seqValues;
 
     /// <summary>
     /// Hook that executes a nested ONNX subgraph (the value of a GRAPH attribute on a
@@ -57,6 +69,29 @@ public sealed class GraphContext
 
     /// <summary>Writes a tensor by name (any dtype; <c>Tensor&lt;float&gt;</c> upcasts implicitly).</summary>
     public void Set(string name, Tensor value) => _values[name] = value;
+
+    // ---- Sequence / Optional non-tensor value plumbing (additive) -----------------------------
+
+    /// <summary>
+    /// Reads a non-tensor value (sequence or optional) by name. Throws if the name is not bound
+    /// as a <see cref="SeqValue"/> (a tensor bound under the same name is a separate slot).
+    /// </summary>
+    public SeqValue GetSeq(string name) =>
+        _seqValues is not null && _seqValues.TryGetValue(name, out SeqValue? v)
+            ? v
+            : throw new KeyNotFoundException(
+                $"Sequence/optional value '{name}' is not available in the execution context.");
+
+    /// <summary>True if a non-tensor (sequence/optional) value with the given name is bound.</summary>
+    public bool HasSeq(string name) =>
+        name.Length != 0 && _seqValues is not null && _seqValues.ContainsKey(name);
+
+    /// <summary>Writes a non-tensor (sequence/optional) value by name.</summary>
+    public void SetSeq(string name, SeqValue value)
+    {
+        _seqValues ??= new Dictionary<string, SeqValue>();
+        _seqValues[name] = value;
+    }
 
     /// <summary>
     /// Executes a nested subgraph with outer-scope capture and returns its outputs keyed

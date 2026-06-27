@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ONNX signal-processing ops: `DFT`, `STFT`, and `MelWeightMatrix`, backed by a
   shared FFT implementation.
 - ONNX control-flow ops: `If`, `Loop`, and `Scan`, with subgraph execution.
+- Full distilgpt2 graph runs end-to-end on the GPU engine (no CPU fallback),
+  matching the CPU engine's logits and exact greedy argmax on CUDA.
+- GPU engine **runs any CPU-runnable model**: ops without a native GPU kernel
+  transparently fall back to the CPU kernel (download → CPU op → re-upload).
+- Sequence ops (`SequenceEmpty/Construct/Insert/Erase/At/Length`,
+  `SplitToSequence`, `ConcatFromSequence`) and Optional ops (`Optional`,
+  `OptionalGetElement`, `OptionalHasElement`) with sequence/optional value types.
+- Quantized `QLinear*` ops: `QLinearMatMul`, `QLinearConv`, `QLinearAdd`,
+  `QLinearMul`, `ConvInteger`, `QLinearGlobalAveragePool`; plus `FastGelu`,
+  `BiasGelu`, `QuickGelu`, `Affine`, `ImageScaler`.
+- Encoder-decoder (seq2seq) generation (`Seq2SeqGenerator` + Pipeline
+  `Seq2SeqGeneration` task): encoder-once + cross-attention KV-cached decode for
+  T5 / BART / MarianMT-style models.
+- GGUF `IQ4_NL` / `IQ4_XS` dequantization; `DFT` FFT fast path (radix-2 +
+  Bluestein) and opset-20 axis-as-input.
 - NuGet packaging metadata for the shippable packages (`ModelSharp`,
   `ModelSharp.ImageSharp`, `ModelSharp.Gpu`): authors, description, license
   expression, project/repository URLs, and tags. The core package now embeds the
@@ -27,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Notes
 - GPU validation has been exercised on CUDA hardware; full 7B-class LLM-on-GPU
   proof on dedicated hardware is still pending.
+- GGUF grid-codebook IQ quants (`IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S`)
+  are not yet dequantized — they require vendored ggml lattice tables and license
+  attribution to implement bit-exactly, and intentionally throw rather than emit
+  unverified weights.
 
 ## [0.1.0-alpha]
 

@@ -199,3 +199,67 @@ routing is device-agnostic, so this proves the whole graph clears end-to-end and
   this engine (ILGPU's portable backends have no native int64, and these tensors feed pure index math), the
   float matmul/attention/MLP path runs entirely on the device, and `Cast` is the only host↔device seam. There is
   no CPU-engine fallback and no unsupported op.
+
+## Per-op CPU fallback — the GPU engine now runs any CPU-runnable model
+
+The GPU engine is no longer limited to the ops it has native kernels for. `IlgpuEngine.Run`'s `switch
+(node.OpType)` previously ended in `default: throw UnsupportedOperatorException`; that `default` now routes the
+node through the managed CPU kernel registry (`RunCpuFallback`). The result: **any graph the
+`ManagedCpuEngine` can run, the GPU engine can run too** — accelerated where a native GPU kernel exists,
+correct via the CPU fallback everywhere else. The native distilgpt2 path is unchanged (it never hits the
+fallback), so there is no regression on the fully-native graphs.
+
+### How the fallback crosses the device↔host boundary
+
+`RunCpuFallback(node, values)` mirrors exactly how `ManagedCpuEngine.ExecuteNodes` invokes a kernel for one
+node:
+
+1. **Inputs → host.** Each input `DeviceValue` is materialized to a dtype-carrying host `Tensor` via
+   `DeviceValue.ToHost()`: float buffers are **downloaded** from the device; int/bool tensors already live
+   host-side and pass through untouched. Omitted/optional inputs (empty name) are skipped, exactly as the CPU
+   engine leaves them unbound.
+2. **Run the CPU kernel.** Those inputs seed a `GraphContext` (the same `Dictionary<string,Tensor>` environment
+   the CPU engine threads through kernels); the kernel for `node.OpType` is looked up in a **lazily-built**
+   `KernelRegistry.CreateDefault()` (the same registry `ManagedCpuEngine` uses) and `kernel.Execute(node, ctx)`
+   writes its named outputs into the environment — identical call shape to the CPU engine.
+3. **Outputs → DeviceValue.** Each declared output tensor is re-homed via `Load(...)`: **float outputs are
+   re-uploaded to the device** (so the next GPU op reads a device buffer, not a host array), while int/bool
+   outputs are kept host-side — dtype is preserved throughout. The re-uploaded buffers are tracked in the same
+   `values` map and disposed by `Run`'s existing dedup-by-reference cleanup.
+
+The registry is built **lazily** (first fallback only), so fully-native graphs (distilgpt2) never construct
+it and pay nothing. A native GPU op composes seamlessly with a fallback op in either direction because both
+sides speak `DeviceValue` — e.g. `MatMul (native GPU) → Softplus (CPU fallback) → Add (native GPU)` keeps the
+right buffers on the device at each hop (`GpuFallbackTests`).
+
+### "Unsupported" now means no engine supports it
+
+If the CPU registry *also* lacks a kernel for the op, `RunCpuFallback` throws `UnsupportedOperatorException`
+with a message stating that neither the GPU engine nor the CPU kernel registry can run it. So the exception's
+meaning has sharpened from "the GPU engine doesn't have this kernel" to "**no engine** supports this op."
+
+Control-flow ops (`If`/`Loop`/`Scan`) that need nested-subgraph execution are dispatched to their CPU kernels
+too, but the fallback installs a bare `GraphContext` with no subgraph runner; such a kernel surfaces a clear
+error from `GraphContext.RunSubgraph` rather than miscomputing. Running those through the GPU engine's stateless
+`Run` is out of scope here (they require the engine-level subgraph runner the CPU engine wires up).
+
+### A few extra native GPU kernels
+
+Four trivially-native unary float ops were added so a fallback wouldn't needlessly download for them: `Log`
+(`MathF.Log`/`LogF` intrinsic), `Abs`, `Neg`, and `Reciprocal`. They are guarded with
+`when values[node.Inputs[0]].IsFloat`, so integer inputs (rare — e.g. int `Abs`/`Neg`) still fall through to
+the dtype-correct CPU kernel.
+
+### Tests (`GpuFallbackTests.cs`, CUDA-gated, `[Collection("CudaGpu")]`)
+
+- **Single fallback op round-trips:** `Softplus`, `ReduceMax` (a reduction the GPU switch lacks), and `Tile`
+  (a data-movement op with an int `repeats` input) each match `ManagedCpuEngine` to 1e-4 through `IlgpuEngine`,
+  proving the device↔host round-trip is correct.
+- **No engine supports it → throws:** a made-up op type throws `UnsupportedOperatorException` (runs on ILGPU's
+  CPU accelerator, so it needs no CUDA).
+- **Mixed native + fallback end-to-end:** `MatMul → Softplus → Add` and a chained
+  `MatMul → Mish → ReduceMax → Add` both match the CPU engine, proving fallback outputs re-enter the device for
+  the trailing native ops.
+- **No native regression:** a synthetic distilgpt2-style graph (`MatMul/Add/Gelu/LayerNormalization/Softmax`)
+  matches the CPU engine on both the CPU accelerator and real hardware, confirming the native paths are
+  untouched.

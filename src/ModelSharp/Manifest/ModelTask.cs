@@ -11,4 +11,5 @@ public enum ModelTask
     Embedding,
     TextGeneration,
     SpeechRecognition,
+    Seq2SeqGeneration,
 }

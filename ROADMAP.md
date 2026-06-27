@@ -8,8 +8,17 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **572 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **647 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
 
+- **2026-06-27 (pass 3 — "runs any model"):** the **GPU engine now runs any CPU-runnable model** —
+  `IlgpuEngine.Run` executes natively-supported ops on-device and transparently **falls back to the
+  CPU kernel** (download → CPU kernel → re-upload) for the rest, instead of throwing; **+22 CPU ops**
+  (Sequence* + Optional* value types/ops, `QLinear*` quantized ops — QLinearMatMul/Conv/Add/Mul,
+  ConvInteger, QLinearGlobalAveragePool — and FastGelu/BiasGelu/QuickGelu/Affine/ImageScaler);
+  **encoder-decoder (seq2seq) generation** (`Seq2SeqGenerator` + Pipeline `Seq2SeqGeneration` task:
+  encoder-once + cross-attention KV-cached decode for T5/BART/Marian). GGUF grid-codebook IQ1/2/3
+  remain deferred (need vendored ggml lattice tables + license attribution to verify bit-exactly).
+  Suite 572 → **647 green**.
 - **2026-06-27 (pass 2):** the **full distilgpt2 graph now runs end-to-end on the GPU engine**
   (`IlgpuEngine.Run`, all 1569 nodes, no CPU fallback) and matches the CPU engine's logits
   (Δ ≤ 1.8e-4) + exact greedy argmax on CUDA; added a full GPU **decoder-layer** through the
@@ -47,7 +56,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 572 tests, 0 failures** (includes
+- Build/test baseline: `dotnet test` must be **GREEN — 647 tests, 0 failures** (includes
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,
@@ -159,7 +168,8 @@ asset is absent** (mirror `MiniLmTests`; discovery via `MODELSHARP_MODELS_DIR` /
 ---
 
 ## Phase D — Op coverage & correctness cleanups
-- ✅ Op coverage now **169 of ~190** standard ops (added control-flow If/Loop/Scan with full ONNX
+- ✅ Op coverage now **180 of ~190** standard ops (plus `QLinear*` quantized + contrib/fused ops) —
+  added Sequence*/Optional* op families, QLinear* quantized ops, control-flow If/Loop/Scan with full ONNX
   subgraph parsing + execution, and the DFT/STFT/MelWeightMatrix signal family;
   earlier: Einsum, ConvTranspose, GridSample,
   NonMaxSuppression, Col2Im, Det, Unique, Bitwise{And,Or,Xor,Not}, {Hann,Hamming,Blackman}Window,

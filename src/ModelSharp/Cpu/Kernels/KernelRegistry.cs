@@ -165,5 +165,7 @@ public sealed class KernelRegistry
         .AddExtraOps()              // Bitwise{And,Or,Xor,Not}/{Hann,Hamming,Blackman}Window/Einsum/Det/
                                     // Unique/CenterCropPad/Dropout/ConvTranspose/GridSample/MaxRoiPool/
                                     // Col2Im/Upsample/NonMaxSuppression/Bernoulli/Multinomial
-        .AddControlFlowOps();       // If/Loop/Scan (subgraph execution via the GraphContext runner hook)
+        .AddControlFlowOps()        // If/Loop/Scan (subgraph execution via the GraphContext runner hook)
+        .AddSequenceOps()           // Sequence*/Optional* families (non-tensor SeqValue plumbing)
+        .AddQLinearOps();           // QLinearConv/MatMul/Add/Mul/GlobalAveragePool + ConvInteger
 }
