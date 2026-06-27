@@ -21,15 +21,14 @@ namespace ModelSharp.Weights;
 /// non-linear-codebook importance-matrix quants <see cref="GgmlType.IQ4_NL"/> and
 /// <see cref="GgmlType.IQ4_XS"/>, whose 16-entry codebook (<see cref="KValuesIq4Nl"/>) is exact.</para>
 /// <para>
-/// The remaining "IQ" families (<see cref="GgmlType.IQ2_XXS"/>, <see cref="GgmlType.IQ2_XS"/>,
+/// The grid-codebook "IQ" families (<see cref="GgmlType.IQ2_XXS"/>, <see cref="GgmlType.IQ2_XS"/>,
 /// <see cref="GgmlType.IQ2_S"/>, <see cref="GgmlType.IQ3_XXS"/>, <see cref="GgmlType.IQ3_S"/>,
 /// <see cref="GgmlType.IQ1_S"/>, <see cref="GgmlType.IQ1_M"/>) encode each group as an index into a
-/// large, fixed lattice/grid constant table (256–2048 entries each) rather than an affine scale.
-/// Because a single incorrect table entry would silently corrupt model weights, ModelSharp only
-/// dequantizes a family once a bit-exact, verified copy of its grid is vendored; none is vendored
-/// yet, so those types — and any unrecognized type — throw rather than emitting unverified output.
-/// The surrounding block layout for each family is documented inline below so a verified grid can be
-/// dropped in without re-deriving the bit packing.</para>
+/// large, fixed lattice/grid constant table (256–2048 entries each) rather than an affine scale. The
+/// grids are vendored verbatim from llama.cpp's <c>ggml-common.h</c> in <see cref="GgufIqGrids"/>
+/// (MIT — see NOTICE), and each dequant routine below is ported line-by-line from the corresponding
+/// <c>dequantize_row_iq*</c> in <c>ggml-quants.c</c> at the pinned upstream commit. Any unrecognized
+/// type still throws rather than emitting unverified output.</para>
 /// </summary>
 public static class GgufDequant
 {
@@ -56,7 +55,10 @@ public static class GgufDequant
         GgmlType.Q8_0 or GgmlType.Q8_1 or
         GgmlType.Q2_K or GgmlType.Q3_K or GgmlType.Q4_K or GgmlType.Q5_K or
         GgmlType.Q6_K or GgmlType.Q8_K or
-        GgmlType.IQ4_NL or GgmlType.IQ4_XS => true,
+        GgmlType.IQ4_NL or GgmlType.IQ4_XS or
+        GgmlType.IQ2_XXS or GgmlType.IQ2_XS or GgmlType.IQ2_S or
+        GgmlType.IQ3_XXS or GgmlType.IQ3_S or
+        GgmlType.IQ1_S or GgmlType.IQ1_M => true,
         _ => false,
     };
 
@@ -77,11 +79,7 @@ public static class GgufDequant
             throw new ModelSharpException(
                 $"ggml type {type} is not a dequantizable block type supported by ModelSharp. " +
                 "Supported: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, " +
-                "Q8_K, IQ4_NL, IQ4_XS. The grid-codebook IQ families (IQ2_XXS, IQ2_XS, IQ2_S, " +
-                "IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) reconstruct each group by indexing a large, fixed " +
-                "lattice/grid constant table; ModelSharp does not vendor a bit-exact, verified copy " +
-                "of those tables, so it throws here rather than emitting unverified (silently wrong) " +
-                "weights. They are intentionally not approximated.");
+                "Q8_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M.");
 
         int block = GgmlTypeInfo.BlockSize(type);
         int typeSize = GgmlTypeInfo.TypeSize(type);
@@ -116,6 +114,13 @@ public static class GgufDequant
             case GgmlType.Q8_K: DequantizeQ8_K(raw, output, nBlocks); break;
             case GgmlType.IQ4_NL: DequantizeIq4Nl(raw, output, nBlocks); break;
             case GgmlType.IQ4_XS: DequantizeIq4Xs(raw, output, nBlocks); break;
+            case GgmlType.IQ2_XXS: DequantizeIq2Xxs(raw, output, nBlocks); break;
+            case GgmlType.IQ2_XS: DequantizeIq2Xs(raw, output, nBlocks); break;
+            case GgmlType.IQ2_S: DequantizeIq2S(raw, output, nBlocks); break;
+            case GgmlType.IQ3_XXS: DequantizeIq3Xxs(raw, output, nBlocks); break;
+            case GgmlType.IQ3_S: DequantizeIq3S(raw, output, nBlocks); break;
+            case GgmlType.IQ1_S: DequantizeIq1S(raw, output, nBlocks); break;
+            case GgmlType.IQ1_M: DequantizeIq1M(raw, output, nBlocks); break;
             default:
                 throw new ModelSharpException($"Unhandled ggml type {type}.");
         }
@@ -605,38 +610,368 @@ public static class GgufDequant
     // =====================================================================================
     // Grid-codebook IQ families (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M)
     //
-    // These are NOT implemented: each reconstructs a group of weights by indexing a large, fixed
-    // lattice "grid" table (256 / 512 / 1024 / 2048 entries depending on the family). ModelSharp
-    // does not vendor a bit-exact, independently verified copy of those tables, and a single wrong
-    // entry would silently corrupt weights, so these types throw (see Dequantize / IsSupported)
-    // rather than emitting approximated or unverified output.
+    // Each reconstructs a group of weights by indexing a large, fixed lattice "grid" table vendored
+    // verbatim in GgufIqGrids (from llama.cpp ggml-common.h, MIT — see NOTICE). The routines below
+    // are ported line-by-line from the dequantize_row_iq* reference functions in ggml-quants.c at the
+    // pinned commit 050ee92d04c2e1f639025786dea701c70e7d4204. Block layouts (all QK_K = 256, sizes are
+    // the GgmlTypeInfo.TypeSize values) match the block_iq* structs in ggml-common.h.
     //
-    // The block layouts below are recorded so that, once a verified grid + sign table is vendored
-    // (with the appropriate upstream attribution added to NOTICE), the dequant routine can be
-    // implemented without re-deriving the bit packing. Sizes are the on-disk TypeSize values in
-    // GgmlTypeInfo; all are QK_K = 256 super-blocks.
-    //
-    //   IQ2_XXS (66 B): fp16 d; uint16[4] qs. Each 32-element group: 4 grid indices (1 byte each)
-    //       select 8-byte grid points (8 packed int4 sign/scale signals); the 4th uint16 packs the
-    //       block scale (top nibble) and the per-group sign indices. Grid: iq2xxs_grid[256] (u64).
-    //   IQ2_XS  (74 B): fp16 d; uint16[8] qs (grid index + 9-bit sign in the high bits per quarter);
-    //       uint8[4] scales (two 4-bit sub-scales per byte). Grid: iq2xs_grid[512] (u64).
-    //   IQ2_S   (82 B): fp16 d; uint8[32] qs; uint8[8] qh (high grid-index bits); uint8[4] signs +
-    //       uint8[4] scales. Grid: iq2s_grid[1024] (u64); signs via ksigns_iq2xs[128]/kmask_iq2xs[8].
-    //   IQ3_XXS (98 B): fp16 d; uint8[64] qs (3-bit grid indices); uint8[28] of packed signs+scale.
-    //       Grid: iq3xxs_grid[256] (u32, two 4-byte points per index).
-    //   IQ3_S  (110 B): fp16 d; uint8[64] qs; uint8[8] qh; uint8[4] signs; uint8[8] scales (+ a high
-    //       grid-index plane). Grid: iq3s_grid[512] (u32); signs via ksigns_iq2xs.
-    //   IQ1_S   (50 B): fp16 d; uint8[32] qs; uint16[8] qh (3 bits grid-high + 3 bits scale + 1 sign
-    //       per 8-element group). Value = d * (2*grid_bit + 1) +/- IQ1S_DELTA(0.125). Grid:
-    //       iq1s_grid[2048] (u64, 8 int8 codes per entry).
-    //   IQ1_M   (56 B): fp16 scale is split across qh; uint8[32] qs; uint8[16] qh; uint8[8] scales.
-    //       Two sub-blocks per group, IQ1M_DELTA(0.125). Grid: iq1m_grid[2048] (u64).
-    //
-    // The short sign/mask helper tables (kmask_iq2xs[8] = {1,2,4,8,16,32,64,128}, ksigns_iq2xs[128])
-    // are small functional bit machinery, but are only meaningful alongside the large grids and are
-    // therefore also deferred until the grids are vendored.
+    // Grid entries pack 8 (u64) or 4 (u32) signed int8 lattice codes little-endian. The C reference
+    // reinterprets a grid entry as `const uint8_t*` (or `const int8_t*` for the IQ1 grid) and reads
+    // byte j; on little-endian that is (entry >> (8*j)) & 0xFF, which is what GridByte/GridSByte do.
+    // The IQ2/IQ3 grids hold small non-negative codes (8/0x19/0x2b ...) read as uint8; the IQ1 grid
+    // holds signed codes (-1/0/+1 scaled) read as int8.
     // =====================================================================================
+
+    /// <summary>Unpacks the <paramref name="j"/>-th byte (as unsigned 0..255) of a packed 64-bit grid
+    /// entry, mirroring the C reinterpret of <c>iq2*_grid[idx]</c> as <c>const uint8_t*</c>.</summary>
+    private static int GridByte(ulong entry, int j) => (int)((entry >> (8 * j)) & 0xFF);
+
+    /// <summary>Unpacks the <paramref name="j"/>-th byte (as unsigned 0..255) of a packed 32-bit grid
+    /// entry, mirroring the C reinterpret of <c>iq3*_grid[idx]</c> as <c>const uint8_t*</c>.</summary>
+    private static int GridByte(uint entry, int j) => (int)((entry >> (8 * j)) & 0xFF);
+
+    /// <summary>Unpacks the <paramref name="j"/>-th byte as <i>signed</i> int8 of a packed 64-bit grid
+    /// entry, mirroring the C reinterpret of <c>iq1s_grid[idx]</c> as <c>const int8_t*</c>.</summary>
+    private static int GridSByte(ulong entry, int j) => unchecked((sbyte)((entry >> (8 * j)) & 0xFF));
+
+    /// <summary>
+    /// IQ2_XXS super-block (66 B): fp16 <c>d</c>; <c>qs[8]</c> uint16 (64 B). For each of the 8
+    /// 32-element groups (<c>ib32</c>) the 4 consecutive uint16 form two uint32 <c>aux32[0..1]</c>:
+    /// the four bytes of <c>aux32[0]</c> are grid indices into <see cref="GgufIqGrids.Iq2xxsGrid"/>;
+    /// <c>aux32[1]</c> packs the block scale in its top nibble and four 7-bit sign selectors. Each
+    /// grid point yields 8 codes; signs come from <c>ksigns_iq2xs</c>/<c>kmask_iq2xs</c>. Value =
+    /// <c>db · grid[j] · (±1)</c>, <c>db = d · (0.5 + (aux32[1]&gt;&gt;28)) · 0.25</c>.
+    /// Ported from <c>dequantize_row_iq2_xxs</c>.
+    /// </summary>
+    private static void DequantizeIq2Xxs(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<ulong> grid = GgufIqGrids.Iq2xxsGrid;
+        ReadOnlySpan<byte> ksigns = GgufIqGrids.KsignsIq2xs;
+        ReadOnlySpan<byte> kmask = GgufIqGrids.KmaskIq2xs;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 66;
+            float d = DecodeHalf(raw, o);
+            int qsBase = o + 2; // qs[QK_K/8] = 32 uint16 (64 bytes); 4 uint16 per ib32.
+            int outIdx = b * QkK;
+            for (int ib32 = 0; ib32 < QkK / 32; ib32++)
+            {
+                // 4*ib32 uint16 -> read 2 uint32 (aux32[0], aux32[1]) = 8 bytes.
+                int p = qsBase + 8 * ib32;
+                uint aux0 = ReadUInt32LE(raw, p);
+                uint aux1 = ReadUInt32LE(raw, p + 4);
+                float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
+                for (int l = 0; l < 4; l++)
+                {
+                    int gridIdx = (int)((aux0 >> (8 * l)) & 0xFF);
+                    ulong g = grid[gridIdx];
+                    byte signs = ksigns[(int)((aux1 >> (7 * l)) & 127)];
+                    for (int j = 0; j < 8; j++)
+                        output[outIdx + j] = db * GridByte(g, j) * ((signs & kmask[j]) != 0 ? -1f : 1f);
+                    outIdx += 8;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// IQ2_XS super-block (74 B): fp16 <c>d</c>; <c>qs[8]</c> uint16 (64 B); <c>scales[8]</c> (8 B).
+    /// Per 32-element group <c>ib32</c>: two sub-scales <c>db[0/1] = d · (0.5 + nibble) · 0.25</c> from
+    /// <c>scales[ib32]</c>. Each of 4 uint16 <c>qs[4*ib32+l]</c> gives a 9-bit grid index (low 9 bits)
+    /// into <see cref="GgufIqGrids.Iq2xsGrid"/> and a 7-bit sign selector (high bits) into
+    /// <c>ksigns_iq2xs</c>. Ported from <c>dequantize_row_iq2_xs</c>.
+    /// </summary>
+    private static void DequantizeIq2Xs(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<ulong> grid = GgufIqGrids.Iq2xsGrid;
+        ReadOnlySpan<byte> ksigns = GgufIqGrids.KsignsIq2xs;
+        ReadOnlySpan<byte> kmask = GgufIqGrids.KmaskIq2xs;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 74;
+            float d = DecodeHalf(raw, o);
+            int qsBase = o + 2;          // qs[QK_K/8] = 32 uint16 = 64 bytes
+            int scalesBase = o + 2 + 64; // scales[QK_K/32] = 8 bytes
+            int outIdx = b * QkK;
+            for (int ib32 = 0; ib32 < QkK / 32; ib32++)
+            {
+                byte sc = raw[scalesBase + ib32];
+                float db0 = d * (0.5f + (sc & 0xf)) * 0.25f;
+                float db1 = d * (0.5f + (sc >> 4)) * 0.25f;
+                for (int l = 0; l < 4; l++)
+                {
+                    int q = raw[qsBase + 2 * (4 * ib32 + l)] | (raw[qsBase + 2 * (4 * ib32 + l) + 1] << 8);
+                    ulong g = grid[q & 511];
+                    byte signs = ksigns[(q >> 9) & 127];
+                    float dl = (l / 2) == 0 ? db0 : db1;
+                    for (int j = 0; j < 8; j++)
+                        output[outIdx + j] = dl * GridByte(g, j) * ((signs & kmask[j]) != 0 ? -1f : 1f);
+                    outIdx += 8;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// IQ2_S super-block (82 B): fp16 <c>d</c>; <c>qs[64]</c> (the first 32 bytes are grid indices,
+    /// the second 32 are sign bytes — <c>signs = qs + QK_K/8</c>); <c>qh[8]</c>; <c>scales[8]</c>.
+    /// Per group <c>ib32</c>: two sub-scales from <c>scales[ib32]</c>. The grid index is
+    /// <c>qs[l] | ((qh[ib32] &lt;&lt; (8-2l)) &amp; 0x300)</c> into <see cref="GgufIqGrids.Iq2sGrid"/>;
+    /// signs are taken directly from the sign bytes (not via ksigns). Ported from
+    /// <c>dequantize_row_iq2_s</c>.
+    /// </summary>
+    private static void DequantizeIq2S(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<ulong> grid = GgufIqGrids.Iq2sGrid;
+        ReadOnlySpan<byte> kmask = GgufIqGrids.KmaskIq2xs;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 82;
+            float d = DecodeHalf(raw, o);
+            int qsBase = o + 2;            // qs[QK_K/4] = 64 bytes
+            int signsBase = qsBase + 32;   // signs = qs + QK_K/8 = qs + 32
+            int qhBase = o + 2 + 64;       // qh[QK_K/32] = 8 bytes
+            int scalesBase = o + 2 + 64 + 8; // scales[QK_K/32] = 8 bytes
+            int outIdx = b * QkK;
+            // qs/signs advance by 4 per ib32 (mirrors qs += 4; signs += 4).
+            int qsPtr = qsBase;
+            int signsPtr = signsBase;
+            for (int ib32 = 0; ib32 < QkK / 32; ib32++)
+            {
+                byte sc = raw[scalesBase + ib32];
+                float db0 = d * (0.5f + (sc & 0xf)) * 0.25f;
+                float db1 = d * (0.5f + (sc >> 4)) * 0.25f;
+                byte qh = raw[qhBase + ib32];
+                for (int l = 0; l < 4; l++)
+                {
+                    float dl = (l / 2) == 0 ? db0 : db1;
+                    int gridIdx = raw[qsPtr + l] | ((qh << (8 - 2 * l)) & 0x300);
+                    ulong g = grid[gridIdx];
+                    byte signs = raw[signsPtr + l];
+                    for (int j = 0; j < 8; j++)
+                        output[outIdx + j] = dl * GridByte(g, j) * ((signs & kmask[j]) != 0 ? -1f : 1f);
+                    outIdx += 8;
+                }
+                qsPtr += 4;
+                signsPtr += 4;
+            }
+        }
+    }
+
+    /// <summary>
+    /// IQ3_XXS super-block (98 B): fp16 <c>d</c>; <c>qs[96]</c> (3·QK_K/8 grid indices);
+    /// <c>scales_and_signs = qs + QK_K/4</c> (the last 32 bytes, one uint32 per group). Per group:
+    /// <c>db = d · (0.5 + (aux32&gt;&gt;28)) · 0.5</c>; for each of 4 pairs, two grid indices
+    /// <c>qs[2l]</c>,<c>qs[2l+1]</c> select 4-byte points in <see cref="GgufIqGrids.Iq3xxsGrid"/>; signs
+    /// from <c>ksigns_iq2xs[(aux32&gt;&gt;7l)&amp;127]</c>. Ported from <c>dequantize_row_iq3_xxs</c>.
+    /// </summary>
+    private static void DequantizeIq3Xxs(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<uint> grid = GgufIqGrids.Iq3xxsGrid;
+        ReadOnlySpan<byte> ksigns = GgufIqGrids.KsignsIq2xs;
+        ReadOnlySpan<byte> kmask = GgufIqGrids.KmaskIq2xs;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 98;
+            float d = DecodeHalf(raw, o);
+            int qsBase = o + 2;             // qs[3*QK_K/8] = 96 bytes
+            int ssBase = qsBase + QkK / 4;  // scales_and_signs = qs + 64
+            int outIdx = b * QkK;
+            int qsPtr = qsBase;             // advances by 8 per ib32
+            for (int ib32 = 0; ib32 < QkK / 32; ib32++)
+            {
+                uint aux32 = ReadUInt32LE(raw, ssBase + 4 * ib32);
+                float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+                for (int l = 0; l < 4; l++)
+                {
+                    byte signs = ksigns[(int)((aux32 >> (7 * l)) & 127)];
+                    uint g1 = grid[raw[qsPtr + 2 * l + 0]];
+                    uint g2 = grid[raw[qsPtr + 2 * l + 1]];
+                    for (int j = 0; j < 4; j++)
+                    {
+                        output[outIdx + j + 0] = db * GridByte(g1, j) * ((signs & kmask[j + 0]) != 0 ? -1f : 1f);
+                        output[outIdx + j + 4] = db * GridByte(g2, j) * ((signs & kmask[j + 4]) != 0 ? -1f : 1f);
+                    }
+                    outIdx += 8;
+                }
+                qsPtr += 8;
+            }
+        }
+    }
+
+    /// <summary>
+    /// IQ3_S super-block (110 B): fp16 <c>d</c>; <c>qs[64]</c>; <c>qh[8]</c>; <c>signs[32]</c>;
+    /// <c>scales[4]</c>. Processed two groups at a time (<c>ib32 += 2</c>): each scale byte gives
+    /// <c>db1 = d·(1+2·low4)</c>, <c>db2 = d·(1+2·high4)</c>. The grid index is
+    /// <c>qs[2l] | ((qh[h] &lt;&lt; (8-2l)) &amp; 256)</c> (and <c>7-2l</c> for the odd member) into
+    /// <see cref="GgufIqGrids.Iq3sGrid"/>; signs taken directly from <c>signs[l]</c>. Ported from
+    /// <c>dequantize_row_iq3_s</c>.
+    /// </summary>
+    private static void DequantizeIq3S(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<uint> grid = GgufIqGrids.Iq3sGrid;
+        ReadOnlySpan<byte> kmask = GgufIqGrids.KmaskIq2xs;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 110;
+            float d = DecodeHalf(raw, o);
+            int qsBase = o + 2;                 // qs[QK_K/4] = 64
+            int qhBase = qsBase + 64;           // qh[QK_K/32] = 8
+            int signsBase = qhBase + 8;         // signs[QK_K/8] = 32
+            int scalesBase = signsBase + 32;    // scales[IQ3S_N_SCALE=4]
+            int outIdx = b * QkK;
+            int qsPtr = qsBase;
+            int qhPtr = qhBase;
+            int signsPtr = signsBase;
+            for (int ib32 = 0; ib32 < QkK / 32; ib32 += 2)
+            {
+                byte sc = raw[scalesBase + ib32 / 2];
+                float db1 = d * (1 + 2 * (sc & 0xf));
+                float db2 = d * (1 + 2 * (sc >> 4));
+                byte qh0 = raw[qhPtr + 0];
+                byte qh1 = raw[qhPtr + 1];
+                // First 4 groups (db1, qh[0]).
+                for (int l = 0; l < 4; l++)
+                {
+                    uint g1 = grid[raw[qsPtr + 2 * l + 0] | ((qh0 << (8 - 2 * l)) & 256)];
+                    uint g2 = grid[raw[qsPtr + 2 * l + 1] | ((qh0 << (7 - 2 * l)) & 256)];
+                    byte signs = raw[signsPtr + l];
+                    for (int j = 0; j < 4; j++)
+                    {
+                        output[outIdx + j + 0] = db1 * GridByte(g1, j) * ((signs & kmask[j + 0]) != 0 ? -1f : 1f);
+                        output[outIdx + j + 4] = db1 * GridByte(g2, j) * ((signs & kmask[j + 4]) != 0 ? -1f : 1f);
+                    }
+                    outIdx += 8;
+                }
+                qsPtr += 8;
+                signsPtr += 4;
+                // Second 4 groups (db2, qh[1]).
+                for (int l = 0; l < 4; l++)
+                {
+                    uint g1 = grid[raw[qsPtr + 2 * l + 0] | ((qh1 << (8 - 2 * l)) & 256)];
+                    uint g2 = grid[raw[qsPtr + 2 * l + 1] | ((qh1 << (7 - 2 * l)) & 256)];
+                    byte signs = raw[signsPtr + l];
+                    for (int j = 0; j < 4; j++)
+                    {
+                        output[outIdx + j + 0] = db2 * GridByte(g1, j) * ((signs & kmask[j + 0]) != 0 ? -1f : 1f);
+                        output[outIdx + j + 4] = db2 * GridByte(g2, j) * ((signs & kmask[j + 4]) != 0 ? -1f : 1f);
+                    }
+                    outIdx += 8;
+                }
+                qhPtr += 2;
+                qsPtr += 8;
+                signsPtr += 4;
+            }
+        }
+    }
+
+    /// <summary>IQ1 delta constant (<c>IQ1S_DELTA</c>/<c>IQ1M_DELTA</c> in ggml-common.h).</summary>
+    private const float Iq1Delta = 0.125f;
+
+    /// <summary>
+    /// IQ1_S super-block (50 B): fp16 <c>d</c>; <c>qs[32]</c>; <c>qh[8]</c> uint16. Per 32-element
+    /// group <c>ib</c>: <c>dl = d · (2·((qh[ib]&gt;&gt;12)&amp;7) + 1)</c>; sign bit 0x8000 of
+    /// <c>qh[ib]</c> selects <c>±IQ1S_DELTA</c>. Grid index is
+    /// <c>qs[l] | (((qh[ib]&gt;&gt;3l)&amp;7) &lt;&lt; 8)</c> into the <i>signed</i>
+    /// <see cref="GgufIqGrids.Iq1sGrid"/>; value = <c>dl · (grid[j] + delta)</c>. Ported from
+    /// <c>dequantize_row_iq1_s</c>.
+    /// </summary>
+    private static void DequantizeIq1S(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<ulong> grid = GgufIqGrids.Iq1sGrid;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 50;
+            float d = DecodeHalf(raw, o);
+            int qsBase = o + 2;        // qs[QK_K/8] = 32
+            int qhBase = qsBase + 32;  // qh[QK_K/32] = 8 uint16 = 16 bytes
+            int outIdx = b * QkK;
+            int qsPtr = qsBase;
+            for (int ib = 0; ib < QkK / 32; ib++)
+            {
+                int qh = raw[qhBase + 2 * ib] | (raw[qhBase + 2 * ib + 1] << 8);
+                float dl = d * (2 * ((qh >> 12) & 7) + 1);
+                float delta = (qh & 0x8000) != 0 ? -Iq1Delta : Iq1Delta;
+                for (int l = 0; l < 4; l++)
+                {
+                    int gridIdx = raw[qsPtr + l] | (((qh >> (3 * l)) & 7) << 8);
+                    ulong g = grid[gridIdx];
+                    for (int j = 0; j < 8; j++)
+                        output[outIdx + j] = dl * (GridSByte(g, j) + delta);
+                    outIdx += 8;
+                }
+                qsPtr += 4;
+            }
+        }
+    }
+
+    /// <summary>
+    /// IQ1_M super-block (56 B): <c>qs[32]</c>; <c>qh[16]</c>; <c>scales[8]</c> (4 uint16). The fp16
+    /// scale is reassembled from the top nibbles of the 4 scale uint16:
+    /// <c>(sc0&gt;&gt;12) | ((sc1&gt;&gt;8)&amp;0xf0) | ((sc2&gt;&gt;4)&amp;0xf00) | (sc3&amp;0xf000)</c>.
+    /// Per 32-element group <c>ib</c>: two 3-bit sub-scales from <c>sc[ib/2]</c>. Four 8-element grid
+    /// points use indices <c>qs[k] | ((qh &lt;&lt; n) &amp; 0x700)</c> and per-point deltas from the
+    /// 0x08/0x80 bits of the two <c>qh</c> bytes. Grid is the signed <see cref="GgufIqGrids.Iq1sGrid"/>.
+    /// Ported from <c>dequantize_row_iq1_m</c>.
+    /// </summary>
+    private static void DequantizeIq1M(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<ulong> grid = GgufIqGrids.Iq1sGrid;
+        Span<ushort> idx = stackalloc ushort[4];
+        Span<float> delta = stackalloc float[4];
+        Span<int> sc = stackalloc int[4];
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 56;
+            int qsBase = o;              // qs[QK_K/8] = 32
+            int qhBase = o + 32;         // qh[QK_K/16] = 16
+            int scalesBase = o + 32 + 16; // scales[QK_K/32] = 8 bytes = 4 uint16
+            // scales as uint16[4].
+            int sc0 = raw[scalesBase + 0] | (raw[scalesBase + 1] << 8);
+            int sc1 = raw[scalesBase + 2] | (raw[scalesBase + 3] << 8);
+            int sc2 = raw[scalesBase + 4] | (raw[scalesBase + 5] << 8);
+            int sc3 = raw[scalesBase + 6] | (raw[scalesBase + 7] << 8);
+            ushort scaleBits = (ushort)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+            float d = (float)BitConverter.UInt16BitsToHalf(scaleBits);
+            sc[0] = sc0; sc[1] = sc1; sc[2] = sc2; sc[3] = sc3;
+
+            int outIdx = b * QkK;
+            int qsPtr = qsBase;
+            int qhPtr = qhBase;
+            for (int ib = 0; ib < QkK / 32; ib++)
+            {
+                float dl1 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+                float dl2 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+                byte qh0 = raw[qhPtr + 0];
+                byte qh1 = raw[qhPtr + 1];
+                idx[0] = (ushort)(raw[qsPtr + 0] | ((qh0 << 8) & 0x700));
+                idx[1] = (ushort)(raw[qsPtr + 1] | ((qh0 << 4) & 0x700));
+                idx[2] = (ushort)(raw[qsPtr + 2] | ((qh1 << 8) & 0x700));
+                idx[3] = (ushort)(raw[qsPtr + 3] | ((qh1 << 4) & 0x700));
+                delta[0] = (qh0 & 0x08) != 0 ? -Iq1Delta : Iq1Delta;
+                delta[1] = (qh0 & 0x80) != 0 ? -Iq1Delta : Iq1Delta;
+                delta[2] = (qh1 & 0x08) != 0 ? -Iq1Delta : Iq1Delta;
+                delta[3] = (qh1 & 0x80) != 0 ? -Iq1Delta : Iq1Delta;
+                for (int l = 0; l < 2; l++)
+                {
+                    ulong g = grid[idx[l]];
+                    for (int j = 0; j < 8; j++)
+                        output[outIdx + j] = dl1 * (GridSByte(g, j) + delta[l]);
+                    outIdx += 8;
+                }
+                for (int l = 2; l < 4; l++)
+                {
+                    ulong g = grid[idx[l]];
+                    for (int j = 0; j < 8; j++)
+                        output[outIdx + j] = dl2 * (GridSByte(g, j) + delta[l]);
+                    outIdx += 8;
+                }
+                qsPtr += 4;
+                qhPtr += 2;
+            }
+        }
+    }
 
     // =====================================================================================
     // Shared helpers

@@ -111,6 +111,30 @@ public sealed class Seq2SeqGenerator
         IReadOnlyList<long> sourceTokenIds, GenerationConfig config, IReadOnlyList<long>? sourceAttentionMask = null)
         => Iterate(sourceTokenIds, config, sourceAttentionMask);
 
+    /// <summary>
+    /// Generates target token ids for an encoder that consumes a pre-built <em>feature</em> tensor (e.g. a
+    /// Whisper audio encoder taking <c>[1, n_mels, 3000]</c> log-mel features) rather than integer token ids,
+    /// and seeds the decoder with a multi-token <paramref name="forcedDecoderIds"/> prompt. The forced prompt
+    /// (Whisper's <c>&lt;|startoftranscript|&gt;</c>, language, task and timestamp tokens) is fed to the
+    /// decoder but never emitted; generation continues greedily/sampled until EOS or a length bound. The
+    /// encoder still runs exactly once.
+    /// </summary>
+    /// <param name="encoderFeatures">The encoder input tensor; bound under the configured encoder input name.</param>
+    /// <param name="forcedDecoderIds">Forced decoder prompt ids (must start with the decoder-start token); non-empty.</param>
+    /// <param name="config">Decoding parameters.</param>
+    public IReadOnlyList<long> GenerateFromFeatures(
+        NamedTensor encoderFeatures, IReadOnlyList<long> forcedDecoderIds, GenerationConfig config)
+    {
+        var result = new List<long>();
+        foreach (long token in IterateFromFeatures(encoderFeatures, forcedDecoderIds, config)) result.Add(token);
+        return result;
+    }
+
+    /// <summary>Lazily streams generated target token ids for a feature-input encoder with a forced prompt.</summary>
+    public IEnumerable<long> GenerateFromFeaturesStream(
+        NamedTensor encoderFeatures, IReadOnlyList<long> forcedDecoderIds, GenerationConfig config)
+        => IterateFromFeatures(encoderFeatures, forcedDecoderIds, config);
+
     /// <summary>Generates target token ids and invokes <paramref name="onToken"/> for each produced token.</summary>
     public void Generate(
         IReadOnlyList<long> sourceTokenIds, GenerationConfig config, Action<long> onToken,
@@ -142,8 +166,49 @@ public sealed class Seq2SeqGenerator
         long[] encMask = BuildEncMaskValues(source.Count, sourceMask);
 
         // 2) Decoder autoregressive loop, seeded by the decoder start token (which is never emitted).
+        foreach (long token in Decode(encoderHidden, encMask, new List<long> { _options.DecoderStartTokenId }, config, rng))
+            yield return token;
+    }
+
+    /// <summary>
+    /// Feature-input variant of <see cref="Iterate"/>: runs the encoder over a pre-built feature tensor and
+    /// seeds the decoder with a multi-token forced prompt (e.g. Whisper). The forced prompt is fed but never
+    /// emitted; only generated tokens are yielded.
+    /// </summary>
+    private IEnumerable<long> IterateFromFeatures(
+        NamedTensor encoderFeatures, IReadOnlyList<long> forcedDecoderIds, GenerationConfig config)
+    {
+        if (encoderFeatures is null) throw new ArgumentNullException(nameof(encoderFeatures));
+        if (forcedDecoderIds is null) throw new ArgumentNullException(nameof(forcedDecoderIds));
+        if (config is null) throw new ArgumentNullException(nameof(config));
+        config.Validate();
+        if (forcedDecoderIds.Count == 0)
+            throw new ArgumentException("Forced decoder prompt must contain at least one token.", nameof(forcedDecoderIds));
+
+        Random? rng = config.DoSample
+            ? (config.Seed.HasValue ? new Random(config.Seed.Value) : new Random())
+            : null;
+
+        // Encoder runs once over the supplied features (rebound under the decoder's cross-attention input name).
+        NamedTensor encoderHidden = RunEncoderFeatures(encoderFeatures, out int encLen);
+        long[] encMask = BuildEncMaskValues(encLen, null);
+
+        // The whole forced prompt seeds the decoder; none of it is emitted.
+        var seed = new List<long>(forcedDecoderIds);
+        foreach (long token in Decode(encoderHidden, encMask, seed, config, rng))
+            yield return token;
+    }
+
+    /// <summary>
+    /// The shared autoregressive decode loop. <paramref name="decoderSequence"/> holds the initial forced
+    /// prefix (decoder start token, plus any forced prompt) which is fed but never yielded; every token
+    /// produced after the prefix is yielded until EOS or a length bound.
+    /// </summary>
+    private IEnumerable<long> Decode(
+        NamedTensor encoderHidden, long[] encMask, List<long> decoderSequence, GenerationConfig config, Random? rng)
+    {
         bool cache = UsesKvCache;
-        var decoderSequence = new List<long> { _options.DecoderStartTokenId };
+        int prefixLength = decoderSequence.Count; // forced prefix is never counted as generated
         int generatedCount = 0;
 
         Dictionary<string, Tensor>? selfPast = null;   // self-attn KV, grows each step
@@ -152,7 +217,7 @@ public sealed class Seq2SeqGenerator
         while (true)
         {
             if (generatedCount >= config.MaxNewTokens) yield break;
-            if (config.MaxLength > 0 && decoderSequence.Count - 1 >= config.MaxLength) yield break;
+            if (config.MaxLength > 0 && decoderSequence.Count - prefixLength >= config.MaxLength) yield break;
 
             // Cache mode: feed whole decoder prefix once (selfPast == null), then one token at a time.
             int chunkLength = (!cache || selfPast is null) ? decoderSequence.Count : 1;
@@ -207,6 +272,32 @@ public sealed class Seq2SeqGenerator
                 $"Encoder produced no '{_options.EncoderHiddenStatesOutputName}' output to feed the decoder.");
 
         // Rebind under the decoder's encoder-hidden-states input name for the loop.
+        return new NamedTensor(_options.EncoderHiddenStatesInputName, hidden.Tensor);
+    }
+
+    /// <summary>
+    /// Runs the encoder once over a pre-built feature tensor (Whisper-style audio encoder) and returns its
+    /// hidden states rebound under the decoder's cross-attention input name. <paramref name="encoderLen"/>
+    /// reports the encoder's output sequence length (used to size the cross-attention mask).
+    /// </summary>
+    private NamedTensor RunEncoderFeatures(NamedTensor encoderFeatures, out int encoderLen)
+    {
+        var feeds = new Dictionary<string, NamedTensor>(StringComparer.Ordinal)
+        {
+            // Bind the features under the encoder's declared input name (e.g. "input_features").
+            [_options.EncoderInputIdsName] = new NamedTensor(_options.EncoderInputIdsName, encoderFeatures.Tensor),
+        };
+
+        IReadOnlyDictionary<string, NamedTensor> outputs = _encoder.Run(feeds);
+
+        if (!outputs.TryGetValue(_options.EncoderHiddenStatesOutputName, out NamedTensor? hidden))
+            hidden = outputs.Values.FirstOrDefault();
+        if (hidden is null)
+            throw new ModelSharpException(
+                $"Encoder produced no '{_options.EncoderHiddenStatesOutputName}' output to feed the decoder.");
+
+        ReadOnlySpan<int> dims = hidden.Tensor.Shape.Dimensions;
+        encoderLen = dims.Length >= 2 ? dims[1] : 1; // [batch, seq, hidden]
         return new NamedTensor(_options.EncoderHiddenStatesInputName, hidden.Tensor);
     }
 

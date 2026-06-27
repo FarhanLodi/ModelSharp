@@ -28,10 +28,10 @@ namespace ModelSharp.Weights;
 /// The unquantized ggml types materialize directly: <see cref="GgmlType.F32"/> and
 /// <see cref="GgmlType.F16"/> decode to <see cref="Tensor{Single}"/>. The common block-quantized
 /// types (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, the Q2_K…Q6_K / Q8_K k-quants, and the non-linear
-/// importance-matrix quants IQ4_NL and IQ4_XS) are dequantized to <see cref="Tensor{Single}"/> by
-/// <see cref="GgufDequant"/>; the grid-codebook "IQ" families (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-/// IQ3_S, IQ1_S, IQ1_M) are still surfaced only as raw bytes via <see cref="GetRawTensorBytes"/>,
-/// and asking <see cref="GetTensor"/> to materialize one of those throws.
+/// importance-matrix quants IQ4_NL and IQ4_XS, and the grid-codebook "IQ" families IQ2_XXS, IQ2_XS,
+/// IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M — the latter backed by lattice grids vendored verbatim from
+/// llama.cpp's ggml-common.h, see <see cref="GgufIqGrids"/>) are dequantized to
+/// <see cref="Tensor{Single}"/> by <see cref="GgufDequant"/>.
 /// </para>
 /// </summary>
 public sealed class GgufFile : IDisposable
@@ -464,8 +464,8 @@ public sealed class GgufFile : IDisposable
     /// (half-decoded), <see cref="GgmlType.F64"/> → <see cref="Tensor{Double}"/>, and the integer
     /// types to their managed equivalents. The ggml block-quantized types supported by
     /// <see cref="GgufDequant"/> — Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
-    /// Q8_K, IQ4_NL and IQ4_XS — are dequantized to a <see cref="Tensor{Single}"/> of the tensor's
-    /// shape. The grid-codebook "IQ" quant families are not yet implemented and still throw.
+    /// Q8_K, IQ4_NL, IQ4_XS, and the grid-codebook families IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+    /// IQ1_S, IQ1_M — are dequantized to a <see cref="Tensor{Single}"/> of the tensor's shape.
     /// </summary>
     /// <exception cref="ModelSharpException">
     /// No tensor with that name exists, or the tensor is a quantized type that ModelSharp does not
@@ -481,7 +481,8 @@ public sealed class GgufFile : IDisposable
                 throw new ModelSharpException(
                     $"GGUF tensor '{name}' is quantized type {info.Type}; ModelSharp does not yet " +
                     "dequantize it. Supported quantized types are Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, " +
-                    "Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL and IQ4_XS. Use " +
+                    "Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, " +
+                    "IQ2_S, IQ3_XXS, IQ3_S, IQ1_S and IQ1_M. Use " +
                     "GetRawTensorBytes and the ggml type to dequantize separately.");
 
             byte[] raw = GetRawTensorBytes(name);

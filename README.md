@@ -59,8 +59,9 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | Speech recognition (CTC) | wav2vec2-base-960h | transcribes a LibriSpeech clip exactly as `"MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL"` |
 | GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
 | GPU LLM path | distilgpt2 on CUDA | the **full 1569-node graph runs end-to-end through the GPU engine** (no CPU fallback), matching the CPU engine's logits (Δ ≤ 1.8e-4) and exact greedy argmax; a full decoder layer + multi-step decode run on an **on-device KV-cache** |
+| Quantized LLM on GPU | INT8 gpt2 (ONNX, dynamic-quant) | the whole quantized graph (48× `DynamicQuantizeLinear`→`MatMulInteger`) runs through the GPU engine and **greedy-decodes with the exact same argmax as the CPU engine** at every step |
 
-The full test suite is **647 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **682 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` initializers, dtype-generic Gather), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, and Whisper-style ASR runs through the seq2seq path. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 

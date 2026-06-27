@@ -201,7 +201,7 @@ public static class OnnxModelLoader
     }
 
     // ONNX TensorProto.DataType values we materialize.
-    private const long DtFloat = 1, DtInt32 = 6, DtInt64 = 7, DtBool = 9;
+    private const long DtFloat = 1, DtUint8 = 2, DtInt8 = 3, DtInt32 = 6, DtInt64 = 7, DtBool = 9;
 
     private static (string Name, Tensor Tensor) ParseTensor(ReadOnlySpan<byte> bytes)
     {
@@ -287,6 +287,26 @@ public static class OnnxModelLoader
                 else if (floatData is not null)
                     for (int k = 0; k < count && k < floatData.Count; k++) data[k] = floatData[k];
                 return (name, new Tensor<float>(shape, data));
+            }
+            case DtUint8:
+            {
+                // uint8 (e.g. quantized weights / zero-points). Raw bytes map directly; otherwise
+                // ONNX packs the values into int32_data.
+                var data = new byte[count];
+                if (hasRaw && count > 0)
+                    rawData.Slice(0, count).CopyTo(data);
+                else if (int32Data is not null)
+                    for (int k = 0; k < count && k < int32Data.Count; k++) data[k] = (byte)int32Data[k];
+                return (name, new Tensor<byte>(shape, data));
+            }
+            case DtInt8:
+            {
+                var data = new sbyte[count];
+                if (hasRaw && count > 0)
+                    MemoryMarshal.Cast<byte, sbyte>(rawData).Slice(0, count).CopyTo(data);
+                else if (int32Data is not null)
+                    for (int k = 0; k < count && k < int32Data.Count; k++) data[k] = (sbyte)int32Data[k];
+                return (name, new Tensor<sbyte>(shape, data));
             }
             default:
                 throw new ModelSharpException(

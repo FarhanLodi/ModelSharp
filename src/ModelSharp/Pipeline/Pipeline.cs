@@ -33,6 +33,11 @@ public sealed class Pipeline : IDisposable
     private readonly Seq2SeqGenerationProcessor? _seq2seqGeneration;
     private readonly IExecutionEngine? _encoderEngine;
 
+    // Set only on the Whisper (speech-to-text seq2seq) path; null otherwise. Shares the encoder-engine
+    // ownership convention with the seq2seq path above (_encoderEngine is disposed when distinct).
+    private readonly Seq2SeqGenerator? _whisperGenerator;
+    private readonly WhisperProcessor? _whisper;
+
     /// <summary>The resolved manifest describing this model.</summary>
     public ModelManifest Manifest { get; }
 
@@ -73,6 +78,23 @@ public sealed class Pipeline : IDisposable
         Manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         _seq2seqGenerator = generator ?? throw new ArgumentNullException(nameof(generator));
         _seq2seqGeneration = generation ?? throw new ArgumentNullException(nameof(generation));
+    }
+
+    /// <summary>
+    /// Constructs a Whisper speech-to-text pipeline that drives <paramref name="generator"/> with the
+    /// feature extractor, tokenizer and forced-prompt conventions held by <paramref name="whisper"/>. The
+    /// decoder engine is <paramref name="decoderEngine"/>; <paramref name="encoderEngine"/> is disposed with
+    /// the pipeline when it is a distinct instance.
+    /// </summary>
+    public Pipeline(
+        IExecutionEngine decoderEngine, IExecutionEngine encoderEngine, ModelManifest manifest,
+        Seq2SeqGenerator generator, WhisperProcessor whisper)
+    {
+        _engine = decoderEngine ?? throw new ArgumentNullException(nameof(decoderEngine));
+        _encoderEngine = encoderEngine ?? throw new ArgumentNullException(nameof(encoderEngine));
+        Manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
+        _whisperGenerator = generator ?? throw new ArgumentNullException(nameof(generator));
+        _whisper = whisper ?? throw new ArgumentNullException(nameof(whisper));
     }
 
     /// <summary>Loads a model file and resolves its manifest automatically (sidecar → metadata → built-in).</summary>
@@ -176,6 +198,21 @@ public sealed class Pipeline : IDisposable
                 previous = current;
             }
         }
+    }
+
+    /// <summary>
+    /// Transcribes a mono 16 kHz PCM waveform to text. Only available on a Whisper (speech-to-text)
+    /// pipeline: the waveform is turned into log-mel features, the encoder runs once, the forced
+    /// language/task prompt seeds the decoder, and the generated tokens are decoded to text.
+    /// </summary>
+    /// <param name="waveform">Mono PCM samples in <c>[-1, 1]</c> at 16 kHz; padded/trimmed to 30 s internally.</param>
+    /// <param name="config">Decoding parameters; defaults to the manifest-derived greedy configuration.</param>
+    public string Transcribe(ReadOnlyMemory<float> waveform, GenerationConfig? config = null)
+    {
+        if (_whisperGenerator is null || _whisper is null)
+            throw new ModelSharpException(
+                $"Transcribe is only available for Whisper (SpeechToTextSeq2Seq) pipelines; this pipeline's task is '{Manifest.Task}'.");
+        return _whisper.Transcribe(_whisperGenerator, waveform.Span, config);
     }
 
     private (TextGenerator Generator, TextGenerationProcessor Generation) RequireGeneration()
