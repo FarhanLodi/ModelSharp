@@ -89,6 +89,51 @@ internal static class GpuKernels
     }
 
     /// <summary>
+    /// Integer GEMM for ONNX <c>MatMulInteger</c>: <c>Y = (A - a_zp) @ (B - b_zp)</c> with int32 accumulation.
+    /// One thread per output element across [batch, M, N]. A and B arrive as int32 device buffers (the uint8/int8
+    /// operands are widened to int32 on the host). Per-flattened-batch operand base offsets (element units, already
+    /// broadcast-resolved) come via <paramref name="aBatchOff"/>/<paramref name="bBatchOff"/>, matching the float
+    /// <see cref="MatMulK"/> layout. Zero points are supplied as int32 buffers with a stride selector
+    /// (<paramref name="aZpStride"/> = 0 for per-tensor / absent, 1 for per-row of A; <paramref name="bZpStride"/>
+    /// = 0 for per-tensor / absent, 1 for per-column of B) so the same kernel covers absent / per-tensor / per-row /
+    /// per-column without branching on a null buffer. Mirrors the CPU <c>MatMulIntegerKernel</c> exactly: each
+    /// product is computed as a 32-bit difference times a 32-bit difference; the running sum is int32 (wrapping on
+    /// overflow exactly as the CPU kernel's <c>(int)</c> cast of its int64 accumulator does for in-range models).
+    /// </summary>
+    internal static void MatMulIntegerK(
+        Index1D idx,
+        ArrayView<int> a,
+        ArrayView<int> b,
+        ArrayView<int> y,
+        ArrayView<int> aBatchOff,
+        ArrayView<int> bBatchOff,
+        ArrayView<int> aZp,
+        ArrayView<int> bZp,
+        int aZpStride,
+        int bZpStride,
+        int M,
+        int K,
+        int N)
+    {
+        int gid = idx.X;
+        int oMat = M * N;
+        int bi = gid / oMat;
+        int rem = gid - bi * oMat;
+        int m = rem / N;
+        int n = rem - m * N;
+
+        int aRow = aBatchOff[bi] + m * K;
+        int bBase = bBatchOff[bi];
+        int az = aZp[m * aZpStride];
+        int bz = bZp[n * bZpStride];
+
+        int sum = 0;
+        for (int kk = 0; kk < K; kk++)
+            sum += (a[aRow + kk] - az) * (b[bBase + kk * N + n] - bz);
+        y[gid] = sum;
+    }
+
+    /// <summary>
     /// Direct 2-D convolution (NCHW). One thread per output element across [N, Cout, OutH, OutW],
     /// supporting stride, padding, dilation, groups and an optional bias. Mirrors <c>ConvKernel</c>.
     /// </summary>
