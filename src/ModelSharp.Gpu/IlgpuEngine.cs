@@ -30,6 +30,11 @@ namespace ModelSharp.Gpu;
 /// crosses the host/device boundary (int→float uploads, float→int downloads). The float device
 /// kernels live in <see cref="GpuKernels"/> and (for the per-element activations) here, with the
 /// host-side stride/offset precomputation in this class.
+///
+/// The integer/boolean mask &amp; position-id prologue ops (Range, ConstantOfShape, Equal, Greater, Trilu,
+/// ScatterND) are also dispatched: they are pure control-flow over the host-resident int/bool tensors (never
+/// on the float compute path), so they compute host-side and store a dtype-carrying host value — exactly as
+/// Shape/Constant do. With these added the whole distilgpt2 graph is GPU-dispatchable.
 /// </summary>
 public sealed class IlgpuEngine : IExecutionEngine
 {
@@ -229,12 +234,23 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Constant": RunConstant(node, values); break;
                     case "Expand": RunExpand(node, values, temps); break;
                     case "Split": RunSplit(node, values, temps); break;
+                    // Integer/boolean control-flow ops that build the causal mask and position ids.
+                    // These never touch the float compute path, so they run host-side (on the CPU-resident
+                    // int/bool tensors) and store a dtype-carrying host DeviceValue — exactly as Shape/Constant
+                    // already do for int outputs. Float results (rare) upload back to the device via Load.
+                    case "Range": RunRange(node, values); break;
+                    case "ConstantOfShape": RunConstantOfShape(node, values); break;
+                    case "Equal": RunCompare(node, values, equal: true); break;
+                    case "Greater": RunCompare(node, values, equal: false); break;
+                    case "Trilu": RunTrilu(node, values); break;
+                    case "ScatterND": RunScatterND(node, values); break;
                     default:
                         throw new UnsupportedOperatorException(node.OpType,
                             $"node '{node.Name}' — the GPU engine covers elementwise/activations, Softmax, " +
                             "Transpose, ReduceSum/ReduceMean, LayerNormalization, Gather/Concat/Slice/Cast, " +
-                            "MatMul/Gemm, Conv, and the decoder shape ops Reshape/Unsqueeze/Squeeze/Shape/" +
-                            "Constant/Expand/Split plus Pow/Where/Erf");
+                            "MatMul/Gemm, Conv, the decoder shape ops Reshape/Unsqueeze/Squeeze/Shape/" +
+                            "Constant/Expand/Split plus Pow/Where/Erf, and the integer/mask prologue ops " +
+                            "Range/ConstantOfShape/Equal/Greater/Trilu/ScatterND");
                 }
             }
             _accelerator.Synchronize();
@@ -1548,6 +1564,313 @@ public sealed class IlgpuEngine : IExecutionEngine
             values[node.Outputs[p]] = DeviceValue.Device(y, new TensorShape(outDims));
             offset += sz;
         }
+    }
+
+    // --- Integer / boolean mask & position-id prologue ops (host-side) ---
+    //
+    // distilgpt2's causal-mask / position-id prologue uses these six integer/boolean control-flow ops
+    // (Range/ConstantOfShape/Equal/Greater/Trilu/ScatterND). They are never on the float compute path, so —
+    // consistent with the engine's design where int/bool tensors flow host-side — they compute on the
+    // CPU-resident tensors and store a dtype-carrying host value (via Load, which routes float→device,
+    // int/bool→host). Each mirrors the ONNX semantics of the corresponding CPU kernel so GPU-vs-CPU parity is exact.
+
+    /// <summary>
+    /// ONNX <c>Range</c>: the 1-D sequence <c>start, start+delta, …</c> stopping before <c>limit</c>; element
+    /// count = max(ceil((limit−start)/delta), 0). The output dtype follows the (scalar) input dtype
+    /// (Int64/Int32/Float32). Mirrors the CPU <c>RangeKernel</c>.
+    /// </summary>
+    private void RunRange(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        DeviceValue startV = values[node.Inputs[0]];
+        DeviceValue limitV = values[node.Inputs[1]];
+        DeviceValue deltaV = values[node.Inputs[2]];
+
+        // Float inputs live on the device; int inputs host-side. Read each scalar accordingly.
+        if (startV.IsFloat)
+        {
+            float s = startV.FloatBuf!.GetAsArray1D()[0];
+            float l = limitV.FloatBuf!.GetAsArray1D()[0];
+            float d = deltaV.FloatBuf!.GetAsArray1D()[0];
+            int n = RangeCount(s, l, d);
+            var buf = new float[n];
+            for (int i = 0; i < n; i++) buf[i] = s + i * d;
+            values[node.Outputs[0]] = Load(new Tensor<float>(new TensorShape(n), buf));
+            return;
+        }
+
+        Tensor st = startV.HostInt!;
+        if (st.Dtype == ElementType.Int32)
+        {
+            int s = st.AsInt32().Span[0], l = limitV.HostInt!.AsInt32().Span[0], d = deltaV.HostInt!.AsInt32().Span[0];
+            int n = RangeCount(s, l, d);
+            var buf = new int[n];
+            for (int i = 0; i < n; i++) buf[i] = s + i * d;
+            values[node.Outputs[0]] = DeviceValue.Host(new Tensor<int>(new TensorShape(n), buf));
+            return;
+        }
+
+        // Default / Int64.
+        long[] sa = TensorAsInts(st), la = TensorAsInts(limitV.HostInt!), da = TensorAsInts(deltaV.HostInt!);
+        long ls = sa[0], ll = la[0], ld = da[0];
+        int cnt = RangeCount(ls, ll, ld);
+        var lbuf = new long[cnt];
+        for (int i = 0; i < cnt; i++) lbuf[i] = ls + (long)i * ld;
+        values[node.Outputs[0]] = DeviceValue.Host(new Tensor<long>(new TensorShape(cnt), lbuf));
+    }
+
+    /// <summary>Range element count = max(ceil((limit−start)/delta), 0). Mirrors the CPU <c>RangeKernel.Count</c>.</summary>
+    private static int RangeCount(double start, double limit, double delta)
+    {
+        if (delta == 0d) throw new ModelSharpException("Range 'delta' cannot be 0.");
+        double c = Math.Ceiling((limit - start) / delta);
+        return c <= 0d ? 0 : (int)c;
+    }
+
+    /// <summary>
+    /// ONNX <c>ConstantOfShape</c>: a tensor of the shape given by the 1-D integer input, filled with the scalar
+    /// <c>value</c> attribute (default a single float32 zero). Output dtype follows <c>value</c>'s dtype; float
+    /// fills upload to the device, int/bool stay host-side. Mirrors the CPU <c>ConstantOfShapeKernel</c>.
+    /// </summary>
+    private void RunConstantOfShape(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        long[] shapeVals = ReadInts(values, node.Inputs[0]);
+        var dims = new int[shapeVals.Length];
+        for (int i = 0; i < shapeVals.Length; i++) dims[i] = checked((int)shapeVals[i]);
+        var shape = new TensorShape(dims);
+        int count = checked((int)shape.Length);
+
+        Tensor? value = node.Attributes.TryGetValue("value", out object? v) ? v as Tensor : null;
+        ElementType dtype = value?.Dtype ?? ElementType.Float32;
+
+        switch (dtype)
+        {
+            case ElementType.Int64:
+            {
+                ReadOnlySpan<long> vs = value!.AsInt64().Span;
+                var buf = new long[count];
+                Array.Fill(buf, vs.Length > 0 ? vs[0] : 0L);
+                values[node.Outputs[0]] = DeviceValue.Host(new Tensor<long>(shape, buf));
+                break;
+            }
+            case ElementType.Int32:
+            {
+                ReadOnlySpan<int> vs = value!.AsInt32().Span;
+                var buf = new int[count];
+                Array.Fill(buf, vs.Length > 0 ? vs[0] : 0);
+                values[node.Outputs[0]] = DeviceValue.Host(new Tensor<int>(shape, buf));
+                break;
+            }
+            case ElementType.Boolean:
+            {
+                ReadOnlySpan<bool> vs = value!.AsBool().Span;
+                var buf = new bool[count];
+                Array.Fill(buf, vs.Length > 0 && vs[0]);
+                values[node.Outputs[0]] = DeviceValue.Host(new Tensor<bool>(shape, buf));
+                break;
+            }
+            case ElementType.Float32:
+            {
+                float fill = 0f;
+                if (value is not null)
+                {
+                    ReadOnlySpan<float> vs = value.AsFloat().Span;
+                    if (vs.Length > 0) fill = vs[0];
+                }
+                var buf = new float[count];
+                Array.Fill(buf, fill);
+                values[node.Outputs[0]] = Load(new Tensor<float>(shape, buf)); // float → device
+                break;
+            }
+            default:
+                throw new ModelSharpException($"ConstantOfShape: unsupported 'value' dtype {dtype}.");
+        }
+    }
+
+    /// <summary>
+    /// ONNX <c>Equal</c>/<c>Greater</c>: elementwise same-dtype comparison with NumPy broadcasting, producing a
+    /// Boolean tensor (always host-side). Both operands are read at their native dtype; float NaN comparisons
+    /// follow IEEE semantics. Mirrors the CPU <c>EqualKernel</c>/<c>GreaterKernel</c>.
+    /// </summary>
+    private void RunCompare(GraphNode node, Dictionary<string, DeviceValue> values, bool equal)
+    {
+        Tensor a = values[node.Inputs[0]].ToHost();
+        Tensor b = values[node.Inputs[1]].ToHost();
+
+        Tensor<bool> y;
+        switch (a.Dtype)
+        {
+            case ElementType.Int64:
+            {
+                Func<long, long, bool> cmp = equal ? (x, z) => x == z : (x, z) => x > z;
+                y = CompareHost(a.AsInt64().Span, b.AsInt64().Span, a.Shape, b.Shape, cmp);
+                break;
+            }
+            case ElementType.Int32:
+            {
+                Func<int, int, bool> cmp = equal ? (x, z) => x == z : (x, z) => x > z;
+                y = CompareHost(a.AsInt32().Span, b.AsInt32().Span, a.Shape, b.Shape, cmp);
+                break;
+            }
+            case ElementType.Boolean:
+            {
+                // Greater is undefined for bool in ONNX; only Equal is expected here.
+                Func<bool, bool, bool> cmp = equal ? (x, z) => x == z : (x, z) => (x ? 1 : 0) > (z ? 1 : 0);
+                y = CompareHost(a.AsBool().Span, b.AsBool().Span, a.Shape, b.Shape, cmp);
+                break;
+            }
+            default:
+            {
+                Func<float, float, bool> cmp = equal ? (x, z) => x == z : (x, z) => x > z;
+                y = CompareHost(a.AsFloat().Span, b.AsFloat().Span, a.Shape, b.Shape, cmp);
+                break;
+            }
+        }
+        values[node.Outputs[0]] = DeviceValue.Host(y);
+    }
+
+    private static Tensor<bool> CompareHost<T>(ReadOnlySpan<T> a, ReadOnlySpan<T> b, TensorShape sa, TensorShape sb,
+        Func<T, T, bool> cmp) where T : unmanaged
+    {
+        if (sa.Equals(sb))
+        {
+            var yEqual = new bool[(int)sa.Length];
+            for (int i = 0; i < yEqual.Length; i++) yEqual[i] = cmp(a[i], b[i]);
+            return new Tensor<bool>(sa, yEqual);
+        }
+
+        int[] outd = BroadcastShape(sa.Dimensions, sb.Dimensions);
+        var outShape = new TensorShape(outd);
+        int rank = outd.Length;
+        int[] strideA = BroadcastStrides(sa.Dimensions, rank);
+        int[] strideB = BroadcastStrides(sb.Dimensions, rank);
+
+        var buf = new bool[(int)outShape.Length];
+        var coord = new int[rank];
+        int aOff = 0, bOff = 0;
+        for (int idx = 0; idx < buf.Length; idx++)
+        {
+            buf[idx] = cmp(a[aOff], b[bOff]);
+            for (int ax = rank - 1; ax >= 0; ax--)
+            {
+                coord[ax]++;
+                aOff += strideA[ax];
+                bOff += strideB[ax];
+                if (coord[ax] < outd[ax]) break;
+                coord[ax] = 0;
+                aOff -= strideA[ax] * outd[ax];
+                bOff -= strideB[ax] * outd[ax];
+            }
+        }
+        return new Tensor<bool>(outShape, buf);
+    }
+
+    /// <summary>
+    /// ONNX <c>Trilu</c>: keeps the upper (<c>upper=1</c>, default) or lower triangle of the trailing 2-D
+    /// matrices, zeroing the rest; the optional scalar <c>k</c> input shifts the diagonal. Batched over leading
+    /// dims, dtype-preserving (float re-uploads to the device, int/bool host-side). Mirrors the CPU <c>TriluKernel</c>.
+    /// </summary>
+    private void RunTrilu(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        DeviceValue dataV = values[node.Inputs[0]];
+        Tensor data = dataV.ToHost();
+        bool upper = AttrInt(node, "upper", 1) != 0;
+        long k = 0;
+        if (node.Inputs.Count > 1 && !string.IsNullOrEmpty(node.Inputs[1]))
+            k = ReadInts(values, node.Inputs[1])[0];
+
+        Tensor outT = data.Dtype switch
+        {
+            ElementType.Int64 => TriluHost(data.AsInt64(), k, upper),
+            ElementType.Int32 => TriluHost(data.AsInt32(), k, upper),
+            ElementType.Boolean => TriluHost(data.AsBool(), k, upper),
+            _ => TriluHost(data.AsFloat(), k, upper),
+        };
+
+        // Preserve the device/host placement of the original dtype (float → device).
+        values[node.Outputs[0]] = dataV.IsFloat ? Load(outT) : DeviceValue.Host(outT);
+    }
+
+    private static Tensor<T> TriluHost<T>(Tensor<T> x, long k, bool upper) where T : unmanaged
+    {
+        ReadOnlySpan<int> dims = x.Shape.Dimensions;
+        int rank = dims.Length;
+        if (rank < 2) throw new ModelSharpException("Trilu requires a tensor of rank >= 2.");
+        int rows = dims[rank - 2], cols = dims[rank - 1];
+        int batch = 1; for (int i = 0; i < rank - 2; i++) batch *= dims[i];
+
+        var y = new Tensor<T>(x.Shape);
+        ReadOnlySpan<T> xs = x.Span;
+        Span<T> ys = y.Span;
+        int mat = rows * cols;
+        T zero = default;
+        for (int b = 0; b < batch; b++)
+        for (int i = 0; i < rows; i++)
+        for (int j = 0; j < cols; j++)
+        {
+            int idx = b * mat + i * cols + j;
+            bool keep = upper ? (long)j >= (long)i + k : (long)j <= (long)i + k;
+            ys[idx] = keep ? xs[idx] : zero;
+        }
+        return y;
+    }
+
+    /// <summary>
+    /// ONNX <c>ScatterND</c> (<c>batch_dims=0</c>, <c>reduction=none</c>): copies <c>data</c>, then writes each
+    /// <c>updates</c> slice into the location addressed by the matching length-<c>k</c> index tuple in
+    /// <c>indices</c> (negative-normalized). Dtype-preserving (float → device, int/bool host-side). Mirrors the
+    /// CPU <c>ScatterNDKernel</c> none-reduction path (the only one distilgpt2 needs).
+    /// </summary>
+    private void RunScatterND(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        DeviceValue dataV = values[node.Inputs[0]];
+        Tensor data = dataV.ToHost();
+        long[] idx = ReadInts(values, node.Inputs[1]);
+        int[] iDims = values[node.Inputs[1]].Shape.Dimensions.ToArray();
+        Tensor updates = values[node.Inputs[2]].ToHost();
+        string reduction = AttrStr(node, "reduction", "none");
+        if (reduction != "none")
+            throw new ModelSharpException($"ScatterND on the GPU engine supports reduction=none only, got '{reduction}'.");
+
+        Tensor outT = data.Dtype switch
+        {
+            ElementType.Int64 => ScatterNDHost(data.AsInt64(), idx, iDims, updates.AsInt64()),
+            ElementType.Int32 => ScatterNDHost(data.AsInt32(), idx, iDims, updates.AsInt32()),
+            ElementType.Boolean => ScatterNDHost(data.AsBool(), idx, iDims, updates.AsBool()),
+            _ => ScatterNDHost(data.AsFloat(), idx, iDims, updates.AsFloat()),
+        };
+        values[node.Outputs[0]] = dataV.IsFloat ? Load(outT) : DeviceValue.Host(outT);
+    }
+
+    private static Tensor<T> ScatterNDHost<T>(Tensor<T> data, long[] idx, int[] iDims, Tensor<T> updates)
+        where T : unmanaged
+    {
+        ReadOnlySpan<int> dDims = data.Shape.Dimensions;
+        int r = dDims.Length;
+        int q = iDims.Length;
+        int k = iDims[q - 1];
+        int[] dStrides = Strides(dDims);
+
+        int sliceLen = 1;
+        for (int i = k; i < r; i++) sliceLen *= dDims[i];
+        int numTuples = k == 0 ? 0 : idx.Length / k;
+
+        var y = new Tensor<T>(data.Shape);
+        data.Span.CopyTo(y.Span);
+        Span<T> ys = y.Span;
+        ReadOnlySpan<T> us = updates.Span;
+        for (int t = 0; t < numTuples; t++)
+        {
+            int baseOff = 0;
+            for (int j = 0; j < k; j++)
+            {
+                int g = (int)idx[t * k + j];
+                if (g < 0) g += dDims[j];
+                baseOff += g * dStrides[j];
+            }
+            int uBase = t * sliceLen;
+            for (int s = 0; s < sliceLen; s++) ys[baseOff + s] = us[uBase + s];
+        }
+        return y;
     }
 
     /// <summary>
