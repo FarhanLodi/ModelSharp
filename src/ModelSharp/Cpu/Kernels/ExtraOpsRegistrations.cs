@@ -41,4 +41,13 @@ public static class ExtraOpsRegistrations
         .Register(new ModelSharp.Cpu.Kernels.Signal.DftKernel())
         .Register(new ModelSharp.Cpu.Kernels.Signal.StftKernel())
         .Register(new ModelSharp.Cpu.Kernels.Signal.MelWeightMatrixKernel());
+
+    /// <summary>
+    /// Adds the ONNX control-flow ops — <c>If</c>, <c>Loop</c>, and <c>Scan</c> — which execute
+    /// nested subgraphs (GRAPH attributes) via the <see cref="GraphContext"/> subgraph-runner hook.
+    /// </summary>
+    public static KernelRegistry AddControlFlowOps(this KernelRegistry r) => r
+        .Register(new ModelSharp.Cpu.Kernels.ControlFlow.IfKernel())
+        .Register(new ModelSharp.Cpu.Kernels.ControlFlow.LoopKernel())
+        .Register(new ModelSharp.Cpu.Kernels.ControlFlow.ScanKernel());
 }

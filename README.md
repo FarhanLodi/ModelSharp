@@ -38,7 +38,7 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
 - 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types (token ids, masks, and shape tensors included).
-- 🧠 **166 ONNX operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), and signal ops (DFT/STFT/MelWeightMatrix) included.
+- 🧠 **169 ONNX operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), and control-flow (If/Loop/Scan) included.
 - 🔤 **Built-in tokenizers** — WordPiece (BERT) and byte-level BPE (GPT-2 / RoBERTa), pure managed.
 - 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam).
 - 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
@@ -56,9 +56,9 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | Object detection | YOLOv8 | detects **2 cats** with well-formed boxes (auto layout detection) |
 | Speech recognition (CTC) | wav2vec2-base-960h | transcribes a LibriSpeech clip exactly as `"MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL"` |
 | GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
-| GPU LLM path | distilgpt2 on CUDA | **98.7% of nodes GPU-dispatchable**; a self-attention block and a multi-step decode run entirely on GPU via an **on-device KV-cache** (~1.3 ms/step) |
+| GPU LLM path | distilgpt2 on CUDA | the **full 1569-node graph runs end-to-end through the GPU engine** (no CPU fallback), matching the CPU engine's logits (Δ ≤ 1.8e-4) and exact greedy argmax; a full decoder layer + multi-step decode run on an **on-device KV-cache** |
 
-The full test suite is **549 passing (0 failed)** and op coverage is **166 of ~190** standard ONNX ops. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **572 passing (0 failed)** and op coverage is **169 of ~190** standard ONNX ops. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 
@@ -194,7 +194,7 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 
 ## Capabilities
 
-### Operator coverage (166)
+### Operator coverage (169)
 
 - **Arithmetic** (broadcasting): Add, Sub, Mul, Div, Pow
 - **Activations**: Relu, Sigmoid, Tanh, Exp, Log, Sqrt, Abs, Neg, Erf, Gelu, Identity, LeakyRelu, Clip, Softmax
@@ -204,9 +204,10 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 - **Reduction**: ReduceMean (axes, keepdims)
 - **Logical** (bool out, broadcasting): Where, Equal, Less, Greater
 - **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand, Trilu, ScatterND, Range
-- **Signal**: DFT, STFT, MelWeightMatrix (opset-17 audio front-end ops)
+- **Signal**: DFT (+ FFT fast path), STFT, MelWeightMatrix (opset-17 audio front-end ops)
+- **Control flow**: If, Loop, Scan (full ONNX subgraph parsing + execution)
 
-> The list above is a representative sample; the registry now covers **166 of ~190** standard ops (plus contrib/fused LLM ops). Additional kernels are wired in as they're verified.
+> The list above is a representative sample; the registry now covers **169 of ~190** standard ops (plus contrib/fused LLM ops). Additional kernels are wired in as they're verified.
 
 ### Text
 

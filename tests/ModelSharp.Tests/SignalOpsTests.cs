@@ -104,6 +104,117 @@ public class SignalOpsTests
         Close(new[] { 1f, 1f, 1f, -1f }, y.Span.ToArray());
     }
 
+    [Fact]
+    public void Dft_Fft_PowerOfTwo_MatchesNaive()
+    {
+        // Cross-check the FFT fast path against the reference naive DFT on fixed complex data,
+        // N = 16 (power of two), two-sided forward. Deterministic fill (no RNG).
+        const int n = 16;
+        var reIn = new double[n];
+        var imIn = new double[n];
+        for (int t = 0; t < n; t++)
+        {
+            reIn[t] = Math.Sin(0.3 * t) + 0.5 * t;
+            imIn[t] = Math.Cos(0.7 * t) - 0.25 * t;
+        }
+
+        var reFast = new double[n];
+        var imFast = new double[n];
+        var reRef = new double[n];
+        var imRef = new double[n];
+        DftCore.Dft1d(reIn, imIn, reFast, imFast, n, n, inverse: false);
+        DftCore.Dft1dNaive(reIn, imIn, reRef, imRef, n, n, inverse: false);
+
+        for (int k = 0; k < n; k++)
+        {
+            Assert.True(Math.Abs(reFast[k] - reRef[k]) <= 1e-5, $"re[{k}] {reFast[k]} vs {reRef[k]}");
+            Assert.True(Math.Abs(imFast[k] - imRef[k]) <= 1e-5, $"im[{k}] {imFast[k]} vs {imRef[k]}");
+        }
+    }
+
+    [Fact]
+    public void Dft_Bluestein_NonPowerOfTwo_MatchesNaive()
+    {
+        // Cross-check the Bluestein path against the naive DFT on fixed data, N = 6 (not a power of
+        // two), both forward and inverse.
+        const int n = 6;
+        var reIn = new double[n];
+        var imIn = new double[n];
+        for (int t = 0; t < n; t++)
+        {
+            reIn[t] = 1.0 + t * t * 0.1;
+            imIn[t] = (t % 2 == 0) ? 0.5 : -0.5;
+        }
+
+        foreach (bool inverse in new[] { false, true })
+        {
+            var reFast = new double[n];
+            var imFast = new double[n];
+            var reRef = new double[n];
+            var imRef = new double[n];
+            DftCore.Dft1d(reIn, imIn, reFast, imFast, n, n, inverse);
+            DftCore.Dft1dNaive(reIn, imIn, reRef, imRef, n, n, inverse);
+
+            for (int k = 0; k < n; k++)
+            {
+                Assert.True(Math.Abs(reFast[k] - reRef[k]) <= 1e-5,
+                    $"inverse={inverse} re[{k}] {reFast[k]} vs {reRef[k]}");
+                Assert.True(Math.Abs(imFast[k] - imRef[k]) <= 1e-5,
+                    $"inverse={inverse} im[{k}] {imFast[k]} vs {imRef[k]}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Dft_AxisAsInput_MatchesAttributeForm()
+    {
+        // opset-20 axis-as-input (input index 2) must produce the same result as the opset-17
+        // axis attribute. Transform along axis 1 of a [1,4,1] real signal.
+        var xData = new float[] { 1, 2, 3, 4 };
+
+        // Attribute form (axis defaults to 1).
+        var ctxAttr = Ctx(("x", F(new[] { 1, 4, 1 }, xData)));
+        new DftKernel().Execute(Node("DFT", new[] { "x" }, new[] { "y" }), ctxAttr);
+        float[] expected = ctxAttr.Get("y").Span.ToArray();
+
+        // Input form: input 1 = dft_length omitted (empty name), input 2 = axis scalar = 1.
+        var ctxInput = Ctx(
+            ("x", F(new[] { 1, 4, 1 }, xData)),
+            ("axis", I64(Array.Empty<int>(), 1)));
+        new DftKernel().Execute(
+            Node("DFT", new[] { "x", "", "axis" }, new[] { "y" }), ctxInput);
+        var y = ctxInput.Get("y");
+
+        Assert.Equal(new[] { 1, 4, 2 }, y.Shape.Dimensions.ToArray());
+        Close(expected, y.Span.ToArray());
+    }
+
+    [Fact]
+    public void Dft_AxisAsInput_WithDftLength()
+    {
+        // Both optional inputs present: input 1 = dft_length (zero-pad N=4 -> 8), input 2 = axis.
+        // Cross-check against the same call expressed with the axis attribute.
+        var xData = new float[] { 1, 2, 3, 4 };
+
+        var ctxAttr = Ctx(
+            ("x", F(new[] { 1, 4, 1 }, xData)),
+            ("len", I64(new[] { 1 }, 8)));
+        var attrs = new Dictionary<string, object> { ["axis"] = 1L };
+        new DftKernel().Execute(Node("DFT", new[] { "x", "len" }, new[] { "y" }, attrs), ctxAttr);
+        float[] expected = ctxAttr.Get("y").Span.ToArray();
+
+        var ctxInput = Ctx(
+            ("x", F(new[] { 1, 4, 1 }, xData)),
+            ("len", I64(new[] { 1 }, 8)),
+            ("axis", I64(Array.Empty<int>(), 1)));
+        new DftKernel().Execute(
+            Node("DFT", new[] { "x", "len", "axis" }, new[] { "y" }), ctxInput);
+        var y = ctxInput.Get("y");
+
+        Assert.Equal(new[] { 1, 8, 2 }, y.Shape.Dimensions.ToArray());
+        Close(expected, y.Span.ToArray());
+    }
+
     // ---- STFT ----------------------------------------------------------------------------------
 
     [Fact]

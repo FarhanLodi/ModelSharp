@@ -6,14 +6,19 @@ using ModelSharp.Tensors;
 namespace ModelSharp.Cpu.Kernels.Signal;
 
 /// <summary>
-/// ONNX <c>DFT</c> (opset 17). Computes the discrete Fourier transform along <c>axis</c>
-/// (attribute, default 1). The input's last dimension is the complex dimension: size 1 means a
-/// real signal, size 2 means complex (real, imag). The output's last dimension is always 2.
+/// ONNX <c>DFT</c> (opset 17 and opset 20). Computes the discrete Fourier transform along
+/// <c>axis</c>. The input's last dimension is the complex dimension: size 1 means a real signal,
+/// size 2 means complex (real, imag). The output's last dimension is always 2.
 ///
-/// Inputs: <c>input</c>, optional <c>dft_length</c> (scalar; truncates/zero-pads the axis).
-/// Attributes: <c>axis</c> (default 1), <c>inverse</c> (default 0), <c>onesided</c> (default 0).
-/// When <c>onesided</c> is set (forward only), only floor(N/2)+1 bins are returned along the axis.
-/// Forward exponent is <c>-2*pi*i*k*n/N</c>; inverse is <c>+2*pi*i*k*n/N</c> scaled by 1/N.
+/// Inputs: <c>input</c>; optional <c>dft_length</c> (input 1, scalar; truncates/zero-pads the axis);
+/// optional <c>axis</c> (input 2, int scalar — opset 20). In opset 17 <c>axis</c> was an attribute
+/// (default 1) instead; both forms are supported. The optional <c>dft_length</c> and <c>axis</c>
+/// inputs are disambiguated purely by position (index 1 vs 2), with an empty-string input name
+/// denoting an omitted optional.
+/// Attributes: <c>axis</c> (default 1, opset-17 form), <c>inverse</c> (default 0), <c>onesided</c>
+/// (default 0). When <c>onesided</c> is set (forward only), only floor(N/2)+1 bins are returned
+/// along the axis. Forward exponent is <c>-2*pi*i*k*n/N</c>; inverse is <c>+2*pi*i*k*n/N</c> scaled
+/// by 1/N. The transform uses an FFT fast path (see <see cref="DftCore"/>).
 /// </summary>
 public sealed class DftKernel : IKernel
 {
@@ -35,7 +40,16 @@ public sealed class DftKernel : IKernel
 
         bool inverse = Attr.Int(node, "inverse", 0) != 0;
         bool onesided = Attr.Int(node, "onesided", 0) != 0;
-        int axis = (int)Attr.Int(node, "axis", 1);
+
+        // axis: opset 20 moves it to optional input index 2 (an int scalar); opset 17 has it as an
+        // attribute (default 1). dft_length is input index 1. The two optional inputs are
+        // distinguished purely by position; an empty-string input name means the optional is
+        // omitted. If input 2 is present and non-empty, it wins over the attribute.
+        int axis;
+        if (node.Inputs.Count > 2 && !string.IsNullOrEmpty(node.Inputs[2]))
+            axis = (int)TensorInts.Read(ctx.GetTensor(node.Inputs[2]))[0];
+        else
+            axis = (int)Attr.Int(node, "axis", 1);
         if (axis < 0) axis += rank;
         // The complex (last) axis cannot be the transform axis.
         if (axis < 0 || axis >= rank - 1)

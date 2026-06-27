@@ -471,9 +471,10 @@ public class GgufDequantTests
     [Fact]
     public void UnsupportedType_Throws()
     {
-        Assert.False(GgufDequant.IsSupported(GgmlType.IQ4_NL));
+        // IQ2_XXS is a grid-codebook IQ family that ModelSharp intentionally does not approximate.
+        Assert.False(GgufDequant.IsSupported(GgmlType.IQ2_XXS));
         Assert.Throws<ModelSharpException>(
-            () => GgufDequant.Dequantize(new byte[18], GgmlType.IQ4_NL, 32));
+            () => GgufDequant.Dequantize(new byte[66], GgmlType.IQ2_XXS, 256));
     }
 
     [Fact]
