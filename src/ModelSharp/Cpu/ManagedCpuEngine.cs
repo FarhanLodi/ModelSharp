@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using ModelSharp.Graph;
 using ModelSharp.Cpu.Kernels;
+using ModelSharp.Cpu.Kernels.Sequence;
 using ModelSharp.Engine;
 using ModelSharp.Tensors;
 
@@ -46,26 +47,31 @@ public sealed class ManagedCpuEngine : IExecutionEngine
             env[input] = fed.Tensor;
         }
 
-        Dictionary<string, Tensor> outputs = ExecuteNodes(_graph, env);
+        // Top-level graph: tensor inputs/outputs only (the public contract). Sequence/optional
+        // values live solely on the intra-graph wire, so we read the tensor env for outputs.
+        ExecuteNodes(_graph, env);
 
         // Collect the requested outputs.
         var result = new Dictionary<string, NamedTensor>();
         foreach (string outName in _graph.Outputs)
-            result[outName] = new NamedTensor(outName, outputs[outName]);
+            result[outName] = new NamedTensor(outName, env[outName]);
         return result;
     }
 
     /// <summary>
-    /// Executes a graph's nodes against an already-seeded environment and returns that
-    /// environment (mutated in place). Shared by <see cref="Run"/> and the subgraph runner
-    /// so control-flow ops (If/Loop/Scan) re-enter the same dispatch loop. The
-    /// <see cref="GraphContext"/> is wired with a subgraph runner that, for each nested
-    /// subgraph, layers the subgraph's feeds over a snapshot of the outer environment so
-    /// captured outer-scope names resolve, then runs the subgraph's nodes in isolation.
+    /// Executes a graph's nodes against an already-seeded environment and returns the
+    /// <see cref="GraphContext"/> (whose tensor env is <paramref name="env"/>, mutated in place,
+    /// and whose sequence/optional map holds any non-tensor values produced). Shared by
+    /// <see cref="Run"/> and the subgraph runner so control-flow ops (If/Loop/Scan) re-enter the
+    /// same dispatch loop. <paramref name="seedSeqValues"/> seeds the captured outer-scope
+    /// sequence/optional values when entering a subgraph body (null for the top-level graph).
     /// </summary>
-    private Dictionary<string, Tensor> ExecuteNodes(ModelGraph graph, Dictionary<string, Tensor> env)
+    private GraphContext ExecuteNodes(
+        ModelGraph graph,
+        Dictionary<string, Tensor> env,
+        IReadOnlyDictionary<string, SeqValue>? seedSeqValues = null)
     {
-        var ctx = new GraphContext(env, RunSubgraph);
+        var ctx = new GraphContext(env, RunSubgraph, seedSeqValues);
 
         foreach (GraphNode node in graph.Nodes)
         {
@@ -74,19 +80,23 @@ public sealed class ManagedCpuEngine : IExecutionEngine
             kernel.Execute(node, ctx);
         }
 
-        return env;
+        return ctx;
     }
 
     /// <summary>
     /// Subgraph runner installed on every <see cref="GraphContext"/>. Builds a child
-    /// environment seeded with (1) the captured outer-scope values, (2) the subgraph's own
-    /// initializers, then (3) the per-iteration feeds (formal subgraph inputs) — feeds win
-    /// on name collisions. Executes the subgraph and returns its declared outputs by name.
+    /// environment seeded with (1) the captured outer-scope tensor values, (2) the subgraph's own
+    /// initializers, then (3) the per-iteration feeds (formal subgraph inputs) — feeds win on name
+    /// collisions. The captured outer-scope sequence/optional values (<paramref name="outerSeq"/>)
+    /// are seeded into the child context as well so a subgraph body can read an outer
+    /// <c>Sequence*</c>/<c>Optional*</c> value. Executes the subgraph and returns its declared
+    /// outputs split into tensor outputs and sequence/optional outputs.
     /// </summary>
-    private IReadOnlyDictionary<string, Tensor> RunSubgraph(
+    private GraphContext.SubgraphResult RunSubgraph(
         ModelGraph subgraph,
         IReadOnlyDictionary<string, Tensor> feeds,
-        IReadOnlyDictionary<string, Tensor> outerValues)
+        IReadOnlyDictionary<string, Tensor> outerValues,
+        IReadOnlyDictionary<string, SeqValue>? outerSeq)
     {
         var childEnv = new Dictionary<string, Tensor>(outerValues);
         foreach (KeyValuePair<string, Tensor> init in subgraph.Initializers)
@@ -94,18 +104,37 @@ public sealed class ManagedCpuEngine : IExecutionEngine
         foreach (KeyValuePair<string, Tensor> feed in feeds)
             childEnv[feed.Key] = feed.Value;
 
-        Dictionary<string, Tensor> result = ExecuteNodes(subgraph, childEnv);
+        GraphContext childCtx = ExecuteNodes(subgraph, childEnv, outerSeq);
+        IReadOnlyDictionary<string, SeqValue>? childSeq = childCtx.SeqValues;
 
-        var outputs = new Dictionary<string, Tensor>(subgraph.Outputs.Count);
+        var tensorOuts = new Dictionary<string, Tensor>(subgraph.Outputs.Count);
+        Dictionary<string, SeqValue>? seqOuts = null;
         foreach (string outName in subgraph.Outputs)
         {
-            if (!result.TryGetValue(outName, out Tensor? t))
+            // A declared output is either a tensor or a sequence/optional value. Resolve it from
+            // whichever map produced it; prefer the tensor binding (the common case).
+            if (childEnv.TryGetValue(outName, out Tensor? t))
+            {
+                tensorOuts[outName] = t;
+            }
+            else if (childSeq is not null && childSeq.TryGetValue(outName, out SeqValue? sv))
+            {
+                (seqOuts ??= new Dictionary<string, SeqValue>())[outName] = sv;
+            }
+            else
+            {
                 throw new ModelSharpException(
                     $"Subgraph did not produce declared output '{outName}'.");
-            outputs[outName] = t;
+            }
         }
-        return outputs;
+
+        return new GraphContext.SubgraphResult(
+            tensorOuts,
+            (IReadOnlyDictionary<string, SeqValue>?)seqOuts ?? EmptySeq);
     }
+
+    /// <summary>Shared empty sequence-output map for the (common) tensor-only subgraph case.</summary>
+    private static readonly Dictionary<string, SeqValue> EmptySeq = new();
 
     /// <inheritdoc />
     public void Dispose() { /* No unmanaged resources in Phase 1. */ }

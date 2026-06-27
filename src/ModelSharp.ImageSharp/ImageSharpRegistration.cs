@@ -1,4 +1,6 @@
+using System;
 using System.Runtime.CompilerServices;
+using ModelSharp.Cpu.Kernels;
 using ModelSharp.Manifest;
 using ModelSharp.Pipeline;
 
@@ -46,4 +48,17 @@ public static class ImageSharpRegistration
     /// invoke this before building a pipeline to force the registrations above to run.
     /// </summary>
     public static void Ensure() { }
+
+    /// <summary>
+    /// Registers the ImageSharp-backed CPU kernels (currently the ONNX <c>ImageDecoder</c>) onto a
+    /// <see cref="KernelRegistry"/>. The core <see cref="KernelRegistry.CreateDefault"/> stays free
+    /// of an image-codec dependency, so callers that need image-decoding ops call this on the
+    /// registry they hand to <c>ManagedCpuEngine</c> (last-registration-wins, like every other
+    /// kernel). Returns the same registry for fluent chaining.
+    /// </summary>
+    public static KernelRegistry RegisterKernels(KernelRegistry registry)
+    {
+        if (registry is null) throw new ArgumentNullException(nameof(registry));
+        return registry.Register(new ImageDecoderKernel());
+    }
 }
