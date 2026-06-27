@@ -44,7 +44,11 @@ namespace ModelSharp.Cpu.Kernels.Llm;
 /// <para><b>seqlens_k / total_sequence_length</b>: tolerated when present. The causal key
 /// bound per (batch, query) is min(pastSeq + qi, seqlens_k[b]); for the common batch-1
 /// prefill/decode case this matches the existing pastSeq+qi logic. <c>local_window_size</c>
-/// (sliding-window attention) is <b>not</b> implemented and is treated as disabled (−1).</para>
+/// (sliding-window attention), when ≥ 0, additionally bounds the key range <b>below</b>: a query
+/// at absolute position <c>qAbs = pastSeq + qi</c> attends only to keys in the inclusive window
+/// <c>[max(0, qAbs − local_window_size + 1), qAbs]</c> (the current key plus the
+/// <c>local_window_size − 1</c> preceding ones). −1 (default) disables the lower bound (full
+/// causal). Models: Mistral-7B v0.1/0.2, Phi-3-small.</para>
 /// </summary>
 public sealed class GroupQueryAttentionKernel : IKernel
 {
@@ -190,6 +194,13 @@ public sealed class GroupQueryAttentionKernel : IKernel
         float scaleAttr = Attr.Float(node, "scale", 0f);
         float scale = scaleAttr != 0f ? scaleAttr : 1f / MathF.Sqrt(headDim);
 
+        // local_window_size (sliding-window attention): when ≥ 0, query at absolute
+        // position qAbs = pastSeq + qi may attend only to key positions in the inclusive
+        // causal window [qAbs - local_window_size + 1, qAbs] — i.e. the current key plus the
+        // (local_window_size − 1) immediately preceding keys. Older keys are excluded from the
+        // softmax. −1 (default) disables the lower bound → full causal (range starts at 0).
+        int localWindow = (int)Attr.Int(node, "local_window_size", -1);
+
         ReadOnlySpan<float> kSpan = kBuf;
         ReadOnlySpan<float> vSpan = vBuf;
 
@@ -253,13 +264,17 @@ public sealed class GroupQueryAttentionKernel : IKernel
             // Causal: query position qi corresponds to absolute position pastSeq+qi,
             // so it may attend to key positions 0..pastSeq+qi inclusive, further
             // capped by the last valid key (seqlens_k) for this batch.
-            int kLimit = pastSeq + qi;
+            int qAbs = pastSeq + qi;
+            int kLimit = qAbs;
             if (kLimit > seqBound) kLimit = seqBound;
+            // Sliding window: drop keys older than the window's lower bound. With localWindow
+            // disabled (−1) kStart stays 0 → full causal range, identical to before.
+            int kStart = localWindow >= 0 ? Math.Max(0, qAbs - localWindow + 1) : 0;
 
             int kvBase = (b * kvNumHeads + g) * totalSeq * headDim;
 
             float mx = float.NegativeInfinity;
-            for (int kj = 0; kj <= kLimit; kj++)
+            for (int kj = kStart; kj <= kLimit; kj++)
             {
                 float sc = KernelSimd.Dot(qArr, qRow, pkArr, kvBase + kj * headDim, headDim) * scale;
                 scores[kj] = sc;
@@ -267,12 +282,12 @@ public sealed class GroupQueryAttentionKernel : IKernel
             }
 
             float sum = 0f;
-            for (int kj = 0; kj <= kLimit; kj++) { float e = MathF.Exp(scores[kj] - mx); scores[kj] = e; sum += e; }
+            for (int kj = kStart; kj <= kLimit; kj++) { float e = MathF.Exp(scores[kj] - mx); scores[kj] = e; sum += e; }
             float inv = sum > 0f ? 1f / sum : 0f;
 
             int outRow = (b * qSeq + qi) * qHid + h * headDim;
             System.Array.Clear(outArr, outRow, headDim);
-            for (int kj = 0; kj <= kLimit; kj++)
+            for (int kj = kStart; kj <= kLimit; kj++)
                 KernelSimd.AxpyInto(outArr, outRow, pvArr, kvBase + kj * headDim, scores[kj] * inv, headDim);
         }
 
