@@ -15,15 +15,33 @@ namespace ModelSharp.Weights;
 /// </para>
 /// <para><b>Supported types</b>: the QK=32 legacy quants <see cref="GgmlType.Q4_0"/>,
 /// <see cref="GgmlType.Q4_1"/>, <see cref="GgmlType.Q5_0"/>, <see cref="GgmlType.Q5_1"/>,
-/// <see cref="GgmlType.Q8_0"/>, <see cref="GgmlType.Q8_1"/>; and the QK_K=256 k-quants
+/// <see cref="GgmlType.Q8_0"/>, <see cref="GgmlType.Q8_1"/>; the QK_K=256 k-quants
 /// <see cref="GgmlType.Q2_K"/>, <see cref="GgmlType.Q3_K"/>, <see cref="GgmlType.Q4_K"/>,
-/// <see cref="GgmlType.Q5_K"/>, <see cref="GgmlType.Q6_K"/>, <see cref="GgmlType.Q8_K"/>. The
-/// importance-matrix "IQ" families and any unrecognized type throw.</para>
+/// <see cref="GgmlType.Q5_K"/>, <see cref="GgmlType.Q6_K"/>, <see cref="GgmlType.Q8_K"/>; and the
+/// non-linear-codebook importance-matrix quants <see cref="GgmlType.IQ4_NL"/> and
+/// <see cref="GgmlType.IQ4_XS"/>, whose 16-entry codebook (<see cref="KValuesIq4Nl"/>) is exact.</para>
+/// <para>
+/// The remaining "IQ" families (<see cref="GgmlType.IQ2_XXS"/>, <see cref="GgmlType.IQ2_XS"/>,
+/// <see cref="GgmlType.IQ2_S"/>, <see cref="GgmlType.IQ3_XXS"/>, <see cref="GgmlType.IQ3_S"/>,
+/// <see cref="GgmlType.IQ1_S"/>, <see cref="GgmlType.IQ1_M"/>) encode each group as an index into a
+/// large published lattice/grid constant table rather than an affine scale. Those grids are not
+/// transcribed here, so those types — and any unrecognized type — throw rather than silently
+/// emitting wrong output.</para>
 /// </summary>
 public static class GgufDequant
 {
     /// <summary>Elements per super-block for the k-quant family.</summary>
     private const int QkK = 256;
+
+    /// <summary>
+    /// The 16-entry non-linear codebook shared by IQ4_NL and IQ4_XS (the reference
+    /// <c>kvalues_iq4nl</c> in <c>ggml-quants.c</c>). A 4-bit code indexes directly into this table;
+    /// the dequantized value is <c>scale · KValuesIq4Nl[code]</c>.
+    /// </summary>
+    public static ReadOnlySpan<sbyte> KValuesIq4Nl => new sbyte[]
+    {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    };
 
     /// <summary>
     /// Returns <c>true</c> if <see cref="Dequantize"/> can reconstruct the given quantized type.
@@ -34,7 +52,8 @@ public static class GgufDequant
         GgmlType.Q4_0 or GgmlType.Q4_1 or GgmlType.Q5_0 or GgmlType.Q5_1 or
         GgmlType.Q8_0 or GgmlType.Q8_1 or
         GgmlType.Q2_K or GgmlType.Q3_K or GgmlType.Q4_K or GgmlType.Q5_K or
-        GgmlType.Q6_K or GgmlType.Q8_K => true,
+        GgmlType.Q6_K or GgmlType.Q8_K or
+        GgmlType.IQ4_NL or GgmlType.IQ4_XS => true,
         _ => false,
     };
 
@@ -54,7 +73,10 @@ public static class GgufDequant
         if (!IsSupported(type))
             throw new ModelSharpException(
                 $"ggml type {type} is not a dequantizable block type supported by ModelSharp. " +
-                "Supported: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K.");
+                "Supported: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, " +
+                "Q8_K, IQ4_NL, IQ4_XS. The grid-codebook IQ families (IQ2_XXS, IQ2_XS, IQ2_S, " +
+                "IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) are not yet implemented and are intentionally not " +
+                "approximated.");
 
         int block = GgmlTypeInfo.BlockSize(type);
         int typeSize = GgmlTypeInfo.TypeSize(type);
@@ -87,6 +109,8 @@ public static class GgufDequant
             case GgmlType.Q5_K: DequantizeQ5_K(raw, output, nBlocks); break;
             case GgmlType.Q6_K: DequantizeQ6_K(raw, output, nBlocks); break;
             case GgmlType.Q8_K: DequantizeQ8_K(raw, output, nBlocks); break;
+            case GgmlType.IQ4_NL: DequantizeIq4Nl(raw, output, nBlocks); break;
+            case GgmlType.IQ4_XS: DequantizeIq4Xs(raw, output, nBlocks); break;
             default:
                 throw new ModelSharpException($"Unhandled ggml type {type}.");
         }
@@ -505,6 +529,71 @@ public static class GgufDequant
             int outBase = b * QkK;
             for (int j = 0; j < QkK; j++)
                 output[outBase + j] = d * unchecked((sbyte)raw[o + 4 + j]);
+        }
+    }
+
+    // =====================================================================================
+    // Non-linear-codebook IQ quants (IQ4_NL, IQ4_XS)
+    // =====================================================================================
+
+    /// <summary>
+    /// IQ4_NL block (18 bytes, QK=32): fp16 scale <c>d</c> then 16 bytes holding 32 4-bit codes. As in
+    /// Q4_0 the codes are split low-half/high-half — code <c>j</c> (j&lt;16) is the low nibble of byte
+    /// <c>j</c> and code <c>j+16</c> is the high nibble. Each 4-bit code indexes the non-linear
+    /// codebook: value = <c>d · KValuesIq4Nl[code]</c>. Mirrors <c>dequantize_row_iq4_nl</c>.
+    /// </summary>
+    private static void DequantizeIq4Nl(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        const int qk = 32;
+        ReadOnlySpan<sbyte> kv = KValuesIq4Nl;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 18;
+            float d = DecodeHalf(raw, o);
+            ReadOnlySpan<byte> qs = raw.Slice(o + 2, 16);
+            int outBase = b * qk;
+            for (int j = 0; j < qk / 2; j++)
+            {
+                output[outBase + j] = d * kv[qs[j] & 0x0F];
+                output[outBase + j + qk / 2] = d * kv[qs[j] >> 4];
+            }
+        }
+    }
+
+    /// <summary>
+    /// IQ4_XS super-block (136 bytes, QK_K=256): fp16 <c>d</c>, a 16-bit <c>scales_h</c>, 4 bytes
+    /// <c>scales_l</c>, then 128 bytes holding 256 4-bit codes. The 256 elements split into 8 sub-blocks
+    /// of 32. Sub-block <c>ib</c> reconstructs a 6-bit scale from <c>scales_l[ib/2]</c> (nibble selected
+    /// by <c>ib%2</c>, low 4 bits) and <c>scales_h</c> (2 bits at position <c>2·ib</c>, the high 2 bits);
+    /// the signed scale is <c>(ls − 32)</c> and the sub-block delta is <c>dl = d · (ls − 32)</c>. Within
+    /// a sub-block the 16 <c>qs</c> bytes split low-half/high-half exactly as IQ4_NL: value =
+    /// <c>dl · KValuesIq4Nl[code]</c>. Mirrors <c>dequantize_row_iq4_xs</c>.
+    /// </summary>
+    private static void DequantizeIq4Xs(ReadOnlySpan<byte> raw, Span<float> output, int nBlocks)
+    {
+        ReadOnlySpan<sbyte> kv = KValuesIq4Nl;
+        for (int b = 0; b < nBlocks; b++)
+        {
+            int o = b * 136;
+            float d = DecodeHalf(raw, o);
+            int scalesH = raw[o + 2] | (raw[o + 3] << 8);
+            ReadOnlySpan<byte> scalesL = raw.Slice(o + 4, 4);
+            ReadOnlySpan<byte> qs = raw.Slice(o + 8, 128);
+
+            int outIdx = b * QkK;
+            int qsBase = 0;
+            for (int ib = 0; ib < QkK / 32; ib++)
+            {
+                int ls = ((scalesL[ib / 2] >> (4 * (ib % 2))) & 0x0F) | (((scalesH >> (2 * ib)) & 3) << 4);
+                float dl = d * (ls - 32);
+                for (int j = 0; j < 16; j++)
+                {
+                    output[outIdx + j] = dl * kv[qs[qsBase + j] & 0x0F];
+                    output[outIdx + j + 16] = dl * kv[qs[qsBase + j] >> 4];
+                }
+                outIdx += 32;
+                qsBase += 16;
+            }
         }
     }
 

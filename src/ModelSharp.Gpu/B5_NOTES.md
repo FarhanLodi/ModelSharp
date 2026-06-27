@@ -95,15 +95,107 @@ The stateful decode seam is `IlgpuEngine.DecodeStepAttention(cache, stepQ, stepK
 This does **not** disturb the existing stateless `IExecutionEngine.Run` contract — it is an additional
 public surface on the engine.
 
+## B5 completion pass — full decoder layer through the cache seam + seq-0 fix + whole-graph e2e
+
+This pass closes the two gaps the previous "honest list" called out.
+
+### 1. seq-0 / zero-length device buffers (whole-graph blocker) — FIXED
+
+Driving the WHOLE distilgpt2 graph through `Run` failed at prefill because the empty `past_key_values.*`
+float inputs are shape `[1, heads, 0, head_dim]` → **0 elements**, and `ILGPU.Allocate1D(emptyArray)`
+yields a 0-length buffer whose `View`/`SubView`/`CopyTo` fault on later use (Concat with the new K, then
+MatMul). The fix:
+
+- A single allocation chokepoint, `AllocFloat(long len)`, allocates `max(len,1)` so a length-0 float tensor
+  is backed by a **sentinel 1-element buffer** while the carried `TensorShape` still records length 0. This
+  extends the over-allocate/trim convention `DeviceValue.ToHost` already documented to *every* float output.
+- `Load` represents an empty float input via that sentinel (no `Allocate1D(emptyArray)`).
+- Every device kernel launch is **guarded on the real length** (`if (n > 0) …`) — added to the binary
+  fast/broadcast paths, unary, LeakyRelu, Transpose/Transpose2D, Softmax, Reduce (incl. identity copy),
+  LayerNorm, MatMul, Gemm (all three internal passes) — so a 0-element op writes nothing and the empty past
+  contributes nothing to Concat/Gather/MatMul (a contraction over an empty past sums to 0, the ONNX-correct
+  result). The Gather/Slice/Expand/Split/Pow/Where paths already used the `n==0?1:n` + `if (n>0)` idiom.
+- `RunConcat`'s float re-upload now routes through `Load` (so an empty concat result is sentinel-backed too).
+
+Proven by `GpuWholeGraphTests.Cuda_EmptyPast_Concat_Then_MatMul_Matches_Cpu`: an empty `past` `[H,0,D]` is
+loaded, Concat'd with this step's K along the sequence axis, transposed and MatMul'd into attention scores —
+no crash — and matches the CPU engine; the same graph then runs with a non-empty past to confirm the decode
+(append) path keeps matching.
+
+### 2. A full GPT-2-style decoder layer composed through the on-device cache — DONE
+
+`IlgpuEngine.DecodeLayerStep(GpuKvCache cache, Tensor<float> hidden, DecoderLayerWeights w)` runs ONE whole
+pre-LayerNorm decoder layer entirely on the GPU, threaded through the persistent cache. It chains, all on
+device, reusing the existing kernels:
+
+1. `ln1 = LayerNorm(hidden)` (LayerNorm kernel);
+2. fused QKV projection `ln1·Wqkv + bqkv` (MatMul + broadcast-Add) → split columns into per-head Q/K/V
+   `[H,S,D]` (Gather kernel with host-precomputed offsets);
+3. append K/V into the persistent `GpuKvCache` (device→device `SubView.CopyTo`, no realloc/host round-trip)
+   and scaled-dot-product attention over the **entire cached prefix** per head
+   (Transpose → MatMul → scale → Softmax → MatMul) — K/V stay on-device across steps;
+4. output projection `ctx·Wo + bo` and the **attention residual** add;
+5. `ln2 = LayerNorm(h2)`, the two-matmul **GELU MLP** (`fc·Wfc+b` → Gelu kernel → `·Wproj+b`), and the
+   **MLP residual** add.
+
+Only the final hidden state `[S,E]` is downloaded. `DecoderLayerWeights` carries the conventional HF/GPT-2
+Conv1D `[in,out]` weight layout. Validated by `GpuDecoderLayerTests.Cuda_DecodeLayerStep_MultiStep_Matches_Cpu`
+against a hand-written CPU reference (using the engine's own A&S-Erf GELU) over 4 decode steps to 1e-3; step 0
+exercises the seq-0 empty-cache path.
+
+### 3. Whole-graph distilgpt2 GPU decode e2e — NOW REQUIRED, NO FALLBACK
+
+The full distilgpt2 ONNX graph (1569 nodes) now executes **end-to-end through `IlgpuEngine.Run` with no
+fallback**, matching `ManagedCpuEngine` logits/argmax. Two op handlers were generalized to route the int/bool
+shape subgraph host-side (the previous blocker was an op handler calling `FloatBuf` on a host-side Int64
+tensor):
+
+- **`Gather`** — added an integer/bool *data* path. Gathering elements out of a host int tensor (e.g. selecting
+  dims from a `Shape` vector, or token ids) now stays host-side via `HostGatherFlat`, mirroring the float
+  device-gather offset math; only float `data` touches the device. (Previously `Gather` assumed float `data`
+  and threw on `/transformer/Shape_output_0` — the exact reported blocker.)
+- **`Add`/`Sub`/`Mul`/`Div`** (`RunBinary`) — added a host-side integer path (`RunBinaryHost`/`BinaryHost<T>`)
+  for shape/index arithmetic where both operands are int64/int32. It mirrors the CPU `BroadcastBinaryKernel`
+  exactly (NumPy broadcasting, **integer truncating division**) and preserves the int dtype so a downstream
+  Gather/Slice/Reshape still receives integers. Float operands keep the on-device fast/broadcast path unchanged.
+
+Every other op in distilgpt2's prologue was *already* dtype-routed correctly (Reshape/Unsqueeze/Squeeze via
+`Reshaped`, Concat/Slice/Expand/Split/Where with explicit host int branches, Cast bridging int-host↔float-device,
+and the six integer/mask prologue ops Range/ConstantOfShape/Equal/Greater/Trilu/ScatterND host-side). With the
+two fixes above the **whole graph clears**.
+
+`GpuWholeGraphTests.Cuda_DistilGpt2_WholeGraph_Logits_Match_Cpu` is asset-gated (discovers `distilgpt2.onnx`
+via `MODELSHARP_MODELS_DIR` → repo-relative `models/` → `/home/x16/models`) and CUDA-gated; it skips cleanly
+when either is absent. When the model **is** present the whole-graph `Run` is **REQUIRED** — any exception is a
+hard failure (the report-and-skip fallback was removed) and so is a numeric mismatch. It runs the full ONNX
+graph through `IlgpuEngine.Run` with empty (seq-0) `past_key_values.*` float feeds and asserts last-position
+**logits parity** (max|Δ| < 5e-2; observed **1.8e-4** on an RTX 4090) and an exact **greedy argmax** match vs
+`ManagedCpuEngine` for two decode steps (step 0 argmax 274, step 1 argmax 389 — both agree).
+
+`GpuWholeGraphTests.DistilGpt2_WholeGraph_CpuRouting_Matches_Cpu` is the CUDA-independent companion: it drives
+the same whole graph through `IlgpuEngine.Run` on ILGPU's **CPU** accelerator (`preferCpu: true`). The int/float
+routing is device-agnostic, so this proves the whole graph clears end-to-end and matches `ManagedCpuEngine`
+**bit-for-bit (max|Δ| = 0.0)** even on machines with no GPU.
+
 ## Honest list of what still falls back / is not covered
 
 - The 6 integer/mask prologue ops (`Range`/`ConstantOfShape`/`Equal`/`Greater`/`Trilu`/`ScatterND`) are
-  now dispatched by the engine, but **host-side** — they run on the CPU-resident int/bool tensors (no GPU
-  kernel), consistent with the engine's design where int/bool tensors always live on the host. This makes
-  the whole graph GPU-dispatchable without forcing a CPU fallback; the float compute path is unaffected.
-- `DecodeStepAttention` is a single self-attention block, not the whole decoder layer stack (no
-  projections/MLP/residual wired into the seam) — those ops exist individually on the GPU but are not
-  composed into the cache path here.
-- The cache currently downloads the per-step context to host at the end of each step (the typical
-  consumer wants the token's hidden state on host for the next op); the K/V themselves never leave the
-  device.
+  dispatched **host-side** — they run on the CPU-resident int/bool tensors (no GPU kernel), consistent with
+  the engine's design where int/bool tensors always live on the host. This keeps the whole graph
+  GPU-dispatchable without a CPU fallback; the float compute path is unaffected.
+- `DecodeStepAttention` (the original bare self-attention seam) is retained but **superseded** by
+  `DecodeLayerStep` for the full-layer path. It downloads the per-step context to host at the end of each
+  step; `DecodeLayerStep` instead keeps the whole layer on-device and downloads only the final hidden state.
+- `DecodeLayerStep` covers a single decoder layer; a multi-layer stack is the caller's loop (feed layer *i*'s
+  output hidden state as layer *i+1*'s input, one `GpuKvCache` per layer). It assumes the GPT-2 pre-LN layout
+  (fused `c_attn` QKV, MLP = `c_fc`→GELU→`c_proj`) and a single batch row of `[stepLen, embed]`. This stateful
+  cache seam is now an *alternative* to — not a prerequisite for — running the whole graph: the stateless
+  `IlgpuEngine.Run` drives the entire distilgpt2 ONNX graph end-to-end on its own (see #3 above).
+- **Nothing in distilgpt2 falls back any longer.** The whole graph executes end-to-end through the stateless
+  `IlgpuEngine.Run` on real CUDA hardware, matching `ManagedCpuEngine` (verified — see #3). The only host-side
+  computation is the integer/bool shape & mask subgraph (Shape/Range/ConstantOfShape/Equal/Greater/Trilu/
+  ScatterND, plus int Gather/Concat/Slice/Reshape/Unsqueeze/Squeeze/Expand/Split/Where/Cast and int
+  Add/Sub/Mul/Div index math). That is **by design**, not a fallback: int/bool tensors always live host-side in
+  this engine (ILGPU's portable backends have no native int64, and these tensors feed pure index math), the
+  float matmul/attention/MLP path runs entirely on the device, and `Cast` is the only host↔device seam. There is
+  no CPU-engine fallback and no unsupported op.

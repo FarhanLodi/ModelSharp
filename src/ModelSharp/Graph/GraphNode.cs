@@ -20,7 +20,9 @@ public sealed class GraphNode
     /// <summary>
     /// Operator attributes keyed by name. Values are boxed as: <c>long</c> (INT),
     /// <c>float</c> (FLOAT), <c>string</c> (STRING), <c>long[]</c> (INTS),
-    /// <c>float[]</c> (FLOATS), or <c>Tensor</c> (TENSOR; the dtype-carrying base).
+    /// <c>float[]</c> (FLOATS), <c>Tensor</c> (TENSOR; the dtype-carrying base),
+    /// or <see cref="ModelGraph"/> (GRAPH; a nested subgraph used by control-flow
+    /// ops such as <c>If</c>/<c>Loop</c>/<c>Scan</c>).
     /// </summary>
     public IReadOnlyDictionary<string, object> Attributes { get; }
 

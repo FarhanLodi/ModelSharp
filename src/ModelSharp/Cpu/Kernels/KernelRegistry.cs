@@ -162,7 +162,8 @@ public sealed class KernelRegistry
         .AddDataMovementOps()       // OneHot/EyeLike/Compress/DepthToSpace/SpaceToDepth/ReverseSequence
         .AddMiscMathOps()           // Mod/BitShift/RandomNormal/RandomUniform(+Like)
         .AddPoolingExtraOps()       // GlobalMaxPool/LpPool/GlobalLpPool/Hardmax/MaxUnpool
-        .AddExtraOps();             // Bitwise{And,Or,Xor,Not}/{Hann,Hamming,Blackman}Window/Einsum/Det/
+        .AddExtraOps()              // Bitwise{And,Or,Xor,Not}/{Hann,Hamming,Blackman}Window/Einsum/Det/
                                     // Unique/CenterCropPad/Dropout/ConvTranspose/GridSample/MaxRoiPool/
                                     // Col2Im/Upsample/NonMaxSuppression/Bernoulli/Multinomial
+        .AddControlFlowOps();       // If/Loop/Scan (subgraph execution via the GraphContext runner hook)
 }

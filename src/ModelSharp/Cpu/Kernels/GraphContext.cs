@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
 namespace ModelSharp.Cpu.Kernels;
@@ -8,7 +10,31 @@ public sealed class GraphContext
 {
     private readonly Dictionary<string, Tensor> _values;
 
-    public GraphContext(Dictionary<string, Tensor> values) => _values = values;
+    /// <summary>
+    /// Hook that executes a nested ONNX subgraph (the value of a GRAPH attribute on a
+    /// control-flow node) and returns its outputs by graph-output name. Control-flow
+    /// kernels (<c>If</c>/<c>Loop</c>/<c>Scan</c>) invoke this via
+    /// <see cref="RunSubgraph(ModelGraph, IReadOnlyDictionary{string, Tensor})"/>.
+    /// The runner seeds a child environment with the current outer-scope values (so
+    /// subgraph nodes can capture outer names) plus the supplied per-iteration feeds.
+    /// Null when no engine installed a runner (e.g. a bare context built in a unit test);
+    /// in that case control-flow ops throw a clear error.
+    /// </summary>
+    private readonly Func<ModelGraph, IReadOnlyDictionary<string, Tensor>, IReadOnlyDictionary<string, Tensor>, IReadOnlyDictionary<string, Tensor>>? _subgraphRunner;
+
+    /// <summary>Snapshot of every name currently visible (initializers, feeds, and produced
+    /// intermediates) — the outer scope a subgraph captures from.</summary>
+    internal IReadOnlyDictionary<string, Tensor> Values => _values;
+
+    public GraphContext(Dictionary<string, Tensor> values) : this(values, null) { }
+
+    internal GraphContext(
+        Dictionary<string, Tensor> values,
+        Func<ModelGraph, IReadOnlyDictionary<string, Tensor>, IReadOnlyDictionary<string, Tensor>, IReadOnlyDictionary<string, Tensor>>? subgraphRunner)
+    {
+        _values = values;
+        _subgraphRunner = subgraphRunner;
+    }
 
     /// <summary>
     /// Reads a tensor by name as float32, throwing if it hasn't been produced yet
@@ -26,6 +52,26 @@ public sealed class GraphContext
             ? t
             : throw new KeyNotFoundException($"Tensor '{name}' is not available in the execution context.");
 
+    /// <summary>True if a tensor with the given (non-empty) name is bound in this scope.</summary>
+    public bool Has(string name) => name.Length != 0 && _values.ContainsKey(name);
+
     /// <summary>Writes a tensor by name (any dtype; <c>Tensor&lt;float&gt;</c> upcasts implicitly).</summary>
     public void Set(string name, Tensor value) => _values[name] = value;
+
+    /// <summary>
+    /// Executes a nested subgraph with outer-scope capture and returns its outputs keyed
+    /// by the subgraph's declared output names. <paramref name="feeds"/> supplies the
+    /// subgraph's own formal inputs (e.g. a Loop body's iteration count and carried values);
+    /// the current outer scope is captured automatically so subgraph nodes can reference
+    /// outer tensor names. Throws if no engine installed a subgraph runner.
+    /// </summary>
+    public IReadOnlyDictionary<string, Tensor> RunSubgraph(
+        ModelGraph subgraph, IReadOnlyDictionary<string, Tensor> feeds)
+    {
+        if (_subgraphRunner is null)
+            throw new ModelSharpException(
+                "This GraphContext has no subgraph runner; control-flow ops (If/Loop/Scan) "
+                + "require execution through ManagedCpuEngine.");
+        return _subgraphRunner(subgraph, feeds, _values);
+    }
 }
