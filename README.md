@@ -38,7 +38,7 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
 - 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types (token ids, masks, and shape tensors included).
-- 🧠 **46 ONNX operators** out of the box — CNNs, transformers, and RNNs (LSTM/GRU) included.
+- 🧠 **166 ONNX operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), and signal ops (DFT/STFT/MelWeightMatrix) included.
 - 🔤 **Built-in tokenizers** — WordPiece (BERT) and byte-level BPE (GPT-2 / RoBERTa), pure managed.
 - 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam).
 - 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
@@ -58,7 +58,7 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
 | GPU LLM path | distilgpt2 on CUDA | **98.7% of nodes GPU-dispatchable**; a self-attention block and a multi-step decode run entirely on GPU via an **on-device KV-cache** (~1.3 ms/step) |
 
-The full test suite is **514 passing (0 failed)** and op coverage is **163 of ~190** standard ONNX ops. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **549 passing (0 failed)** and op coverage is **166 of ~190** standard ONNX ops. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 
@@ -194,7 +194,7 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 
 ## Capabilities
 
-### Operator coverage (46)
+### Operator coverage (166)
 
 - **Arithmetic** (broadcasting): Add, Sub, Mul, Div, Pow
 - **Activations**: Relu, Sigmoid, Tanh, Exp, Log, Sqrt, Abs, Neg, Erf, Gelu, Identity, LeakyRelu, Clip, Softmax
@@ -203,9 +203,10 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 - **Linear**: MatMul (n-D batched, NumPy semantics), Gemm
 - **Reduction**: ReduceMean (axes, keepdims)
 - **Logical** (bool out, broadcasting): Where, Equal, Less, Greater
-- **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand
+- **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand, Trilu, ScatterND, Range
+- **Signal**: DFT, STFT, MelWeightMatrix (opset-17 audio front-end ops)
 
-> Additional kernels (extra activations, math, reductions, Split/Pad/Tile, TopK, …) are implemented in the kernel library and being wired into the registry as they're verified.
+> The list above is a representative sample; the registry now covers **166 of ~190** standard ops (plus contrib/fused LLM ops). Additional kernels are wired in as they're verified.
 
 ### Text
 

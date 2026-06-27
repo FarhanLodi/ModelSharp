@@ -3,8 +3,9 @@ namespace ModelSharp.Cpu.Kernels;
 /// <summary>
 /// Registers the "extra ops" batch that raises standard ONNX coverage: bitwise logic, the cosine
 /// window generators, Einsum / Det, Unique / CenterCropPad / Col2Im, ConvTranspose / GridSample /
-/// MaxRoiPool / Upsample, NonMaxSuppression, and the Bernoulli / Multinomial samplers. Each owns its
-/// own kernel file; this method keeps <see cref="KernelRegistry.CreateDefault"/> tidy.
+/// MaxRoiPool / Upsample, NonMaxSuppression, the Bernoulli / Multinomial samplers, and the
+/// signal-processing family (DFT / STFT / MelWeightMatrix). Each owns its own kernel file; this
+/// method keeps <see cref="KernelRegistry.CreateDefault"/> tidy.
 /// </summary>
 public static class ExtraOpsRegistrations
 {
@@ -35,5 +36,9 @@ public static class ExtraOpsRegistrations
         .Register(new ModelSharp.Cpu.Kernels.Nn.NonMaxSuppressionKernel())
         // Samplers
         .Register(new ModelSharp.Cpu.Kernels.Generators.BernoulliKernel())
-        .Register(new ModelSharp.Cpu.Kernels.Generators.MultinomialKernel());
+        .Register(new ModelSharp.Cpu.Kernels.Generators.MultinomialKernel())
+        // Signal processing (opset 17)
+        .Register(new ModelSharp.Cpu.Kernels.Signal.DftKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Signal.StftKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Signal.MelWeightMatrixKernel());
 }
