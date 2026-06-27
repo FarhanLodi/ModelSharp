@@ -96,6 +96,10 @@ public sealed class IlgpuEngine : IExecutionEngine
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         ArrayView<float>, ConvParams> _conv;
 
+    // Native integer GEMM for MatMulInteger (int32 operands/result, int32 zero-point buffers).
+    private readonly Action<Index1D, ArrayView<int>, ArrayView<int>, ArrayView<int>,
+        ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>, int, int, int, int, int> _matmulInteger;
+
     // B5 decoder ops: broadcasting Pow and Where (the latter with a float-encoded condition).
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         ArrayView<int>, ArrayView<int>, ArrayView<int>, int> _pow;
@@ -160,6 +164,8 @@ public sealed class IlgpuEngine : IExecutionEngine
             ArrayView<int>, ArrayView<int>, int, int, int>(GpuKernels.MatMulK);
         _conv = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             ArrayView<float>, ConvParams>(GpuKernels.Conv2DK);
+        _matmulInteger = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<int>, ArrayView<int>, ArrayView<int>,
+            ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>, int, int, int, int, int>(GpuKernels.MatMulIntegerK);
 
         _pow = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             ArrayView<int>, ArrayView<int>, ArrayView<int>, int>(GpuKernels.PowK);
@@ -249,6 +255,7 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Slice": RunSlice(node, values, temps); break;
                     case "Cast": RunCast(node, values); break;
                     case "MatMul": RunMatMul(node, values, temps); break;
+                    case "MatMulInteger": RunMatMulInteger(node, values, temps); break;
                     case "Gemm": RunGemm(node, values, temps); break;
                     case "Conv": RunConv(node, values, temps); break;
                     case "Erf": RunUnary(_erf, node, values); break;
@@ -1314,6 +1321,153 @@ public sealed class IlgpuEngine : IExecutionEngine
         // runs (total>0) and its inner k-loop executes zero times, so every output element is written as 0.
         if (total > 0) _matmul(total, a.View, b.View, y.View, vAOff, vBOff, M, K, N);
         values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(outDims.ToArray()));
+    }
+
+    /// <summary>
+    /// ONNX <c>MatMulInteger</c>: native on-device integer GEMM <c>Y = (A - a_zp) @ (B - b_zp)</c> with int32
+    /// accumulation. The uint8/int8 operands (and any zero points) arrive host-side as integer tensors; they are
+    /// widened to int32 and uploaded to the device, the int32 GEMM runs in <see cref="GpuKernels.MatMulIntegerK"/>
+    /// (one thread per output element, NumPy-broadcast batch like <see cref="RunMatMul"/>), and the int32 result is
+    /// downloaded to a host <see cref="Tensor{Int32}"/> — exactly the dtype/home the CPU fallback produced, so the
+    /// downstream Cast(int32→float)/dequant chain consumes it unchanged. Zero points may be absent, per-tensor
+    /// (scalar), per-row of A (length M) or per-column of B (length N), matching the CPU
+    /// <c>MatMulIntegerKernel</c> exactly. This replaces the previous CPU-fallback path: the GEMM hot-spot now runs
+    /// on the accelerator instead of the host (double-precision) kernel.
+    /// </summary>
+    private void RunMatMulInteger(
+        GraphNode node,
+        Dictionary<string, DeviceValue> values,
+        List<MemoryBuffer> temps)
+    {
+        Tensor aT = values[node.Inputs[0]].ToHost();
+        Tensor bT = values[node.Inputs[1]].ToHost();
+
+        int[] a = ReadQuantAsInts(aT);
+        int[] b = ReadQuantAsInts(bT);
+
+        int[] adims = aT.Shape.Dimensions.ToArray();
+        int[] bdims = bT.Shape.Dimensions.ToArray();
+        if (adims.Length < 2 || bdims.Length < 2)
+            throw new ModelSharpException("MatMulInteger requires inputs of rank >= 2.");
+
+        int M = adims[^2], K = adims[^1];
+        int Kb = bdims[^2], N = bdims[^1];
+        if (K != Kb) throw new ModelSharpException($"MatMulInteger inner dimensions disagree: {K} vs {Kb}.");
+
+        int[] aBatch = adims[..^2];
+        int[] bBatch = bdims[..^2];
+        int[] outBatch = BroadcastShape(aBatch, bBatch);
+        int batchRank = outBatch.Length;
+        int[] aBS = BroadcastStrides(aBatch, batchRank);   // strides in matrix units
+        int[] bBS = BroadcastStrides(bBatch, batchRank);
+
+        int aMat = M * K, bMat = K * N, oMat = M * N;
+        int totalBatch = 1;
+        foreach (int d in outBatch) totalBatch *= d;
+
+        // Per-batch operand base offsets (element units), identical to the float MatMul.
+        var aOffArr = new int[totalBatch];
+        var bOffArr = new int[totalBatch];
+        var coord = new int[batchRank];
+        int aOff = 0, bOff = 0;
+        for (int bi = 0; bi < totalBatch; bi++)
+        {
+            aOffArr[bi] = aOff * aMat;
+            bOffArr[bi] = bOff * bMat;
+            for (int ax = batchRank - 1; ax >= 0; ax--)
+            {
+                coord[ax]++;
+                aOff += aBS[ax];
+                bOff += bBS[ax];
+                if (coord[ax] < outBatch[ax]) break;
+                coord[ax] = 0;
+                aOff -= aBS[ax] * outBatch[ax];
+                bOff -= bBS[ax] * outBatch[ax];
+            }
+        }
+
+        // Zero points: absent → 0 (per-tensor, stride 0); per-tensor scalar (stride 0); per-row A (length M,
+        // stride 1) / per-column B (length N, stride 1). The kernel indexes aZp[m*aZpStride] / bZp[n*bZpStride],
+        // so a stride of 0 makes every thread read the single scalar (matching the CPU kernel's selection).
+        int[] aZp = ReadZeroPoint(node, values, 2);
+        int[] bZp = ReadZeroPoint(node, values, 3);
+        int aZpStride = aZp.Length == M && M != 1 ? 1 : 0;
+        int bZpStride = bZp.Length == N && N != 1 ? 1 : 0;
+        // Buffers must be non-empty and large enough for the largest index the kernel can form.
+        int[] aZpBuf = aZpStride == 1 ? aZp : new[] { aZp.Length > 0 ? aZp[0] : 0 };
+        int[] bZpBuf = bZpStride == 1 ? bZp : new[] { bZp.Length > 0 ? bZp[0] : 0 };
+
+        var outDims = new int[batchRank + 2];
+        Array.Copy(outBatch, outDims, batchRank);
+        outDims[batchRank] = M;
+        outDims[batchRank + 1] = N;
+
+        int total = totalBatch * oMat;
+        if (total == 0)
+        {
+            values[node.Outputs[0]] = DeviceValue.Host(new Tensor<int>(new TensorShape(outDims), Array.Empty<int>()));
+            return;
+        }
+
+        MemoryBuffer1D<int, Stride1D.Dense> aBuf = _accelerator.Allocate1D(a.Length == 0 ? new[] { 0 } : a);
+        MemoryBuffer1D<int, Stride1D.Dense> bBuf = _accelerator.Allocate1D(b.Length == 0 ? new[] { 0 } : b);
+        MemoryBuffer1D<int, Stride1D.Dense> yBuf = _accelerator.Allocate1D<int>(total);
+        temps.Add(aBuf); temps.Add(bBuf); temps.Add(yBuf);
+        ArrayView<int> vAOff = Upload(aOffArr, temps);
+        ArrayView<int> vBOff = Upload(bOffArr, temps);
+        ArrayView<int> vAZp = Upload(aZpBuf, temps);
+        ArrayView<int> vBZp = Upload(bZpBuf, temps);
+
+        _matmulInteger(total, aBuf.View, bBuf.View, yBuf.View, vAOff, vBOff, vAZp, vBZp,
+            aZpStride, bZpStride, M, K, N);
+        _accelerator.Synchronize();
+
+        int[] yHost = yBuf.GetAsArray1D();
+        values[node.Outputs[0]] = DeviceValue.Host(new Tensor<int>(new TensorShape(outDims), yHost));
+    }
+
+    /// <summary>Reads an int8/uint8/int32 quantized host tensor elementwise to int32 (mirrors <c>QuantizeOps.ReadIntAsDoubles</c>).</summary>
+    private static int[] ReadQuantAsInts(Tensor t)
+    {
+        int n = checked((int)t.Length);
+        var r = new int[n];
+        switch (t.Dtype)
+        {
+            case ElementType.Int8:
+            {
+                ReadOnlySpan<sbyte> s = ((Tensor<sbyte>)t).Span;
+                for (int i = 0; i < n; i++) r[i] = s[i];
+                break;
+            }
+            case ElementType.UInt8:
+            {
+                ReadOnlySpan<byte> s = ((Tensor<byte>)t).Span;
+                for (int i = 0; i < n; i++) r[i] = s[i];
+                break;
+            }
+            case ElementType.Int32:
+            {
+                ReadOnlySpan<int> s = t.AsInt32().Span;
+                for (int i = 0; i < n; i++) r[i] = s[i];
+                break;
+            }
+            default:
+                throw new ModelSharpException(
+                    $"MatMulInteger expected an int8/uint8/int32 tensor, got {t.Dtype}.");
+        }
+        return r;
+    }
+
+    /// <summary>
+    /// Reads the optional zero-point input at <paramref name="inputIndex"/> as int32, or an empty array when it is
+    /// absent/omitted. The zero point shares its operand's dtype (int8/uint8) but may also be int32.
+    /// </summary>
+    private static int[] ReadZeroPoint(GraphNode node, Dictionary<string, DeviceValue> values, int inputIndex)
+    {
+        if (node.Inputs.Count <= inputIndex) return Array.Empty<int>();
+        string name = node.Inputs[inputIndex];
+        if (string.IsNullOrEmpty(name) || !values.TryGetValue(name, out DeviceValue v)) return Array.Empty<int>();
+        return ReadQuantAsInts(v.ToHost());
     }
 
     /// <summary>

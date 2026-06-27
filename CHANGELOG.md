@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0-alpha] - 2026-06-27
 
 ### Added
+- Native on-device `MatMulInteger` GEMM (uint8/int8, bit-exact vs the CPU
+  engine), so quantized matmuls run on the GPU instead of the CPU fallback;
+  the real INT8 GPT-2 decodes whole-graph on CUDA through it.
+- fp16 (`FLOAT16`) and bf16 (`BFLOAT16`) ONNX initializer loading (decoded to
+  float32 on load), so half-precision models run.
+- Exact 400-point DFT (Bluestein) for the Whisper log-mel front-end, making the
+  mel features bit-accurate (was a radix-2 512-point zero-pad approximation).
 - Whole-graph GPU dispatch: GPU prologue ops let larger contiguous subgraphs
   execute on the device without round-tripping intermediate tensors back to the CPU.
 - GGUF quantized-tensor dequantization, covering legacy quant types, k-quants,

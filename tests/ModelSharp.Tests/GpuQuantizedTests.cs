@@ -19,10 +19,13 @@ namespace ModelSharp.Tests;
 /// <c>MatMulInteger</c>, the <c>QLinear*</c> family, and a tiny quantized transformer-ish block — and
 /// asserts the <see cref="IlgpuEngine"/> result matches the <see cref="ManagedCpuEngine"/> exactly.
 ///
-/// <para>The quantized kernels have no native GPU implementation, so on the GPU engine they run through the
-/// per-op CPU fallback (inputs downloaded to host, the CPU kernel run, outputs re-homed by dtype). These tests
-/// prove that quantized inference is correct end-to-end on the GPU engine, including where quantized fallback
-/// ops are interleaved with native GPU float ops (MatMul/Softmax/Add).</para>
+/// <para><c>MatMulInteger</c> runs through a <b>native on-device GPU kernel</b> (the INT8 GEMM hot-spot); the
+/// remaining quantized glue kernels (Quantize/Dequantize/DynamicQuantize/QLinear*) have no native GPU
+/// implementation and run through the per-op CPU fallback (inputs downloaded to host, the CPU kernel run, outputs
+/// re-homed by dtype). These tests prove that quantized inference is correct end-to-end on the GPU engine,
+/// including where the native INT8 GEMM and quantized fallback ops are interleaved with native GPU float ops
+/// (MatMul/Softmax/Add). The <c>MatMulInteger_Native_*</c> theory additionally asserts the native int32 GEMM is
+/// element-exact vs the CPU reference across shapes, dtypes and zero-point forms.</para>
 ///
 /// <para>Two execution surfaces:
 /// <list type="bullet">
@@ -288,6 +291,75 @@ public class GpuQuantizedTests
         return (graph, feeds);
     }
 
+    // ---- native MatMulInteger variant builders (zero-point + dtype + batch coverage) ----------
+
+    /// <summary>
+    /// A bare <c>MatMulInteger</c> (no Cast/Mul) so the int32 output is asserted element-exact directly.
+    /// Parameterized over operand dtypes (uint8/int8 mix) and zero-point form (absent / per-tensor /
+    /// per-row A / per-column B), all driving the native GPU GEMM against the CPU reference.
+    /// </summary>
+    private static (ModelGraph g, Dictionary<string, NamedTensor> f) BuildMatMulIntegerRaw(
+        int M, int K, int Ncols, bool aSigned, bool bSigned, string zpKind, int seed, int[]? batch = null)
+    {
+        var rnd = new Random(seed);
+        int[] aShape = batch is null ? new[] { M, K } : batch.Concat(new[] { M, K }).ToArray();
+        int[] bShape = batch is null ? new[] { K, Ncols } : batch.Concat(new[] { K, Ncols }).ToArray();
+        int aCount = aShape.Aggregate(1, (x, d) => x * d);
+        int bCount = bShape.Aggregate(1, (x, d) => x * d);
+
+        Tensor aT = aSigned
+            ? new Tensor<sbyte>(new TensorShape(aShape),
+                Enumerable.Range(0, aCount).Select(_ => (sbyte)rnd.Next(-128, 128)).ToArray())
+            : new Tensor<byte>(new TensorShape(aShape),
+                Enumerable.Range(0, aCount).Select(_ => (byte)rnd.Next(0, 256)).ToArray());
+        Tensor bT = bSigned
+            ? new Tensor<sbyte>(new TensorShape(bShape),
+                Enumerable.Range(0, bCount).Select(_ => (sbyte)rnd.Next(-128, 128)).ToArray())
+            : new Tensor<byte>(new TensorShape(bShape),
+                Enumerable.Range(0, bCount).Select(_ => (byte)rnd.Next(0, 256)).ToArray());
+
+        string[] inputs;
+        var inits = new Dictionary<string, Tensor>();
+        switch (zpKind)
+        {
+            case "none":
+                inputs = new[] { "A", "B" };
+                break;
+            case "scalar":
+                inputs = new[] { "A", "B", "az", "bz" };
+                inits["az"] = aSigned ? (Tensor)new Tensor<sbyte>(new TensorShape(), new sbyte[] { 7 })
+                                      : new Tensor<byte>(new TensorShape(), new byte[] { 130 });
+                inits["bz"] = bSigned ? (Tensor)new Tensor<sbyte>(new TensorShape(), new sbyte[] { -5 })
+                                      : new Tensor<byte>(new TensorShape(), new byte[] { 64 });
+                break;
+            case "perRowCol":
+                inputs = new[] { "A", "B", "az", "bz" };
+                inits["az"] = aSigned
+                    ? (Tensor)new Tensor<sbyte>(new TensorShape(new[] { M }),
+                        Enumerable.Range(0, M).Select(i => (sbyte)(i - 3)).ToArray())
+                    : new Tensor<byte>(new TensorShape(new[] { M }),
+                        Enumerable.Range(0, M).Select(i => (byte)(120 + i)).ToArray());
+                inits["bz"] = bSigned
+                    ? (Tensor)new Tensor<sbyte>(new TensorShape(new[] { Ncols }),
+                        Enumerable.Range(0, Ncols).Select(i => (sbyte)(i - 2)).ToArray())
+                    : new Tensor<byte>(new TensorShape(new[] { Ncols }),
+                        Enumerable.Range(0, Ncols).Select(i => (byte)(60 + i)).ToArray());
+                break;
+            default:
+                throw new ArgumentException(zpKind);
+        }
+
+        var graph = new ModelGraph
+        {
+            Inputs = new[] { "A", "B" },
+            Outputs = new[] { "Y" },
+            Nodes = new[] { N("MatMulInteger", "mmi", inputs, new[] { "Y" }) },
+            Initializers = inits,
+        };
+        var feeds = Feeds(("A", aT), ("B", bT));
+        return (graph, feeds);
+    }
+
     /// <summary>QLinearAdd then QLinearMul — residual-style quantized elementwise with per-tensor scales.</summary>
     private static (ModelGraph g, Dictionary<string, NamedTensor> f) BuildQLinearElementwise()
     {
@@ -357,6 +429,35 @@ public class GpuQuantizedTests
         AssertParity("QLinearElementwise", g, f, cuda: false);
     }
 
+    // ---- native MatMulInteger: int32 outputs element-exact vs CPU across shapes/zp/dtype ----------
+
+    public static IEnumerable<object[]> MatMulIntegerCases()
+    {
+        // M, K, N, aSigned, bSigned, zpKind, seed, batch
+        yield return new object[] { 3, 4, 2, false, true, "scalar", 1, null! };        // u8 × i8, scalar zp (gpt2 style)
+        yield return new object[] { 1, 8, 5, false, true, "scalar", 2, null! };        // M==1 (scalar-vs-perrow edge)
+        yield return new object[] { 5, 6, 1, false, true, "scalar", 3, null! };        // N==1
+        yield return new object[] { 4, 5, 6, false, false, "none", 4, null! };         // u8 × u8, no zero point
+        yield return new object[] { 4, 5, 6, true, true, "none", 5, null! };           // i8 × i8, no zero point
+        yield return new object[] { 6, 7, 8, false, false, "scalar", 6, null! };       // u8 × u8 scalar zp
+        yield return new object[] { 6, 7, 8, true, false, "scalar", 7, null! };        // i8 × u8 scalar zp
+        yield return new object[] { 5, 4, 7, false, true, "perRowCol", 8, null! };     // per-row A / per-col B
+        yield return new object[] { 5, 4, 7, true, true, "perRowCol", 9, null! };      // per-row/col, i8×i8
+        yield return new object[] { 3, 4, 5, false, true, "scalar", 10, new[] { 2 } }; // batched [2,M,K]×[2,K,N]
+        yield return new object[] { 3, 4, 5, false, true, "perRowCol", 11, new[] { 2, 3 } }; // batched rank-4, per-row/col
+        yield return new object[] { 16, 32, 24, false, true, "scalar", 12, null! };    // larger tile
+    }
+
+    [Theory]
+    [MemberData(nameof(MatMulIntegerCases))]
+    public void MatMulInteger_Native_Parity_CpuAccel(
+        int m, int k, int n, bool aSigned, bool bSigned, string zpKind, int seed, int[]? batch)
+    {
+        var (g, f) = BuildMatMulIntegerRaw(m, k, n, aSigned, bSigned, zpKind, seed, batch);
+        AssertParity($"MatMulIntegerRaw[{m}x{k}x{n},a{(aSigned ? "i8" : "u8")},b{(bSigned ? "i8" : "u8")},{zpKind}]",
+            g, f, cuda: false);
+    }
+
     // ============================================================================================
     //  Cuda_* — same graphs on real hardware CUDA (skips cleanly when absent)
     // ============================================================================================
@@ -383,5 +484,12 @@ public class GpuQuantizedTests
         [Fact] public void Cuda_PerChannel_QuantLinear() => Run("PerChannelQuantLinear", BuildPerChannelQuantLinear());
         [Fact] public void Cuda_QuantTransformerBlock() => Run("QuantTransformerBlock", BuildQuantTransformerBlock());
         [Fact] public void Cuda_QLinearElementwise() => Run("QLinearElementwise", BuildQLinearElementwise());
+
+        [Theory]
+        [MemberData(nameof(MatMulIntegerCases), MemberType = typeof(GpuQuantizedTests))]
+        public void Cuda_MatMulInteger_Native(
+            int m, int k, int n, bool aSigned, bool bSigned, string zpKind, int seed, int[]? batch)
+            => Run($"MatMulIntegerRaw[{m}x{k}x{n},{zpKind}]",
+                BuildMatMulIntegerRaw(m, k, n, aSigned, bSigned, zpKind, seed, batch));
     }
 }
