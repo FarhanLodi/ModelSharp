@@ -26,7 +26,20 @@ public class Mistral7bInt4Tests
     public Mistral7bInt4Tests(ITestOutputHelper output) => _out = output;
 
     private const string ModelRel = "mistral7b-int4/model.onnx";
+
+    /// <summary>
+    /// Hub spec for the ~5&#160;GB Mistral-7B INT4 export (graph + <c>model.onnx.data</c>). Gated as a LARGE
+    /// download: even with <c>MODELSHARP_DOWNLOAD_MODELS=1</c> it only auto-downloads when
+    /// <c>MODELSHARP_DOWNLOAD_LARGE=1</c> is also set, so a casual run never pulls multiple GB.
+    /// </summary>
+    private const string HubSpec =
+        "EmbeddedLLM/mistral-7b-instruct-v0.3-onnx/onnx/cpu_and_mobile/" +
+        "mistral-7b-instruct-v0.3-cpu-int4-rtn-block-32/model.onnx";
+
     private const int KvHeads = 8, HeadDim = 128, Vocab = 32768;
+
+    private bool TryFindModel(out string path)
+        => RealModelAssets.TryResolveOrDownload(ModelRel, HubSpec, out path, isLarge: true, log: _out.WriteLine);
 
     private static bool HardwareGpuAvailable()
     {
@@ -42,7 +55,7 @@ public class Mistral7bInt4Tests
     [Fact]
     public void Mistral7b_Int4_Loads_With_ExternalData_And_FullOpCoverage()
     {
-        if (!RealModelAssets.TryPath(ModelRel, out string path))
+        if (!TryFindModel(out string path))
         {
             _out.WriteLine($"Mistral-7B not found at {ModelRel}; skipping.");
             return;
@@ -70,7 +83,7 @@ public class Mistral7bInt4Tests
     [Fact]
     public void Mistral7b_Int4_ForwardPass_ProducesCoherentLogits()
     {
-        if (!RealModelAssets.TryPath(ModelRel, out string path))
+        if (!TryFindModel(out string path))
         {
             _out.WriteLine($"Mistral-7B not found; skipping.");
             return;

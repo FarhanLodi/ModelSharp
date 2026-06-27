@@ -29,7 +29,30 @@ public class Qwen05bTextGenerationTests
 
     private const string ModelRel = "qwen05b-q4/model_q4.onnx";
     private const string TokenizerRel = "qwen05b-q4/tokenizer.json";
+    private const string HubSpec = "onnx-community/Qwen2.5-0.5B-Instruct/onnx/model_q4.onnx";
     private const int KvHeads = 2, HeadDim = 64;
+
+    /// <summary>
+    /// Resolves the Qwen <c>tokenizer.json</c>: local first, otherwise (opt-in) via the Hub bundle that
+    /// <see cref="HubSpec"/> downloads — the <c>tokenizer.json</c> companion lands next to the model in the
+    /// Hub cache dir, so we look there. Skips cleanly (returns false) when neither is available.
+    /// </summary>
+    private bool TryResolveTokenizer(out string tokPath)
+    {
+        if (RealModelAssets.TryPath(TokenizerRel, out tokPath))
+            return true;
+        // The model bundle download also fetches tokenizer.json into the same directory.
+        if (RealModelAssets.TryResolveOrDownload(ModelRel, HubSpec, out string modelPath, log: _out.WriteLine))
+        {
+            string? dir = System.IO.Path.GetDirectoryName(modelPath);
+            if (dir is not null)
+            {
+                string candidate = System.IO.Path.Combine(dir, "tokenizer.json");
+                if (System.IO.File.Exists(candidate)) { tokPath = candidate; return true; }
+            }
+        }
+        return false;
+    }
     // Greedy stop tokens (generation_config: <|im_end|> and <|endoftext|>).
     private static readonly HashSet<int> EosIds = new() { 151643, 151645 };
 
@@ -38,7 +61,7 @@ public class Qwen05bTextGenerationTests
     [Fact]
     public void HfTokenizer_RoundTrips_Real_Qwen_Text()
     {
-        if (!RealModelAssets.TryPath(TokenizerRel, out string tokPath))
+        if (!TryResolveTokenizer(out string tokPath))
         {
             _out.WriteLine("Qwen tokenizer.json not found; skipping.");
             return;
@@ -71,7 +94,7 @@ public class Qwen05bTextGenerationTests
     [Fact]
     public void HfTokenizer_Special_Tokens_Are_Single_Units()
     {
-        if (!RealModelAssets.TryPath(TokenizerRel, out string tokPath))
+        if (!TryResolveTokenizer(out string tokPath))
         {
             _out.WriteLine("Qwen tokenizer.json not found; skipping.");
             return;
@@ -94,8 +117,8 @@ public class Qwen05bTextGenerationTests
     [Fact]
     public void Qwen05b_Generates_Real_Decoded_Text()
     {
-        if (!RealModelAssets.TryPath(ModelRel, out string modelPath) ||
-            !RealModelAssets.TryPath(TokenizerRel, out string tokPath))
+        if (!RealModelAssets.TryResolveOrDownload(ModelRel, HubSpec, out string modelPath, log: _out.WriteLine) ||
+            !TryResolveTokenizer(out string tokPath))
         {
             _out.WriteLine("Qwen model or tokenizer not found; skipping.");
             return;

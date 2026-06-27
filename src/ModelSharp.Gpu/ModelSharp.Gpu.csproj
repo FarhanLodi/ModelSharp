@@ -14,7 +14,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>ModelSharp.Gpu</PackageId>
-    <Version>0.2.0-alpha</Version>
+    <Version>1.0.0</Version>
     <Authors>Farhan Lodi</Authors>
     <Description>ILGPU GPU execution backend for ModelSharp — C# kernels JIT-compiled to CUDA / OpenCL, with a CPU fallback and whole-graph GPU dispatch.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
