@@ -26,10 +26,10 @@ public class Fp16InitializerLoadingTests
         ushort[] bits = { 0x3C00, 0x4000, 0xB800, 0x0000 };
         byte[] raw = RawLe16(bits);
 
-        Tensor<float> t = LoadInitializer("w", Float16, dims: new[] { 4L }, raw: raw);
+        Tensor t = LoadInitializer("w", Float16, dims: new[] { 4L }, raw: raw);
 
-        Assert.Equal(ElementType.Float32, t.Dtype);
-        var span = t.Span;
+        Assert.Equal(ElementType.Float16, t.Dtype); // stored compactly as fp16 (half the memory)
+        var span = t.ToFloat32().Span;              // widened on demand at the compute boundary
         Assert.Equal(1.0f, span[0]);
         Assert.Equal(2.0f, span[1]);
         Assert.Equal(-0.5f, span[2]);
@@ -43,10 +43,10 @@ public class Fp16InitializerLoadingTests
         ushort[] bits = { 0x3F80, 0xC000, 0x0000 };
         byte[] raw = RawLe16(bits);
 
-        Tensor<float> t = LoadInitializer("w", BFloat16, dims: new[] { 3L }, raw: raw);
+        Tensor t = LoadInitializer("w", BFloat16, dims: new[] { 3L }, raw: raw);
 
-        Assert.Equal(ElementType.Float32, t.Dtype);
-        var span = t.Span;
+        Assert.Equal(ElementType.Float32, t.Dtype); // bf16 has no .NET type; decoded to float32
+        var span = t.ToFloat32().Span;
         Assert.Equal(1.0f, span[0]);
         Assert.Equal(-2.0f, span[1]);
         Assert.Equal(0.0f, span[2]);
@@ -58,10 +58,10 @@ public class Fp16InitializerLoadingTests
         // When not raw, ONNX packs FLOAT16 into int32_data (low 16 bits per int32).
         int[] int32Data = { 0x3C00, 0x4000, 0xB800 }; // 1.0, 2.0, -0.5
 
-        Tensor<float> t = LoadInitializer("w", Float16, dims: new[] { 3L }, int32Data: int32Data);
+        Tensor t = LoadInitializer("w", Float16, dims: new[] { 3L }, int32Data: int32Data);
 
-        Assert.Equal(ElementType.Float32, t.Dtype);
-        var span = t.Span;
+        Assert.Equal(ElementType.Float16, t.Dtype);
+        var span = t.ToFloat32().Span;
         Assert.Equal(1.0f, span[0]);
         Assert.Equal(2.0f, span[1]);
         Assert.Equal(-0.5f, span[2]);
@@ -72,24 +72,24 @@ public class Fp16InitializerLoadingTests
     {
         int[] int32Data = { 0x3F80, 0xC000 }; // 1.0, -2.0
 
-        Tensor<float> t = LoadInitializer("w", BFloat16, dims: new[] { 2L }, int32Data: int32Data);
+        Tensor t = LoadInitializer("w", BFloat16, dims: new[] { 2L }, int32Data: int32Data);
 
         Assert.Equal(ElementType.Float32, t.Dtype);
-        var span = t.Span;
+        var span = t.ToFloat32().Span;
         Assert.Equal(1.0f, span[0]);
         Assert.Equal(-2.0f, span[1]);
     }
 
     // -- helpers --
 
-    /// <summary>Builds a one-initializer ModelProto, parses it, returns the named tensor as float32.</summary>
-    private static Tensor<float> LoadInitializer(
+    /// <summary>Builds a one-initializer ModelProto, parses it, returns the named tensor (preserving dtype).</summary>
+    private static Tensor LoadInitializer(
         string name, int dataType, long[] dims, byte[]? raw = null, int[]? int32Data = null)
     {
         byte[] model = BuildModelWithInitializer(name, dataType, dims, raw, int32Data);
         ModelGraph g = ModelSharp.Onnx.OnnxModelLoader.ParseModel(model);
         Assert.True(g.Initializers.TryGetValue(name, out Tensor? tensor), $"initializer '{name}' not loaded");
-        return tensor!.AsFloat();
+        return tensor!;
     }
 
     private static byte[] BuildModelWithInitializer(

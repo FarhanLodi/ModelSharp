@@ -392,20 +392,20 @@ public static class OnnxModelLoader
             }
             case DtFloat16:
             {
-                // IEEE half-precision initializers are decoded to float32. In raw_data each
-                // element is a little-endian 16-bit value; otherwise ONNX packs them into
-                // int32_data (one value per int32, low 16 bits).
-                var data = new float[count];
+                // IEEE half-precision initializers are kept as compact System.Half (2 bytes/element —
+                // half the memory of float32) and widened to float32 on demand at the compute boundary
+                // (Tensor.ToFloat32 / GraphContext.Get). In raw_data each element is a little-endian
+                // 16-bit value; otherwise ONNX packs them into int32_data (one value per int32, low 16 bits).
+                var data = new Half[count];
                 if (hasRaw && count > 0)
                 {
-                    ReadOnlySpan<ushort> bits = MemoryMarshal.Cast<byte, ushort>(rawData);
-                    for (int k = 0; k < count && k < bits.Length; k++)
-                        data[k] = (float)BitConverter.UInt16BitsToHalf(bits[k]);
+                    ReadOnlySpan<Half> bits = MemoryMarshal.Cast<byte, Half>(rawData);
+                    for (int k = 0; k < count && k < bits.Length; k++) data[k] = bits[k];
                 }
                 else if (int32Data is not null)
                     for (int k = 0; k < count && k < int32Data.Count; k++)
-                        data[k] = (float)BitConverter.UInt16BitsToHalf((ushort)int32Data[k]);
-                return (name, new Tensor<float>(shape, data));
+                        data[k] = BitConverter.UInt16BitsToHalf((ushort)int32Data[k]);
+                return (name, new Tensor<Half>(shape, data));
             }
             case DtBFloat16:
             {
