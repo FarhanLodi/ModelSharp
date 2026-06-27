@@ -27,6 +27,12 @@ public sealed class Pipeline : IDisposable
     private readonly TextGenerator? _generator;
     private readonly TextGenerationProcessor? _generation;
 
+    // Set only on the Seq2SeqGeneration path; null otherwise. The encoder engine is owned and disposed
+    // alongside _engine (the decoder) when it is a distinct instance.
+    private readonly Seq2SeqGenerator? _seq2seqGenerator;
+    private readonly Seq2SeqGenerationProcessor? _seq2seqGeneration;
+    private readonly IExecutionEngine? _encoderEngine;
+
     /// <summary>The resolved manifest describing this model.</summary>
     public ModelManifest Manifest { get; }
 
@@ -50,6 +56,23 @@ public sealed class Pipeline : IDisposable
         Manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         _generator = generator ?? throw new ArgumentNullException(nameof(generator));
         _generation = generation ?? throw new ArgumentNullException(nameof(generation));
+    }
+
+    /// <summary>
+    /// Constructs a seq2seq (encoder-decoder) generation pipeline that drives <paramref name="generator"/>
+    /// with the tokenizer and default config held by <paramref name="generation"/>. The decoder engine is
+    /// passed as <paramref name="decoderEngine"/>; <paramref name="encoderEngine"/> is disposed with the
+    /// pipeline when it is a distinct instance from the decoder.
+    /// </summary>
+    public Pipeline(
+        IExecutionEngine decoderEngine, IExecutionEngine encoderEngine, ModelManifest manifest,
+        Seq2SeqGenerator generator, Seq2SeqGenerationProcessor generation)
+    {
+        _engine = decoderEngine ?? throw new ArgumentNullException(nameof(decoderEngine));
+        _encoderEngine = encoderEngine ?? throw new ArgumentNullException(nameof(encoderEngine));
+        Manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
+        _seq2seqGenerator = generator ?? throw new ArgumentNullException(nameof(generator));
+        _seq2seqGeneration = generation ?? throw new ArgumentNullException(nameof(generation));
     }
 
     /// <summary>Loads a model file and resolves its manifest automatically (sidecar → metadata → built-in).</summary>
@@ -79,9 +102,16 @@ public sealed class Pipeline : IDisposable
     /// <param name="config">Decoding parameters; defaults to the manifest-derived configuration.</param>
     public string Generate(string prompt, GenerationConfig? config = null)
     {
-        (TextGenerator generator, TextGenerationProcessor generation) = RequireGeneration();
         if (prompt is null) throw new ArgumentNullException(nameof(prompt));
 
+        if (_seq2seqGenerator is not null && _seq2seqGeneration is not null)
+        {
+            IReadOnlyList<long> srcIds = _seq2seqGeneration.Encode(prompt);
+            IReadOnlyList<long> targets = _seq2seqGenerator.Generate(srcIds, config ?? _seq2seqGeneration.DefaultConfig);
+            return _seq2seqGeneration.Decode(targets);
+        }
+
+        (TextGenerator generator, TextGenerationProcessor generation) = RequireGeneration();
         IReadOnlyList<long> promptIds = generation.Encode(prompt);
         IReadOnlyList<long> generated = generator.Generate(promptIds, config ?? generation.DefaultConfig);
         return generation.Decode(generated);
@@ -95,11 +125,35 @@ public sealed class Pipeline : IDisposable
     /// <param name="config">Decoding parameters; defaults to the manifest-derived configuration.</param>
     public IEnumerable<string> GenerateStream(string prompt, GenerationConfig? config = null)
     {
-        (TextGenerator generator, TextGenerationProcessor generation) = RequireGeneration();
         if (prompt is null) throw new ArgumentNullException(nameof(prompt));
 
+        if (_seq2seqGenerator is not null && _seq2seqGeneration is not null)
+        {
+            IReadOnlyList<long> srcIds = _seq2seqGeneration.Encode(prompt);
+            return StreamDecodedSeq2Seq(_seq2seqGenerator, _seq2seqGeneration, srcIds, config ?? _seq2seqGeneration.DefaultConfig);
+        }
+
+        (TextGenerator generator, TextGenerationProcessor generation) = RequireGeneration();
         IReadOnlyList<long> promptIds = generation.Encode(prompt);
         return StreamDecoded(generator, generation, promptIds, config ?? generation.DefaultConfig);
+    }
+
+    /// <summary>Decodes streamed seq2seq target tokens incrementally (mirrors <see cref="StreamDecoded"/>).</summary>
+    private static IEnumerable<string> StreamDecodedSeq2Seq(
+        Seq2SeqGenerator generator, Seq2SeqGenerationProcessor generation, IReadOnlyList<long> sourceIds, GenerationConfig config)
+    {
+        var produced = new List<long>();
+        string previous = string.Empty;
+        foreach (long token in generator.GenerateStream(sourceIds, config))
+        {
+            produced.Add(token);
+            string current = generation.Decode(produced);
+            if (current.Length > previous.Length)
+            {
+                yield return current.Substring(previous.Length);
+                previous = current;
+            }
+        }
     }
 
     /// <summary>
@@ -134,5 +188,10 @@ public sealed class Pipeline : IDisposable
     }
 
     /// <inheritdoc />
-    public void Dispose() => _engine.Dispose();
+    public void Dispose()
+    {
+        _engine.Dispose();
+        if (_encoderEngine is not null && !ReferenceEquals(_encoderEngine, _engine))
+            _encoderEngine.Dispose();
+    }
 }

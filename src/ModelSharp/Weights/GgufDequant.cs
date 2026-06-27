@@ -24,9 +24,12 @@ namespace ModelSharp.Weights;
 /// The remaining "IQ" families (<see cref="GgmlType.IQ2_XXS"/>, <see cref="GgmlType.IQ2_XS"/>,
 /// <see cref="GgmlType.IQ2_S"/>, <see cref="GgmlType.IQ3_XXS"/>, <see cref="GgmlType.IQ3_S"/>,
 /// <see cref="GgmlType.IQ1_S"/>, <see cref="GgmlType.IQ1_M"/>) encode each group as an index into a
-/// large published lattice/grid constant table rather than an affine scale. Those grids are not
-/// transcribed here, so those types — and any unrecognized type — throw rather than silently
-/// emitting wrong output.</para>
+/// large, fixed lattice/grid constant table (256–2048 entries each) rather than an affine scale.
+/// Because a single incorrect table entry would silently corrupt model weights, ModelSharp only
+/// dequantizes a family once a bit-exact, verified copy of its grid is vendored; none is vendored
+/// yet, so those types — and any unrecognized type — throw rather than emitting unverified output.
+/// The surrounding block layout for each family is documented inline below so a verified grid can be
+/// dropped in without re-deriving the bit packing.</para>
 /// </summary>
 public static class GgufDequant
 {
@@ -75,8 +78,10 @@ public static class GgufDequant
                 $"ggml type {type} is not a dequantizable block type supported by ModelSharp. " +
                 "Supported: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, " +
                 "Q8_K, IQ4_NL, IQ4_XS. The grid-codebook IQ families (IQ2_XXS, IQ2_XS, IQ2_S, " +
-                "IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) are not yet implemented and are intentionally not " +
-                "approximated.");
+                "IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) reconstruct each group by indexing a large, fixed " +
+                "lattice/grid constant table; ModelSharp does not vendor a bit-exact, verified copy " +
+                "of those tables, so it throws here rather than emitting unverified (silently wrong) " +
+                "weights. They are intentionally not approximated.");
 
         int block = GgmlTypeInfo.BlockSize(type);
         int typeSize = GgmlTypeInfo.TypeSize(type);
@@ -596,6 +601,42 @@ public static class GgufDequant
             }
         }
     }
+
+    // =====================================================================================
+    // Grid-codebook IQ families (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M)
+    //
+    // These are NOT implemented: each reconstructs a group of weights by indexing a large, fixed
+    // lattice "grid" table (256 / 512 / 1024 / 2048 entries depending on the family). ModelSharp
+    // does not vendor a bit-exact, independently verified copy of those tables, and a single wrong
+    // entry would silently corrupt weights, so these types throw (see Dequantize / IsSupported)
+    // rather than emitting approximated or unverified output.
+    //
+    // The block layouts below are recorded so that, once a verified grid + sign table is vendored
+    // (with the appropriate upstream attribution added to NOTICE), the dequant routine can be
+    // implemented without re-deriving the bit packing. Sizes are the on-disk TypeSize values in
+    // GgmlTypeInfo; all are QK_K = 256 super-blocks.
+    //
+    //   IQ2_XXS (66 B): fp16 d; uint16[4] qs. Each 32-element group: 4 grid indices (1 byte each)
+    //       select 8-byte grid points (8 packed int4 sign/scale signals); the 4th uint16 packs the
+    //       block scale (top nibble) and the per-group sign indices. Grid: iq2xxs_grid[256] (u64).
+    //   IQ2_XS  (74 B): fp16 d; uint16[8] qs (grid index + 9-bit sign in the high bits per quarter);
+    //       uint8[4] scales (two 4-bit sub-scales per byte). Grid: iq2xs_grid[512] (u64).
+    //   IQ2_S   (82 B): fp16 d; uint8[32] qs; uint8[8] qh (high grid-index bits); uint8[4] signs +
+    //       uint8[4] scales. Grid: iq2s_grid[1024] (u64); signs via ksigns_iq2xs[128]/kmask_iq2xs[8].
+    //   IQ3_XXS (98 B): fp16 d; uint8[64] qs (3-bit grid indices); uint8[28] of packed signs+scale.
+    //       Grid: iq3xxs_grid[256] (u32, two 4-byte points per index).
+    //   IQ3_S  (110 B): fp16 d; uint8[64] qs; uint8[8] qh; uint8[4] signs; uint8[8] scales (+ a high
+    //       grid-index plane). Grid: iq3s_grid[512] (u32); signs via ksigns_iq2xs.
+    //   IQ1_S   (50 B): fp16 d; uint8[32] qs; uint16[8] qh (3 bits grid-high + 3 bits scale + 1 sign
+    //       per 8-element group). Value = d * (2*grid_bit + 1) +/- IQ1S_DELTA(0.125). Grid:
+    //       iq1s_grid[2048] (u64, 8 int8 codes per entry).
+    //   IQ1_M   (56 B): fp16 scale is split across qh; uint8[32] qs; uint8[16] qh; uint8[8] scales.
+    //       Two sub-blocks per group, IQ1M_DELTA(0.125). Grid: iq1m_grid[2048] (u64).
+    //
+    // The short sign/mask helper tables (kmask_iq2xs[8] = {1,2,4,8,16,32,64,128}, ksigns_iq2xs[128])
+    // are small functional bit machinery, but are only meaningful alongside the large grids and are
+    // therefore also deferred until the grids are vendored.
+    // =====================================================================================
 
     // =====================================================================================
     // Shared helpers

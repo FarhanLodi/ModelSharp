@@ -4,6 +4,7 @@ using System.Linq;
 using ILGPU;
 using ILGPU.Algorithms;
 using ILGPU.Runtime;
+using ModelSharp.Cpu.Kernels;
 using ModelSharp.Engine;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
@@ -42,6 +43,15 @@ public sealed class IlgpuEngine : IExecutionEngine
     private readonly Context _context;
     private readonly Accelerator _accelerator;
 
+    /// <summary>
+    /// CPU kernel registry used by the per-op fallback (see <see cref="RunCpuFallback"/>). Built lazily the
+    /// first time the GPU switch hits an op it has no native handler for, so graphs that are fully GPU-native
+    /// (e.g. distilgpt2) never pay to construct it. The same registry the <see cref="ModelSharp.Cpu.ManagedCpuEngine"/>
+    /// uses, so any op the CPU engine can run, the GPU engine can now run too (accelerated where a native GPU
+    /// kernel exists, correct via this fallback everywhere else).
+    /// </summary>
+    private KernelRegistry? _cpuFallback;
+
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _add;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _sub;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _mul;
@@ -56,6 +66,12 @@ public sealed class IlgpuEngine : IExecutionEngine
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _sqrt;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, float> _leakyRelu;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _erf;
+
+    // Trivially-native unary float ops (would otherwise round-trip to the CPU fallback). One thread per element.
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _log;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _abs;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _neg;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _reciprocal;
 
     // Data-movement / reduction ops whose strides are precomputed on the host.
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>,
@@ -123,6 +139,10 @@ public sealed class IlgpuEngine : IExecutionEngine
         _sqrt = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(SqrtK);
         _leakyRelu = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, float>(LeakyReluK);
         _erf = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(ErfK);
+        _log = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(LogK);
+        _abs = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(AbsK);
+        _neg = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(NegK);
+        _reciprocal = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(ReciprocalK);
 
         _transpose = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>,
             ArrayView<int>, ArrayView<int>, int>(GpuKernels.TransposeK);
@@ -165,6 +185,13 @@ public sealed class IlgpuEngine : IExecutionEngine
     private static void GeluK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = 0.5f * a[i] * (1f + Erf(a[i] * 0.70710678f));
     private static void LeakyReluK(Index1D i, ArrayView<float> a, ArrayView<float> y, float alpha) => y[i] = a[i] >= 0f ? a[i] : alpha * a[i];
     private static void ErfK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = Erf(a[i]);
+
+    // Trivially-native unary float ops mirroring the CPU Log/Abs/Neg/Reciprocal kernels (MathF.Log lowers to
+    // ILGPU's LogF intrinsic, registered by EnableAlgorithms; Abs/Neg/Reciprocal are pure arithmetic).
+    private static void LogK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Log(a[i]);
+    private static void AbsK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = a[i] < 0f ? -a[i] : a[i];
+    private static void NegK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = -a[i];
+    private static void ReciprocalK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = 1f / a[i];
 
     /// <summary>
     /// Device-side error function (Abramowitz &amp; Stegun 7.1.26), with the same constants as the CPU
@@ -225,6 +252,12 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Gemm": RunGemm(node, values, temps); break;
                     case "Conv": RunConv(node, values, temps); break;
                     case "Erf": RunUnary(_erf, node, values); break;
+                    // Trivially-native unary float ops; integer inputs (rare) fall through to the CPU kernel so
+                    // dtype (e.g. int Abs/Neg) stays correct.
+                    case "Log" when values[node.Inputs[0]].IsFloat: RunUnary(_log, node, values); break;
+                    case "Abs" when values[node.Inputs[0]].IsFloat: RunUnary(_abs, node, values); break;
+                    case "Neg" when values[node.Inputs[0]].IsFloat: RunUnary(_neg, node, values); break;
+                    case "Reciprocal" when values[node.Inputs[0]].IsFloat: RunUnary(_reciprocal, node, values); break;
                     case "Pow": RunPow(node, values, temps); break;
                     case "Where": RunWhere(node, values, temps); break;
                     case "Reshape": RunReshape(node, values); break;
@@ -244,13 +277,15 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Greater": RunCompare(node, values, equal: false); break;
                     case "Trilu": RunTrilu(node, values); break;
                     case "ScatterND": RunScatterND(node, values); break;
+                    // Any op the GPU switch doesn't natively handle is routed through the CPU kernel registry
+                    // (RunCpuFallback): its float inputs are downloaded, the matching CPU kernel runs, and its
+                    // float outputs are re-uploaded so downstream GPU ops still see device buffers. This makes
+                    // every CPU-runnable graph run through the GPU engine (accelerated where a native kernel
+                    // exists, correct via fallback otherwise). Only if the CPU registry also lacks the op does
+                    // RunCpuFallback throw UnsupportedOperatorException ("no engine supports it").
                     default:
-                        throw new UnsupportedOperatorException(node.OpType,
-                            $"node '{node.Name}' — the GPU engine covers elementwise/activations, Softmax, " +
-                            "Transpose, ReduceSum/ReduceMean, LayerNormalization, Gather/Concat/Slice/Cast, " +
-                            "MatMul/Gemm, Conv, the decoder shape ops Reshape/Unsqueeze/Squeeze/Shape/" +
-                            "Constant/Expand/Split plus Pow/Where/Erf, and the integer/mask prologue ops " +
-                            "Range/ConstantOfShape/Equal/Greater/Trilu/ScatterND");
+                        RunCpuFallback(node, values);
+                        break;
                 }
             }
             _accelerator.Synchronize();
@@ -272,6 +307,61 @@ public sealed class IlgpuEngine : IExecutionEngine
                 if (v.FloatBuf is not null && seen.Add(v.FloatBuf)) v.FloatBuf.Dispose();
             foreach (MemoryBuffer buf in temps)
                 if (seen.Add(buf)) buf.Dispose();
+        }
+    }
+
+    // --- Per-op CPU fallback (any CPU-runnable op the GPU switch doesn't natively handle) ---
+
+    /// <summary>
+    /// Runs a single node through the managed CPU kernel registry, crossing the device↔host boundary so it
+    /// composes with the native GPU op paths around it. The mechanism mirrors exactly how
+    /// <see cref="ModelSharp.Cpu.ManagedCpuEngine"/> invokes a kernel for one node:
+    /// <list type="number">
+    /// <item><b>Materialize inputs to host.</b> Each input <see cref="DeviceValue"/> is turned into a
+    /// dtype-carrying host <see cref="Tensor"/> via <see cref="DeviceValue.ToHost"/> — float buffers are
+    /// downloaded from the device; int/bool tensors already live host-side, so they pass through untouched.</item>
+    /// <item><b>Run the CPU kernel.</b> The inputs (and any subgraph values the kernel might capture) seed a
+    /// <see cref="GraphContext"/>; the kernel for <c>node.OpType</c> is looked up in the lazily-built
+    /// <see cref="KernelRegistry.CreateDefault"/> registry and executed, writing its named outputs back into the
+    /// context's environment — the same call shape as <c>ManagedCpuEngine.ExecuteNodes</c>.</item>
+    /// <item><b>Store outputs back as DeviceValues.</b> Each declared output tensor is converted to a
+    /// <see cref="DeviceValue"/> via <see cref="Load"/>: float outputs are re-uploaded to the device (so the next
+    /// GPU op reads a device buffer), while int/bool outputs are kept host-side — preserving dtype throughout.</item>
+    /// </list>
+    /// If the CPU registry also has no kernel for the op, this throws <see cref="UnsupportedOperatorException"/>
+    /// (now meaning "no engine — GPU or CPU — supports it").
+    /// </summary>
+    private void RunCpuFallback(GraphNode node, Dictionary<string, DeviceValue> values)
+    {
+        _cpuFallback ??= KernelRegistry.CreateDefault();
+        if (!_cpuFallback.TryGet(node.OpType, out IKernel? kernel) || kernel is null)
+            throw new UnsupportedOperatorException(node.OpType,
+                $"node '{node.Name}' — neither the GPU engine nor the CPU kernel registry has a handler for it " +
+                "(the GPU engine runs natively where a GPU kernel exists and falls back to the CPU kernels " +
+                "otherwise, so this op is unsupported by any engine).");
+
+        // 1) Materialize this node's inputs to host tensors (downloading device floats; int/bool pass through).
+        //    Optional/omitted inputs (empty name) are skipped, matching how the CPU engine leaves them unbound.
+        var env = new Dictionary<string, Tensor>();
+        foreach (string inName in node.Inputs)
+        {
+            if (string.IsNullOrEmpty(inName)) continue;
+            if (values.TryGetValue(inName, out DeviceValue v))
+                env[inName] = v.ToHost();
+        }
+
+        // 2) Invoke the CPU kernel exactly as ManagedCpuEngine.ExecuteNodes does (no subgraph runner: the
+        //    fallback handles plain ops; control-flow ops needing nested-graph execution would surface a clear
+        //    error from GraphContext.RunSubgraph rather than miscompute).
+        var ctx = new GraphContext(env);
+        kernel.Execute(node, ctx);
+
+        // 3) Re-home each produced output as a DeviceValue: float → device (so downstream GPU ops see a device
+        //    buffer), int/bool → host. Load() routes by dtype and preserves the shape.
+        foreach (string outName in node.Outputs)
+        {
+            if (string.IsNullOrEmpty(outName)) continue;
+            values[outName] = Load(ctx.GetTensor(outName));
         }
     }
 

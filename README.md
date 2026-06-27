@@ -38,7 +38,9 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
 - 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types (token ids, masks, and shape tensors included).
-- 🧠 **169 ONNX operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), and control-flow (If/Loop/Scan) included.
+- 🧠 **191 operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control-flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*` ops included.
+- ♻️ **Runs *any* model on the GPU** — the ILGPU backend executes natively-supported ops on-device and transparently falls back to the CPU kernel for the rest, so any CPU-runnable model also runs through the GPU engine.
+- 🔁 **Encoder-decoder generation** — T5 / BART / MarianMT-style seq2seq (encoder-once + cross-attention KV-cached decode), alongside decoder-only LLM generation.
 - 🔤 **Built-in tokenizers** — WordPiece (BERT) and byte-level BPE (GPT-2 / RoBERTa), pure managed.
 - 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam).
 - 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
@@ -58,7 +60,7 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
 | GPU LLM path | distilgpt2 on CUDA | the **full 1569-node graph runs end-to-end through the GPU engine** (no CPU fallback), matching the CPU engine's logits (Δ ≤ 1.8e-4) and exact greedy argmax; a full decoder layer + multi-step decode run on an **on-device KV-cache** |
 
-The full test suite is **572 passing (0 failed)** and op coverage is **169 of ~190** standard ONNX ops. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **647 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 
@@ -194,7 +196,7 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 
 ## Capabilities
 
-### Operator coverage (169)
+### Operator coverage (191)
 
 - **Arithmetic** (broadcasting): Add, Sub, Mul, Div, Pow
 - **Activations**: Relu, Sigmoid, Tanh, Exp, Log, Sqrt, Abs, Neg, Erf, Gelu, Identity, LeakyRelu, Clip, Softmax
@@ -206,8 +208,10 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 - **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand, Trilu, ScatterND, Range
 - **Signal**: DFT (+ FFT fast path), STFT, MelWeightMatrix (opset-17 audio front-end ops)
 - **Control flow**: If, Loop, Scan (full ONNX subgraph parsing + execution)
+- **Sequence / Optional**: SequenceEmpty/Construct/Insert/Erase/At/Length, SplitToSequence, ConcatFromSequence, Optional/OptionalGetElement/OptionalHasElement
+- **Quantized**: DequantizeLinear, QuantizeLinear, DynamicQuantizeLinear, MatMulInteger, QLinearMatMul, QLinearConv, QLinearAdd, QLinearMul, ConvInteger, QLinearGlobalAveragePool
 
-> The list above is a representative sample; the registry now covers **169 of ~190** standard ops (plus contrib/fused LLM ops). Additional kernels are wired in as they're verified.
+> The list above is a representative sample; the registry now covers **180 of ~190** standard ops plus `QLinear*` quantized and contrib/fused ops. Any op without a native GPU kernel still runs on the GPU engine via CPU fallback. Additional kernels are wired in as they're verified.
 
 ### Text
 
