@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0-alpha] - 2026-06-27
 
+### Performance
+- Multithreaded (`Parallel.For`) + SIMD (`System.Numerics.Vector<float>`) the hot CPU
+  kernels (MatMul/MatMulNBits/MatMulInteger/QLinear, GroupQueryAttention/MHA, RMSNorm/
+  LayerNorm, RoPE, Conv), and added native on-device GPU `MatMulNBits` + `GroupQueryAttention`.
+  Bit-identical results, much faster: on an RTX 4090 a Mistral-7B INT4 forward pass went from
+  ~4m11s to ~16s (~16×) and Qwen-0.5B from ~9s to ~2s. All pure-managed, no new dependencies.
+
 ### Added
 - Real **INT4 LLMs run end-to-end**, including a **7B** (Mistral-7B-Instruct):
   ONNX **external-data** loading (`data_location=EXTERNAL`, memory-mapped) for

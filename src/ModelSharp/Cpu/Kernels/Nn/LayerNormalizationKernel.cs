@@ -1,5 +1,7 @@
 using System;
+using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
+using ModelSharp.Cpu.Kernels.Llm;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
@@ -12,6 +14,9 @@ namespace ModelSharp.Cpu.Kernels.Nn;
 public sealed class LayerNormalizationKernel : IKernel
 {
     public string OpType => "LayerNormalization";
+
+    /// <summary>Below this many elements (rows × norm) the row loop stays serial.</summary>
+    private const long NormThreshold = 1L << 16;
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -30,26 +35,25 @@ public sealed class LayerNormalizationKernel : IKernel
         int norm = 1; for (int i = axis; i < rank; i++) norm *= dims[i];
 
         var y = new Tensor<float>(x.Shape);
-        System.Span<float> xs = x.Span, ys = y.Span, sc = scale.Span;
-        System.Span<float> bs = bias is null ? default : bias.Span;
+        float[] xs = KernelSimd.Array(x);
+        float[] ys = KernelSimd.Array(y);
+        float[] sc = KernelSimd.Array(scale);
+        float[]? bs = bias is null ? null : KernelSimd.Array(bias);
 
-        for (int o = 0; o < outer; o++)
+        void Row(int o)
         {
             int b = o * norm;
-            float mean = 0f;
-            for (int i = 0; i < norm; i++) mean += xs[b + i];
-            mean /= norm;
-
-            float varSum = 0f;
-            for (int i = 0; i < norm; i++) { float d = xs[b + i] - mean; varSum += d * d; }
+            float mean = KernelSimd.Sum(xs, b, norm) / norm;
+            float varSum = KernelSimd.SumSquaresCentered(xs, b, mean, norm);
             float inv = 1f / MathF.Sqrt(varSum / norm + eps);
-
-            for (int i = 0; i < norm; i++)
-            {
-                float nval = (xs[b + i] - mean) * inv;
-                ys[b + i] = nval * sc[i] + (bias is null ? 0f : bs[i]);
-            }
+            KernelSimd.NormApplyCentered(ys, b, xs, b, mean, inv, sc, bs, norm);
         }
+
+        if ((long)outer * norm >= NormThreshold)
+            Parallel.For(0, outer, Row);
+        else
+            for (int o = 0; o < outer; o++) Row(o);
+
         ctx.Set(node.Outputs[0], y);
     }
 }
