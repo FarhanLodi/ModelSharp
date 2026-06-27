@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0-alpha] - 2026-06-27
 
+### Verified & hardened
+- Next-token logits **bit-verified against ONNX Runtime** on real models — Qwen-0.5B
+  (`MatMulNBits`) and Mistral-7B (genai `GroupQueryAttention`) match ORT exactly.
+- Real text generation via a Hugging Face `tokenizer.json` (BPE) loader; Whisper-tiny
+  transcribes correctly.
+- `local_window_size` (sliding-window attention) in GroupQueryAttention; Sequence/Optional
+  values now cross If/Loop/Scan subgraph boundaries; ONNX `ImageDecoder` (via ImageSharp).
+- Hardening: concurrency/thread-safety tests for the multithreaded kernels, malformed-model
+  fuzzing tests, a loader allocation DoS guard, and clean exceptions for missing context values.
+
 ### Performance
 - Multithreaded (`Parallel.For`) + SIMD (`System.Numerics.Vector<float>`) the hot CPU
   kernels (MatMul/MatMulNBits/MatMulInteger/QLinear, GroupQueryAttention/MHA, RMSNorm/
