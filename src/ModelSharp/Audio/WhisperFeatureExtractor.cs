@@ -42,12 +42,16 @@ public sealed class WhisperFeatureExtractor
     /// <summary>Number of audio samples in the 30 s analysis window.</summary>
     public const int NumSamples = SampleRate * 30; // 480_000
 
-    /// <summary>FFT size: 400 padded up to the next power of two (512) for the radix-2 transform.</summary>
-    private static readonly int FftSize = Fft.NextPow2(NFft); // 512
+    /// <summary>
+    /// Number of non-negative-frequency bins of the true 400-point DFT (<c>n_fft/2 + 1 = 201</c>).
+    /// Bin <c>k</c> sits at exactly <c>k · SampleRate / NFft = k · 40 Hz</c>, matching OpenAI Whisper.
+    /// </summary>
+    public const int NumBins = NFft / 2 + 1; // 201
 
     private readonly int _nMels;
-    private readonly float[][] _filterbank; // [nMels][FftSize/2 + 1]
+    private readonly float[][] _filterbank; // [nMels][NumBins]
     private readonly float[] _window;       // periodic Hann, length NFft
+    private readonly BluesteinDft _dft;     // exact 400-point DFT (chirp-z)
 
     /// <summary>The number of mel bins this extractor produces (80 or 128).</summary>
     public int NumMels => _nMels;
@@ -58,12 +62,14 @@ public sealed class WhisperFeatureExtractor
         if (nMels != 80 && nMels != 128)
             throw new ArgumentOutOfRangeException(nameof(nMels), nMels, "Whisper supports 80 or 128 mel bins.");
         _nMels = nMels;
-        // Build the filterbank against the actual (zero-padded) FFT size so the bin frequencies the
-        // radix-2 FFT produces line up with the triangular filters. Whisper's reference uses a true
-        // 400-point DFT; padding to 512 yields an interpolated spectrum sampled at 512 bins, so the
-        // filterbank must use the same 512-point bin spacing.
-        _filterbank = BuildMelFilters(SampleRate, FftSize, nMels);
+        // Build the filterbank against the true 400-point DFT bin grid (201 bins at sr/400 = 40 Hz
+        // spacing). This is Whisper-exact: OpenAI uses n_fft = 400, so the STFT yields 201 frequency
+        // bins and the mel filters are defined over that grid. (The previous implementation zero-padded
+        // each frame 400 -> 512 and built filters on the 257-bin/512-point grid, which resamples the
+        // spectrum and slightly mis-aligns the frequency bins.)
+        _filterbank = BuildMelFilters(SampleRate, NFft, nMels);
         _window = HannWindowPeriodic(NFft);
+        _dft = new BluesteinDft(NFft);
     }
 
     /// <summary>
@@ -98,13 +104,13 @@ public sealed class WhisperFeatureExtractor
         Array.Copy(padded, 0, signal, pad, padded.Length);
         for (int i = 0; i < pad; i++) signal[pad + padded.Length + i] = padded[padded.Length - 2 - i]; // reflect right
 
-        int fftN = FftSize;                       // 512
-        int nBins = fftN / 2 + 1;                 // 257 bins of the 512-point FFT
+        int nBins = NumBins;                      // 201 bins of the true 400-point DFT
         // Whisper/torch.stft with center=True over a 480000-sample signal yields 1 + n/hop = 3001 frames,
         // then [..., :-1] drops the last → 3000. We compute exactly NumFrames frames.
         var result = new float[_nMels, NumFrames];
 
-        var buffer = new Complex[fftN];
+        var windowed = new float[NFft];           // windowed 400-sample frame (real input to the DFT)
+        var spectrum = new Complex[NFft];          // full 400-point DFT output
         var mag2 = new float[nBins];
 
         float maxLog = float.NegativeInfinity;
@@ -113,24 +119,18 @@ public sealed class WhisperFeatureExtractor
         for (int f = 0; f < NumFrames; f++)
         {
             int start = f * HopLength;
-            for (int i = 0; i < fftN; i++)
+            for (int i = 0; i < NFft; i++)
             {
-                if (i < NFft)
-                {
-                    int idx = start + i;
-                    float s = idx < signal.Length ? signal[idx] : 0f;
-                    buffer[i] = new Complex(s * _window[i], 0);
-                }
-                else
-                {
-                    buffer[i] = Complex.Zero;
-                }
+                int idx = start + i;
+                float s = idx < signal.Length ? signal[idx] : 0f;
+                windowed[i] = s * _window[i];
             }
-            Fft.Forward(buffer);
+            // True 400-point DFT (chirp-z): bin k is exactly k·sr/400 Hz, Whisper-accurate alignment.
+            _dft.ForwardReal(windowed, spectrum);
 
             for (int b = 0; b < nBins; b++)
             {
-                double re = buffer[b].Real, im = buffer[b].Imaginary;
+                double re = spectrum[b].Real, im = spectrum[b].Imaginary;
                 mag2[b] = (float)(re * re + im * im);  // power spectrum |X|^2
             }
 
@@ -168,8 +168,8 @@ public sealed class WhisperFeatureExtractor
         int nBins = nFft / 2 + 1;
 
         // FFT bin center frequencies (Hz) for an nFft-point transform: bin i sits at i * sampleRate / nFft.
-        // The extractor passes the real (zero-padded) FFT size here so the filters align with the bins the
-        // radix-2 FFT actually produces.
+        // The extractor passes the true n_fft (400) so the filters align with the 201 bins of the genuine
+        // 400-point DFT (40 Hz spacing) — Whisper-exact.
         var fftFreqs = new double[nBins];
         for (int i = 0; i < nBins; i++) fftFreqs[i] = (double)i * sampleRate / nFft;
 
