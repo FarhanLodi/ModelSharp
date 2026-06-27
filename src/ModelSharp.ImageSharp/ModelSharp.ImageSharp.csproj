@@ -8,9 +8,16 @@
     <RootNamespace>ModelSharp.ImageSharp</RootNamespace>
     <AssemblyName>ModelSharp.ImageSharp</AssemblyName>
     <PackageId>ModelSharp.ImageSharp</PackageId>
+    <Version>0.2.0-alpha</Version>
+    <Authors>Farhan Lodi</Authors>
+    <Description>ImageSharp-based image pre/post-processing adapter for ModelSharp — resize/normalize tensor preprocessing and classification/detection postprocessing.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-    <Description>ImageSharp-based image pre/post-processing adapter for ModelSharp.</Description>
-    <Version>0.1.0-alpha</Version>
+    <PackageProjectUrl>https://github.com/FarhanLodi/ModelSharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/FarhanLodi/ModelSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>onnx;inference;ml;machine-learning;managed;image;imagesharp;vision</PackageTags>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
 
   <ItemGroup>

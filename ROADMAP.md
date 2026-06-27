@@ -8,8 +8,33 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **514 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **682 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
 
+- **2026-06-27 (pass 4 — breadth):** all 7 GGUF **grid-codebook IQ** families (IQ1/2/3) now
+  dequantize (ggml lattice tables vendored from a pinned llama.cpp commit, MIT attribution in NOTICE);
+  **Whisper ASR** wired end-to-end (log-mel `WhisperFeatureExtractor` + forced-prompt decode through
+  the seq2seq path, `ModelTask.SpeechToTextSeq2Seq`); and a **real INT8-quantized gpt2 ONNX** was
+  downloaded and now **runs whole-graph on the RTX 4090** with the exact same greedy argmax as the CPU
+  engine. Fixed the core gaps that blocked quantized models: the ONNX loader now parses `uint8`/`int8`
+  initializers, and `Gather` is dtype-generic on both the CPU and GPU engines. Suite 647 → **682 green**.
+
+- **2026-06-27 (pass 3 — "runs any model"):** the **GPU engine now runs any CPU-runnable model** —
+  `IlgpuEngine.Run` executes natively-supported ops on-device and transparently **falls back to the
+  CPU kernel** (download → CPU kernel → re-upload) for the rest, instead of throwing; **+22 CPU ops**
+  (Sequence* + Optional* value types/ops, `QLinear*` quantized ops — QLinearMatMul/Conv/Add/Mul,
+  ConvInteger, QLinearGlobalAveragePool — and FastGelu/BiasGelu/QuickGelu/Affine/ImageScaler);
+  **encoder-decoder (seq2seq) generation** (`Seq2SeqGenerator` + Pipeline `Seq2SeqGeneration` task:
+  encoder-once + cross-attention KV-cached decode for T5/BART/Marian). GGUF grid-codebook IQ1/2/3
+  remain deferred (need vendored ggml lattice tables + license attribution to verify bit-exactly).
+  Suite 572 → **647 green**.
+- **2026-06-27 (pass 2):** the **full distilgpt2 graph now runs end-to-end on the GPU engine**
+  (`IlgpuEngine.Run`, all 1569 nodes, no CPU fallback) and matches the CPU engine's logits
+  (Δ ≤ 1.8e-4) + exact greedy argmax on CUDA; added a full GPU **decoder-layer** through the
+  on-device KV-cache seam; **control-flow ops** (If/Loop/Scan) with ONNX subgraph parsing/execution;
+  **GGUF IQ4** dequant + asset-gated real-GGUF e2e test; **DFT FFT** fast path + opset-20 axis-input;
+  NuGet packaging metadata + CHANGELOG (v0.2.0-alpha). Suite 549 → **572 green**.
+- **2026-06-27:** closed the prior open items — whole-graph GPU dispatch (B5 prologue ops), GGUF
+  quantized-tensor dequantization, and the signal-processing op family. Suite 514 → **549 green**.
 - **2026-06-26:** validated end-to-end on an RTX 4090 (CUDA) + real model exports.
 - **Phase 0 (GPU bring-up):** ✅ ILGPU sees the RTX 4090 (`IsHardwareGpu == true`); new hardware-gated
   CUDA tests skip on CPU-only CI but run on the real GPU.
@@ -19,12 +44,17 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
   (int32/int64) + B3 GPU op parity (LayerNorm/Gather/Concat/Slice/Cast) now verified on CUDA, B4 perf
   (MatMul ~556x, Conv2D ~109x vs CPU on the 4090). B5: GPU decoder kernels + an on-device KV-cache
   now run a full self-attention block and a multi-step autoregressive decode entirely on CUDA
-  (~1.3 ms/step); 98.7% of distilgpt2's nodes are GPU-dispatchable (integer mask/position prologue
-  still falls back). Op coverage 143 → 163.
+  (~1.3 ms/step). **B5 whole-graph closeout (2026-06-27):** added the 6 integer mask/position-id
+  prologue ops on the GPU engine (Range, ConstantOfShape, Equal, Greater, Trilu, ScatterND) →
+  100% of distilgpt2's nodes GPU-dispatchable. **Pass 2 (2026-06-27):** the int/float routing in
+  `IlgpuEngine.Run` (Gather/binary-op host paths for int index math) is now complete, so the **full
+  distilgpt2 graph executes end-to-end on the GPU** matching CPU logits (Δ ≤ 1.8e-4) + exact argmax —
+  no fallback; plus a full GPU decoder layer over the on-device KV-cache. Op coverage 143 → 169.
 - **Phase C:** ✅ C1 `use_cache_branch`, ✅ C2 `Pipeline.Generate` text-generation API, ✅ C3 quantization
   (DequantizeLinear/QuantizeLinear/DynamicQuantizeLinear/MatMulInteger + GPTQ/AWQ safetensors dequant),
-  ✅ C4 mmap >2 GB safetensors + sharded `index.json`, ✅ C5 GGUF reader, ✅ C6 fused LLM ops
-  (RMSNorm/SkipRMSNorm/RotaryEmbedding/MultiHeadAttention/GroupQueryAttention).
+  ✅ C4 mmap >2 GB safetensors + sharded `index.json`, ✅ C5 GGUF reader **+ quantized-tensor
+  dequant** (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 legacy + Q2_K..Q8_K k-quants; IQ codebook types still
+  raw), ✅ C6 fused LLM ops (RMSNorm/SkipRMSNorm/RotaryEmbedding/MultiHeadAttention/GroupQueryAttention).
 - **Phase D:** ✅ embedding attention-mask fix, ✅ manifest-precedence test, ✅ Tan/ReduceSumSquare tests,
   ✅ op coverage **88 → 143** ops (logical, trig/hyperbolic inverses, IsNaN/IsInf, normalization family,
   data-movement family, pooling-extra family, Mod/BitShift/Random, Size/NonZero, etc.).
@@ -34,7 +64,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 514 tests, 0 failures** (432 base + 31
+- Build/test baseline: `dotnet test` must be **GREEN — 682 tests, 0 failures** (includes
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,
@@ -118,10 +148,11 @@ asset is absent** (mirror `MiniLmTests`; discovery via `MODELSHARP_MODELS_DIR` /
   distilgpt2's nodes GPU-dispatchable**. Implemented an **on-device KV-cache** (`GpuKvCache` +
   `IlgpuEngine.CreateKvCache`/`DecodeStepAttention`): a full self-attention block and a 5-step
   autoregressive decode run **entirely on CUDA**, matching the CPU engine within 1e-3
-  (~1.3 ms/step, K/V never leave the device). ⏳ Remaining for a *whole-graph* run: GPU kernels for
-  the 6 integer mask/position-id prologue ops (Range, ConstantOfShape, Equal, Greater, Trilu,
-  ScatterND) and composing projections/MLP/residual into the cache seam. See
-  `src/ModelSharp.Gpu/B5_NOTES.md`.
+  (~1.3 ms/step, K/V never leave the device). ✅ **Whole-graph closeout (2026-06-27):** the 6 integer
+  mask/position-id prologue ops (Range, ConstantOfShape, Equal, Greater, Trilu, ScatterND) are now
+  handled by the GPU engine (host-side index/control-flow, consistent with the int-tensor-on-host
+  design), so **100% of distilgpt2's nodes are GPU-dispatchable — no fallbacks** (verified by
+  `GpuDistilGpt2AuditTests` + `GpuPrologueOpsTests`). See `src/ModelSharp.Gpu/B5_NOTES.md`.
 
 ---
 
@@ -145,7 +176,10 @@ asset is absent** (mirror `MiniLmTests`; discovery via `MODELSHARP_MODELS_DIR` /
 ---
 
 ## Phase D — Op coverage & correctness cleanups
-- ✅ Op coverage now **163 of ~190** standard ops (added Einsum, ConvTranspose, GridSample,
+- ✅ Op coverage now **180 of ~190** standard ops (plus `QLinear*` quantized + contrib/fused ops) —
+  added Sequence*/Optional* op families, QLinear* quantized ops, control-flow If/Loop/Scan with full ONNX
+  subgraph parsing + execution, and the DFT/STFT/MelWeightMatrix signal family;
+  earlier: Einsum, ConvTranspose, GridSample,
   NonMaxSuppression, Col2Im, Det, Unique, Bitwise{And,Or,Xor,Not}, {Hann,Hamming,Blackman}Window,
   CenterCropPad, Dropout, MaxRoiPool, Upsample, Bernoulli, Multinomial). Extend further as models demand. Add via new kernel files +
   `KernelRegistry`, each with a `NewOpsTests`-style unit test.
@@ -163,4 +197,6 @@ an **embedding** model (already done), an **image classifier**, an **object dete
 and a **text-completion LLM** — all now proven end-to-end on **real models on CPU**, with the **GPU path
 validated on CUDA** (RTX 4090). Each is proven by an opt-in test against a real model asset; the
 real-model tests live behind `MODELSHARP_MODELS_DIR` / repo-relative `models/` discovery and **skip when
-the assets are absent**. (7B-class on the GPU via quantization remains the next scaling target.)
+the assets are absent**. The **full distilgpt2 graph now also runs end-to-end on the GPU engine**
+(matching CPU). (Proving a **7B-class** quantized model on the GPU — which needs the large model
+asset present — remains the next scaling target.)

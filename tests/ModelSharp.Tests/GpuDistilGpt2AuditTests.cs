@@ -30,6 +30,8 @@ public class GpuDistilGpt2AuditTests
         // B5 additions:
         "Erf", "Pow", "Where", "Reshape", "Unsqueeze", "Squeeze", "Shape", "Constant",
         "Expand", "Split",
+        // B5 completion — integer/boolean mask & position-id prologue ops (host-side):
+        "Range", "ConstantOfShape", "Equal", "Greater", "Trilu", "ScatterND",
     };
 
     [Fact]
