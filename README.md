@@ -46,6 +46,7 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam).
 - 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
 - 🖼️ **Optional image adapter** — image → tensor and top-K classification decoding via ImageSharp.
+- ⬇️ **Optional model hub** — `HubPipeline.Load("qwen2.5-0.5b-int4")` downloads a model (+ its external-data shards & tokenizer) from Hugging Face / GGUF / safetensors / any URL and runs it, with a local cache. Pure-managed (`HttpClient` only); the core stays dependency-free.
 
 ## Verified on real models
 
@@ -65,7 +66,7 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | INT4 LLM (text) | Qwen2.5-0.5B-Instruct (INT4 q4) | forward pass in **~2 s**, logits **match ONNX Runtime exactly** (argmax 358, logit 15.077); full generation: `"The capital of France is"` → **" Paris. It is the largest city in the world by population…"** |
 | Whisper ASR | whisper-tiny | transcribes the LibriSpeech clip as **"Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel."** (log-mel → seq2seq decode) |
 
-The full test suite is **878 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` and `fp16`/`bf16` initializers, dtype-generic Gather, a native on-device `MatMulInteger` GEMM), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, real **INT4 LLMs** (Qwen-0.5B and Mistral-**7B**, via `MatMulNBits` + genai `GroupQueryAttention` + ONNX **external-data** loading) run end-to-end, and Whisper-style ASR runs through the seq2seq path (exact 400-point DFT mel front-end). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **920 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` and `fp16`/`bf16` initializers, dtype-generic Gather, a native on-device `MatMulInteger` GEMM), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, real **INT4 LLMs** (Qwen-0.5B and Mistral-**7B**, via `MatMulNBits` + genai `GroupQueryAttention` + ONNX **external-data** loading) run end-to-end, and Whisper-style ASR runs through the seq2seq path (exact 400-point DFT mel front-end). The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 
@@ -73,11 +74,26 @@ The full test suite is **878 passing (0 failed)** and op coverage is **180 of ~1
 dotnet add package ModelSharp              # core: load + run any ONNX model on CPU, plus text & audio front ends
 dotnet add package ModelSharp.ImageSharp   # optional: image decoding & classification
 dotnet add package ModelSharp.Gpu          # optional: ILGPU GPU backend
+dotnet add package ModelSharp.Hub          # optional: download models from Hugging Face / URLs
 ```
 
 > Requires **.NET 10**. The core `ModelSharp` package has **no external dependencies**.
 
 ## Quick start
+
+### Download &amp; run from the hub (`ModelSharp.Hub`)
+
+```csharp
+using ModelSharp.Hub;
+
+// Downloads the model + its tokenizer/config (and any external-data shards) into a local cache, then runs it.
+using var pipeline = HubPipeline.Load("all-minilm-l6-v2");        // a friendly alias…
+float[] embedding = pipeline.Run<float[]>("A man is playing a guitar.");
+
+// …or any Hugging Face repo / file, GGUF, safetensors, or direct URL:
+ResolvedModel m = ModelHub.Get("onnx-community/Qwen2.5-0.5B-Instruct/onnx/model_q4.onnx");
+// m.ModelPath is local; m.Files lists the model + tokenizer + config that came with it.
+```
 
 ### Text embeddings (sentence-transformers)
 
