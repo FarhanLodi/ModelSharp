@@ -447,17 +447,15 @@ public class GpuLlmTests
     // ---- Stretch: probe how far the real distilgpt2 graph runs on the GPU engine ----
 
     /// <summary>
-    /// Loads the real distilgpt2 ONNX graph and reports, honestly, how far the GPU engine can carry it.
-    /// distilgpt2's mask / position-id prologue uses integer/control ops (Range/ConstantOfShape/Equal/Greater/
-    /// Trilu/ScatterND) that the GPU engine does not implement, so the full graph is NOT runnable end-to-end on
-    /// GPU. This test confirms (a) the GPU engine's dispatch covers every op EXCEPT that known fallback set, and
-    /// (b) the first op that would force a fallback is one of those ops — documenting precisely what still falls
-    /// back, without faking any output. The heavy transformer compute (Gemm/MatMul/Softmax/LayerNorm/attention,
-    /// the Pow/Tanh GELU, Reshape/Transpose/Split/Concat/Gather/Slice plumbing) IS all GPU-dispatchable and is
-    /// proven elsewhere in this file (the attention block + multi-step KV-cache tests).
+    /// Loads the real distilgpt2 ONNX graph and confirms the GPU engine now dispatches EVERY op in it — the
+    /// integer/mask position-id prologue ops (Range/ConstantOfShape/Equal/Greater/Trilu/ScatterND) that used to
+    /// force a CPU fallback are now handled host-side by the engine, so the whole graph is GPU-dispatchable with
+    /// an empty fallback set. The heavy transformer compute (Gemm/MatMul/Softmax/LayerNorm/attention, the
+    /// Pow/Tanh GELU, Reshape/Transpose/Split/Concat/Gather/Slice plumbing) is proven elsewhere in this file
+    /// (the attention block + multi-step KV-cache tests); the prologue ops are exercised in GpuPrologueOpsTests.
     /// </summary>
     [Fact]
-    public void DistilGpt2_Gpu_Coverage_Gap_Is_Exactly_The_Known_Fallbacks()
+    public void DistilGpt2_Gpu_Coverage_Is_Complete()
     {
         const string modelPath = "/home/x16/models/distilgpt2.onnx";
         if (!System.IO.File.Exists(modelPath))
@@ -475,29 +473,22 @@ public class GpuLlmTests
             "Transpose", "Softmax", "ReduceSum", "ReduceMean", "LayerNormalization", "Gather", "Concat",
             "Slice", "Cast", "MatMul", "Gemm", "Conv", "Erf", "Pow", "Where", "Reshape", "Unsqueeze",
             "Squeeze", "Shape", "Constant", "Expand", "Split",
-        };
-        var knownFallbacks = new HashSet<string>(StringComparer.Ordinal)
-        {
+            // B5 completion — integer/mask prologue ops, now GPU-dispatched (host-side):
             "Range", "ConstantOfShape", "Equal", "Greater", "Trilu", "ScatterND",
         };
 
         var distinct = graph.Nodes.Select(n => n.OpType).Distinct().ToHashSet();
-        var unaccounted = distinct.Where(o => !gpuOps.Contains(o) && !knownFallbacks.Contains(o)).ToList();
+        var unaccounted = distinct.Where(o => !gpuOps.Contains(o)).OrderBy(o => o).ToList();
         Assert.True(unaccounted.Count == 0,
-            $"distilgpt2 has op(s) neither GPU-dispatched nor in the known-fallback set: {string.Join(", ", unaccounted)}");
+            $"distilgpt2 has op(s) the GPU engine does not dispatch: {string.Join(", ", unaccounted)}");
 
-        // Every distinct op is either GPU-dispatched or a known fallback.
-        var fallbacksPresent = distinct.Where(o => knownFallbacks.Contains(o)).OrderBy(o => o).ToList();
+        // Every node is GPU-dispatchable: no fallback remains.
         int gpuDispatchable = graph.Nodes.Count(n => gpuOps.Contains(n.OpType));
-        _out.WriteLine($"DistilGpt2Coverage: {gpuDispatchable}/{graph.Nodes.Count} nodes are GPU-dispatchable.");
-        _out.WriteLine($"Still falls back to CPU (integer/mask prologue ops): {string.Join(", ", fallbacksPresent)}.");
-        _out.WriteLine("Full-graph end-to-end GPU run is therefore NOT reachable; the transformer compute path " +
-                       "(attention + MLP) is GPU-complete and proven by the attention-block and KV-cache tests.");
+        Assert.Equal(graph.Nodes.Count, gpuDispatchable);
+        _out.WriteLine($"DistilGpt2Coverage: {gpuDispatchable}/{graph.Nodes.Count} nodes are GPU-dispatchable (100%).");
+        _out.WriteLine("No CPU fallback remains; the whole distilgpt2 graph is GPU-dispatchable.");
 
-        // First fallback op in topo order — the precise point where a whole-graph GPU run would stop.
         GraphNode? firstFallback = graph.Nodes.FirstOrDefault(n => !gpuOps.Contains(n.OpType));
-        Assert.NotNull(firstFallback);
-        Assert.Contains(firstFallback!.OpType, knownFallbacks);
-        _out.WriteLine($"First fallback op (topo order): '{firstFallback.OpType}' ('{firstFallback.Name}').");
+        Assert.Null(firstFallback);
     }
 }

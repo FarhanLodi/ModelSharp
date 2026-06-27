@@ -149,8 +149,10 @@ public static class OnnxModelLoader
         long? i = null;
         string? s = null;
         Tensor? t = null;
+        ModelGraph? g = null;
         List<long>? ints = null;
         List<float>? floats = null;
+        List<ModelGraph>? graphs = null;
 
         var r = new ProtoReader(bytes);
         while (r.TryReadTag(out int field, out int wire))
@@ -163,23 +165,31 @@ public static class OnnxModelLoader
                 case 3 when wire == 0: i = r.ReadInt64(); break;
                 case 4 when wire == 2: s = Encoding.UTF8.GetString(r.ReadLengthDelimited()); break;
                 case 5 when wire == 2: t = ParseTensor(r.ReadLengthDelimited()).Tensor; break;
+                // AttributeProto.g (field 6): single nested GraphProto.
+                case 6 when wire == 2: g = ParseGraph(r.ReadLengthDelimited(), metadata: null); break;
                 case 7 when wire == 5: (floats ??= new()).Add(r.ReadFloat()); break;
                 case 7 when wire == 2: ReadPackedFloats(r.ReadLengthDelimited(), floats ??= new()); break;
                 case 8 when wire == 0: (ints ??= new()).Add(r.ReadInt64()); break;
                 case 8 when wire == 2: ReadPackedVarints(r.ReadLengthDelimited(), ints ??= new()); break;
+                // AttributeProto.graphs (field 10): repeated GraphProto.
+                case 10 when wire == 2: (graphs ??= new()).Add(ParseGraph(r.ReadLengthDelimited(), metadata: null)); break;
                 default: r.SkipField(wire); break;
             }
         }
 
-        // AttributeType: FLOAT=1, INT=2, STRING=3, TENSOR=4, FLOATS=6, INTS=7.
+        // AttributeType: FLOAT=1, INT=2, STRING=3, TENSOR=4, GRAPH=5, FLOATS=6, INTS=7, GRAPHS=10.
         object? value =
             type == 1 ? f :
             type == 2 ? i :
             type == 3 ? s :
             type == 4 ? (object?)t :
+            type == 5 ? (object?)g :
             type == 6 ? floats?.ToArray() :
             type == 7 ? ints?.ToArray() :
+            type == 10 ? (object?)graphs?.ToArray() :
             // Unknown/undefined type: infer from whichever field was present.
+            g is not null ? g :
+            graphs is not null ? (object?)graphs.ToArray() :
             ints is not null ? ints.ToArray() :
             floats is not null ? (object?)floats.ToArray() :
             i.HasValue ? i.Value :
@@ -191,7 +201,7 @@ public static class OnnxModelLoader
     }
 
     // ONNX TensorProto.DataType values we materialize.
-    private const long DtFloat = 1, DtInt32 = 6, DtInt64 = 7, DtBool = 9;
+    private const long DtFloat = 1, DtUint8 = 2, DtInt8 = 3, DtInt32 = 6, DtInt64 = 7, DtBool = 9;
 
     private static (string Name, Tensor Tensor) ParseTensor(ReadOnlySpan<byte> bytes)
     {
@@ -277,6 +287,26 @@ public static class OnnxModelLoader
                 else if (floatData is not null)
                     for (int k = 0; k < count && k < floatData.Count; k++) data[k] = floatData[k];
                 return (name, new Tensor<float>(shape, data));
+            }
+            case DtUint8:
+            {
+                // uint8 (e.g. quantized weights / zero-points). Raw bytes map directly; otherwise
+                // ONNX packs the values into int32_data.
+                var data = new byte[count];
+                if (hasRaw && count > 0)
+                    rawData.Slice(0, count).CopyTo(data);
+                else if (int32Data is not null)
+                    for (int k = 0; k < count && k < int32Data.Count; k++) data[k] = (byte)int32Data[k];
+                return (name, new Tensor<byte>(shape, data));
+            }
+            case DtInt8:
+            {
+                var data = new sbyte[count];
+                if (hasRaw && count > 0)
+                    MemoryMarshal.Cast<byte, sbyte>(rawData).Slice(0, count).CopyTo(data);
+                else if (int32Data is not null)
+                    for (int k = 0; k < count && k < int32Data.Count; k++) data[k] = (sbyte)int32Data[k];
+                return (name, new Tensor<sbyte>(shape, data));
             }
             default:
                 throw new ModelSharpException(
