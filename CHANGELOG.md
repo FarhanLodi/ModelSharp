@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   T5 / BART / MarianMT-style models.
 - GGUF `IQ4_NL` / `IQ4_XS` dequantization; `DFT` FFT fast path (radix-2 +
   Bluestein) and opset-20 axis-as-input.
+- GGUF grid-codebook IQ dequantization for `IQ1_S`, `IQ1_M`, `IQ2_XXS`,
+  `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S` (ggml lattice tables vendored from a
+  pinned llama.cpp commit; MIT attribution added to `NOTICE`). Every GGUF
+  quantization type now dequantizes.
+- Whisper-style ASR: `WhisperFeatureExtractor` (log-mel front-end) + forced-prompt
+  decoding through the seq2seq path (`ModelTask.SpeechToTextSeq2Seq`).
+- Quantized ONNX model support: the loader parses `uint8`/`int8` initializers and
+  `Gather` is dtype-generic, so dynamic-INT8 ONNX models (e.g. quantized GPT-2)
+  load and run — validated whole-graph on CUDA with exact greedy-argmax parity
+  vs the CPU engine.
 - NuGet packaging metadata for the shippable packages (`ModelSharp`,
   `ModelSharp.ImageSharp`, `ModelSharp.Gpu`): authors, description, license
   expression, project/repository URLs, and tags. The core package now embeds the
