@@ -270,14 +270,45 @@ the dtype-correct CPU kernel.
 
 ## What runs
 
-Quantized inference now runs **end-to-end through `IlgpuEngine`**. The quantized op family
-(`DequantizeLinear`/`QuantizeLinear`/`DynamicQuantizeLinear`/`MatMulInteger` and the `QLinear*` family) has no
-native GPU kernel, so on the GPU engine each one runs through the **per-op CPU fallback** (`RunCpuFallback`):
-its inputs are materialized to host (float buffers downloaded; the uint8/int8/int32 quantized tensors already
-live host-side), the matching CPU quant kernel runs, and outputs are re-homed by dtype — float → device,
-int/uint8/int32 → host. This composes correctly with the surrounding **native GPU float ops**: in a real
-quantized decoder the heavy float matmuls (attention QKᵀ / A·V, and the `lm_head` logits projection over the
-full vocab) dispatch to the device `MatMul` kernel, while the INT8 linear layers route through the fallback.
+Quantized inference runs **end-to-end through `IlgpuEngine`**, and the GEMM hot-spot — `MatMulInteger` — now
+runs **natively on the device** (no longer through the CPU fallback). The rest of the quantized op family
+(`DequantizeLinear`/`QuantizeLinear`/`DynamicQuantizeLinear` and the `QLinear*` family) still routes through the
+**per-op CPU fallback** (`RunCpuFallback`), which is cheap (per-tensor/per-channel scalar math, not the O(MNK)
+GEMM). This composes correctly with the surrounding **native GPU float ops**: in a real quantized decoder the
+heavy float matmuls (attention QKᵀ / A·V, and the `lm_head` logits projection over the full vocab) dispatch to
+the device `MatMul` kernel, the INT8 linear layers now dispatch to the device `MatMulIntegerK` kernel, and only
+the lightweight quant/dequant glue rounds through the host.
+
+## Native `MatMulInteger` GEMM (this pass) — on-device, no longer a fallback
+
+`MatMulInteger` previously had **no native case** in the engine switch, so it hit `RunCpuFallback` → the scalar,
+**double-precision** `MatMulIntegerKernel` on the host (with a device↔host round-trip per linear). It is now a
+first-class native GPU op:
+
+- **Kernel** (`GpuKernels.MatMulIntegerK`): one thread per output element across `[batch, M, N]`, exactly the
+  layout of the float `MatMulK`. A and B are uploaded to the device as **int32** buffers (the uint8/int8 operands
+  are widened to int32 host-side in `ReadQuantAsInts`). Each thread computes `Σ_k (a−a_zp)·(b−b_zp)` with an
+  **int32 accumulator**. The per-flattened-batch operand base offsets (NumPy-broadcast-resolved, element units)
+  are precomputed on the host and uploaded, identical to `RunMatMul`, so batching/broadcasting of the leading
+  dims matches the float path and the CPU reference.
+- **Zero-point handling**: zero points are uploaded as int32 buffers with a per-operand **stride selector** —
+  `aZpStride`/`bZpStride` ∈ {0,1}. Stride 0 means *absent or per-tensor* (every thread reads the single scalar
+  `zp[0]`); stride 1 means *per-row of A* (`zp[m]`, length M) or *per-column of B* (`zp[n]`, length N). This one
+  branchless form covers all four cases (absent / per-tensor / per-row / per-column) and reproduces the CPU
+  kernel's selection exactly — including the `M==1`/`N==1` edge where a length-1 zp is treated as scalar.
+- **Dtype variants**: uint8×int8 (the gpt2 case), uint8×uint8, int8×int8, int8×uint8 — and int32 — all work,
+  because operands and zero points are widened to int32 before upload (`ReadQuantAsInts`).
+- **Exactness**: the CPU kernel accumulates each product in int64 then casts `(int)sum`; the GPU kernel
+  accumulates in int32 (wrapping). Two's-complement addition has identical low-32 bits at any width, and every
+  `(a−zp)` difference and its product fit in int32 (operands ∈ [−128,255]), so the int32 result is **bit-exact**
+  vs the CPU reference — proven element-exact by the parity tests below.
+- **Result flow downstream**: the int32 device result is read back into a host `Tensor<int>` and stored as a
+  host-side `DeviceValue` — the **same dtype and home** the CPU fallback produced. So the downstream
+  `Cast(int32→float)` → `Mul(scale)` dequant chain (and any `DequantizeLinear` consumer) sees an identical value
+  and is **unchanged**. (Int32 tensors live host-side in this engine by the same int/bool convention as token
+  ids and masks; only the O(MNK) compute moved to the device, which is the point.)
+
+Wired as `case "MatMulInteger": RunMatMulInteger(...)` in `Run`'s switch.
 
 ## Validation
 
@@ -290,7 +321,8 @@ plain `[Fact]` (covered on every machine, no CUDA) and is re-run on **hardware C
 
 | Graph | What it proves |
 |-------|----------------|
-| `MatMulInteger` → `Cast(int32→float)` → `Mul(scale)` | INT8 matmul with scalar zero-points, dequantized; int32 fallback output bridges to a device float via `Cast` |
+| `MatMulInteger` → `Cast(int32→float)` → `Mul(scale)` | INT8 matmul with scalar zero-points, dequantized; the **native** int32 GEMM output bridges to a device float via `Cast` |
+| bare `MatMulInteger` (`MatMulInteger_Native_Parity_CpuAccel`, `[Theory]` over 12 cases) | the native int32 GEMM is **element-exact** vs the CPU reference across shapes (incl. M==1, N==1, larger tiles), operand dtypes (u8×i8, u8×u8, i8×i8, i8×u8) and zero-point forms (absent / per-tensor / per-row A / per-col B / batched rank-3 & rank-4). Re-run on CUDA via `Cuda_MatMulInteger_Native`. |
 | `QuantizeLinear` → `QLinearMatMul` → `DequantizeLinear` | full per-tensor quantize→qmatmul→dequant round trip |
 | per-channel `DequantizeLinear`(axis=0) → `Transpose` → `MatMul` → `Add` | INT8 **per-channel** weight dequant feeding a native GPU matmul+bias |
 | `DynamicQuantizeLinear`→`MatMulInteger`→dequant → softmax self-attention → `DynamicQuantizeLinear`→`MatMulInteger`→dequant | tiny **quantized transformer block**: quantized fallback ops interleaved with native GPU `MatMul`/`Transpose`/`Softmax`/`Mul` end-to-end |
@@ -334,12 +366,30 @@ So an INT8 7B fits in the RTX 4090's 24 GB VRAM with wide headroom for activatio
 halves that again. The KV cache (fp16) for a 7B model (≈32 layers × 2 × n_kv_head·head_dim) is ~0.5 MB/token,
 so even a 4k-token context (~2 GB) stays comfortably within 24 GB.
 
-**Throughput observation.** ORT INT8 gpt2 (CPU EP, this box) runs the full prefill graph at ~6.8 ms / ~146
-graph-runs/s (seq=8). ModelSharp's `IlgpuEngine` is **not** yet competitive on tokens/s for the quantized
-linears: they run on the **scalar, double-precision CPU fallback** kernel (`MatMulIntegerKernel`), not a device
-kernel, and each invocation pays a device↔host round-trip. The native GPU float ops (incl. the large `lm_head`
-matmul) *are* on-device, so the bottleneck is specifically the un-accelerated INT8 matmuls. The deliverable
-here is **correctness** of quantized inference on the GPU engine (proven above), not throughput.
+**Throughput observation.** The INT8 GEMM hot-spot is now **on-device**. `GpuMatMulIntegerPerfTests.cs`
+(CUDA-gated, `[Collection("CudaGpu")]`) times the native `MatMulIntegerK` kernel against the same op on the
+managed CPU engine (the old double-precision `MatMulIntegerKernel` fallback) on two realistic shapes and asserts
+the native int32 result is **element-exact** vs CPU before logging the speedup (no ratio is hard-asserted —
+hardware-dependent):
+
+- `Square2048` — a 2048×2048×2048 INT8 GEMM (~17.2 GOP).
+- `Llm[32,4096]×[4096,4096]` — an LLM-decode-shaped projection (seq=32, hidden=4096), the shape a 7B-class
+  attention/MLP linear lowers to at INT8.
+
+*Expected* magnitude on a 4090: the CPU reference is a single-threaded scalar `double` triple-loop, so on these
+sizes the native per-output-element GPU kernel should land in the **~50–200×** range for the 2048³ point and
+**tens of ×** for the LLM-shaped point (the device kernel is one-thread-per-output naïve, not yet shared-memory
+tiled, so it is occupancy/issue-bound rather than peak-INT8-DP4A bound — there is headroom). The exact numbers
+print to the test output on the run box; the parent's central run captures them. Either way the per-linear
+device↔host round-trip and the host double-precision GEMM are **gone** for `MatMulInteger`.
+
+**What now falls back vs runs native (quantized path):**
+
+- **`MatMulInteger` — NATIVE on device** (this pass). The O(MNK) GEMM, the actual hot-spot.
+- `DynamicQuantizeLinear` / `QuantizeLinear` / `DequantizeLinear` / `QLinear*` — still CPU fallback, but these
+  are O(N) per-tensor / per-channel scalar passes (quantize an activation, rescale an int32 accumulator), not
+  GEMMs. They remain candidates for a native pass but are not the throughput bottleneck.
+- All float ops (attention QKᵀ/A·V, `lm_head`, LayerNorm-via-primitives, GELU, softmax) — native on device.
 
 **What a literal 7B-class quantized run needs** (exact remaining requirements):
 
@@ -348,9 +398,11 @@ here is **correctness** of quantized inference on the GPU engine (proven above),
    asset-gated test pattern picks it up. (Not downloaded here — out of test-time budget; the path is proven on
    the smaller real quantized gpt2, which shares the identical op structure.)
 2. **VRAM.** ~7 GB (INT8) / ~4 GB (INT4) weights + ~1–2 GB activations + KV cache — fits the 24 GB 4090.
-3. **A native GPU `MatMulInteger` kernel** to make it *fast* (not *possible* — the fallback already makes it
-   possible). A tiled INT8 GEMM (uint8×int8 → int32 accumulate) on the device, fed the host-resident quantized
-   tensors directly, would remove the per-linear round-trip. Order-of-magnitude expectation on a 4090 once the
-   INT8 GEMM is on-device: tens of tokens/s for a 7B INT8 decode (memory-bandwidth bound), versus the current
-   fallback path which is far slower. This is the one piece of real engineering left for a *performant* literal
-   7B proof; the *correctness* path is already validated.
+3. **GEMM throughput — NOW NATIVE.** The native on-device `MatMulInteger` (uint8/int8 → int32 accumulate, fed the
+   host-resident quantized tensors directly, computed entirely on the accelerator) removes the per-linear
+   double-precision host GEMM and its round-trip — the one piece of real engineering that previously stood
+   between *possible* and *performant*. The remaining throughput upside is incremental, not blocking: a
+   shared-memory-tiled / DP4A INT8 GEMM (vs the current one-thread-per-output kernel) and native
+   `DynamicQuantize`/`Dequantize` to eliminate the last lightweight round-trips. With the native GEMM in place, a
+   7B INT8 decode on a 4090 is memory-bandwidth bound (weights ~7 GB/token-pass), i.e. tens of tokens/s is the
+   expected regime once the asset is present.
