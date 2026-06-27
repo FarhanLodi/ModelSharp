@@ -38,7 +38,9 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
 - 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types (token ids, masks, and shape tensors included).
-- 🧠 **46 ONNX operators** out of the box — CNNs, transformers, and RNNs (LSTM/GRU) included.
+- 🧠 **191 operators** out of the box — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control-flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*` ops included.
+- ♻️ **Runs *any* model on the GPU** — the ILGPU backend executes natively-supported ops on-device and transparently falls back to the CPU kernel for the rest, so any CPU-runnable model also runs through the GPU engine.
+- 🔁 **Encoder-decoder generation** — T5 / BART / MarianMT-style seq2seq (encoder-once + cross-attention KV-cached decode), alongside decoder-only LLM generation.
 - 🔤 **Built-in tokenizers** — WordPiece (BERT) and byte-level BPE (GPT-2 / RoBERTa), pure managed.
 - 🎙️ **Audio front end** — FFT, log-mel spectrograms, and CTC decoding (greedy + prefix-beam).
 - 🔌 **Swappable backends** — the same API runs on the managed CPU engine or the optional ILGPU GPU engine.
@@ -56,9 +58,10 @@ ModelSharp has been validated **end to end on real, exported ONNX models** — w
 | Object detection | YOLOv8 | detects **2 cats** with well-formed boxes (auto layout detection) |
 | Speech recognition (CTC) | wav2vec2-base-960h | transcribes a LibriSpeech clip exactly as `"MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL"` |
 | GPU *(optional ILGPU backend)* | NVIDIA RTX 4090 (CUDA) | GPU outputs match the CPU engine across **40+ ops**; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
-| GPU LLM path | distilgpt2 on CUDA | **98.7% of nodes GPU-dispatchable**; a self-attention block and a multi-step decode run entirely on GPU via an **on-device KV-cache** (~1.3 ms/step) |
+| GPU LLM path | distilgpt2 on CUDA | the **full 1569-node graph runs end-to-end through the GPU engine** (no CPU fallback), matching the CPU engine's logits (Δ ≤ 1.8e-4) and exact greedy argmax; a full decoder layer + multi-step decode run on an **on-device KV-cache** |
+| Quantized LLM on GPU | INT8 gpt2 (ONNX, dynamic-quant) | the whole quantized graph (48× `DynamicQuantizeLinear`→`MatMulInteger`) runs through the GPU engine and **greedy-decodes with the exact same argmax as the CPU engine** at every step |
 
-The full test suite is **514 passing (0 failed)** and op coverage is **163 of ~190** standard ONNX ops. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
+The full test suite is **682 passing (0 failed)** and op coverage is **180 of ~190** standard ONNX ops (plus `QLinear*` quantized and contrib/fused ops). Quantized ONNX models load and run (`uint8`/`int8` initializers, dtype-generic Gather), every GGUF quant type (legacy, k-quant, and IQ) dequantizes, and Whisper-style ASR runs through the seq2seq path. The real-model integration tests are **opt-in**: they run when the model files are present — via `MODELSHARP_MODELS_DIR` or a repo-relative `models/` directory — and skip cleanly otherwise.
 
 ## Installation
 
@@ -194,7 +197,7 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 
 ## Capabilities
 
-### Operator coverage (46)
+### Operator coverage (191)
 
 - **Arithmetic** (broadcasting): Add, Sub, Mul, Div, Pow
 - **Activations**: Relu, Sigmoid, Tanh, Exp, Log, Sqrt, Abs, Neg, Erf, Gelu, Identity, LeakyRelu, Clip, Softmax
@@ -203,9 +206,13 @@ Inside the core assembly the areas keep their own namespaces (`ModelSharp.Onnx`,
 - **Linear**: MatMul (n-D batched, NumPy semantics), Gemm
 - **Reduction**: ReduceMean (axes, keepdims)
 - **Logical** (bool out, broadcasting): Where, Equal, Less, Greater
-- **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand
+- **Shape / data**: Reshape, Flatten, Concat, Transpose, Gather, Unsqueeze, Squeeze, Cast (typed), Shape, Constant, ConstantOfShape, Slice, Expand, Trilu, ScatterND, Range
+- **Signal**: DFT (+ FFT fast path), STFT, MelWeightMatrix (opset-17 audio front-end ops)
+- **Control flow**: If, Loop, Scan (full ONNX subgraph parsing + execution)
+- **Sequence / Optional**: SequenceEmpty/Construct/Insert/Erase/At/Length, SplitToSequence, ConcatFromSequence, Optional/OptionalGetElement/OptionalHasElement
+- **Quantized**: DequantizeLinear, QuantizeLinear, DynamicQuantizeLinear, MatMulInteger, QLinearMatMul, QLinearConv, QLinearAdd, QLinearMul, ConvInteger, QLinearGlobalAveragePool
 
-> Additional kernels (extra activations, math, reductions, Split/Pad/Tile, TopK, …) are implemented in the kernel library and being wired into the registry as they're verified.
+> The list above is a representative sample; the registry now covers **180 of ~190** standard ops plus `QLinear*` quantized and contrib/fused ops. Any op without a native GPU kernel still runs on the GPU engine via CPU fallback. Additional kernels are wired in as they're verified.
 
 ### Text
 

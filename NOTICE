@@ -5,3 +5,44 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this software except in compliance with the License.
 You may obtain a copy of the License in the LICENSE file in this
 repository, or at http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+
+This product includes constant lattice/codebook tables vendored from llama.cpp
+(the ggml library), used by the GGUF IQ1/IQ2/IQ3 grid-codebook dequantizers in
+src/ModelSharp/Weights/GgufIqGrids.cs.
+
+  Project:  llama.cpp / ggml
+  Source:   https://github.com/ggml-org/llama.cpp
+  File:     ggml/src/ggml-common.h
+  Commit:   050ee92d04c2e1f639025786dea701c70e7d4204
+  URL:      https://raw.githubusercontent.com/ggml-org/llama.cpp/050ee92d04c2e1f639025786dea701c70e7d4204/ggml/src/ggml-common.h
+  License:  MIT
+
+The following tables are transcribed verbatim: iq2xxs_grid, iq2xs_grid,
+iq2s_grid, iq3xxs_grid, iq3s_grid, iq1s_grid, kmask_iq2xs, ksigns_iq2xs. The
+dequantization algorithms in src/ModelSharp/Weights/GgufDequant.cs are ported
+from the corresponding dequantize_row_iq* routines in ggml/src/ggml-quants.c at
+the same commit.
+
+MIT License
+
+Copyright (c) 2023-2024 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

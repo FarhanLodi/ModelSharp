@@ -247,7 +247,7 @@ public class GgufTests
     }
 
     [Fact]
-    public void Materializing_Quantized_Tensor_Throws()
+    public void Materializing_Quantized_Tensor_Dequantizes()
     {
         var w = new GgufWriter();
         w.U32(GgufFile.Magic);
@@ -280,8 +280,12 @@ public class GgufTests
             byte[] raw = f.GetRawTensorBytes("q");
             Assert.Equal(18, raw.Length);
 
-            // ...but materializing as a float tensor is rejected.
-            Assert.Throws<ModelSharpException>(() => f.GetTensor("q"));
+            // ...and materializing now dequantizes to a float tensor (an all-zero
+            // Q4_0 block has scale d == 0, so every element decodes to 0).
+            Tensor t = f.GetTensor("q");
+            Tensor<float> ft = t.AsFloat();
+            Assert.Equal(32L, ft.Length);
+            Assert.All(ft.Buffer.ToArray(), v => Assert.Equal(0f, v));
         }
         finally
         {
