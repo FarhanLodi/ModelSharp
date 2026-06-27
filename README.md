@@ -7,6 +7,7 @@
 
   <p>
     <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/v/ModelSharp.svg?label=nuget&color=blue" alt="NuGet" /></a>
+    <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/dt/ModelSharp.svg?label=downloads&color=blue" alt="NuGet downloads" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License: Apache-2.0" /></a>
     <img src="https://img.shields.io/badge/.NET-10.0-512BD4.svg" alt=".NET 10" />
     <img src="https://img.shields.io/badge/dependencies-zero-brightgreen.svg" alt="Zero dependencies" />
