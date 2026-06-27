@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
@@ -48,6 +49,13 @@ namespace ModelSharp.Cpu.Kernels.Llm;
 public sealed class GroupQueryAttentionKernel : IKernel
 {
     public string OpType => "GroupQueryAttention";
+
+    /// <summary>
+    /// Below this many fused multiply-adds (units × keys × head_dim) the attention
+    /// loop runs serially: thread-pool dispatch costs more than the work itself for
+    /// tiny prefill/decode steps. ~256K MACs ≈ a handful of small heads.
+    /// </summary>
+    private const long ParallelThreshold = 1L << 18;
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -182,7 +190,6 @@ public sealed class GroupQueryAttentionKernel : IKernel
         float scaleAttr = Attr.Float(node, "scale", 0f);
         float scale = scaleAttr != 0f ? scaleAttr : 1f / MathF.Sqrt(headDim);
 
-        ReadOnlySpan<float> qSpan = qBuf;
         ReadOnlySpan<float> kSpan = kBuf;
         ReadOnlySpan<float> vSpan = vBuf;
 
@@ -216,53 +223,70 @@ public sealed class GroupQueryAttentionKernel : IKernel
         }
 
         var outT = new Tensor<float>(new TensorShape(batch, qSeq, qHid));
-        Span<float> outSpan = outT.Span;
-        Span<float> scores = new float[totalSeq];
 
-        for (int b = 0; b < batch; b++)
+        // Parallelize over the independent (batch × query_head × query_position) outer
+        // index: each iteration computes one output head-vector and writes a disjoint
+        // [headDim] slice of the output, so no locks are needed. The Q·K dot and the
+        // attn·V accumulation are SIMD-vectorized. KV is read-only and shared.
+        float[] qArr = qBuf;          // [B, Sq, qHid]
+        float[] pkArr = KernelSimd.Array(presentK); // [B, kvNumHeads, totalSeq, headDim]
+        float[] pvArr = KernelSimd.Array(presentV);
+        float[] outArr = KernelSimd.Array(outT);    // [B, Sq, qHid]
+        int totalUnits = batch * numHeads * qSeq;
+
+        // Tiny problems stay serial to dodge thread-pool dispatch overhead.
+        bool parallel = (long)totalUnits * totalSeq * headDim >= ParallelThreshold;
+
+        void Compute(int unit, float[] scores)
         {
-            // Per-batch causal bound from seqlens_k (last valid key index), if present.
+            int qi = unit % qSeq;
+            int hb = unit / qSeq;
+            int h = hb % numHeads;
+            int b = hb / numHeads;
+
             int seqBound = seqlensK is not null && seqlensK.Length > 0
                 ? (int)seqlensK[Math.Min(b, seqlensK.Length - 1)]
                 : totalSeq - 1;
 
-            for (int h = 0; h < numHeads; h++)
+            int g = h / groupSize;   // shared KV head for this query head.
+            int qRow = (b * qSeq + qi) * qHid + h * headDim;
+            // Causal: query position qi corresponds to absolute position pastSeq+qi,
+            // so it may attend to key positions 0..pastSeq+qi inclusive, further
+            // capped by the last valid key (seqlens_k) for this batch.
+            int kLimit = pastSeq + qi;
+            if (kLimit > seqBound) kLimit = seqBound;
+
+            int kvBase = (b * kvNumHeads + g) * totalSeq * headDim;
+
+            float mx = float.NegativeInfinity;
+            for (int kj = 0; kj <= kLimit; kj++)
             {
-                int g = h / groupSize;   // shared KV head for this query head.
-                for (int qi = 0; qi < qSeq; qi++)
-                {
-                    int qRow = (b * qSeq + qi) * qHid + h * headDim;
-                    // Causal: query position qi corresponds to absolute position pastSeq+qi,
-                    // so it may attend to key positions 0..pastSeq+qi inclusive, further
-                    // capped by the last valid key (seqlens_k) for this batch.
-                    int kLimit = pastSeq + qi;
-                    if (kLimit > seqBound) kLimit = seqBound;
-
-                    float mx = float.NegativeInfinity;
-                    for (int kj = 0; kj <= kLimit; kj++)
-                    {
-                        int kBase = ((b * kvNumHeads + g) * totalSeq + kj) * headDim;
-                        float dot = 0f;
-                        for (int d = 0; d < headDim; d++) dot += qSpan[qRow + d] * pk[kBase + d];
-                        float sc = dot * scale;
-                        scores[kj] = sc;
-                        if (sc > mx) mx = sc;
-                    }
-
-                    float sum = 0f;
-                    for (int kj = 0; kj <= kLimit; kj++) { float e = MathF.Exp(scores[kj] - mx); scores[kj] = e; sum += e; }
-                    float inv = sum > 0f ? 1f / sum : 0f;
-
-                    int outRow = (b * qSeq + qi) * qHid + h * headDim;
-                    for (int d = 0; d < headDim; d++) outSpan[outRow + d] = 0f;
-                    for (int kj = 0; kj <= kLimit; kj++)
-                    {
-                        float w = scores[kj] * inv;
-                        int vBase = ((b * kvNumHeads + g) * totalSeq + kj) * headDim;
-                        for (int d = 0; d < headDim; d++) outSpan[outRow + d] += w * pv[vBase + d];
-                    }
-                }
+                float sc = KernelSimd.Dot(qArr, qRow, pkArr, kvBase + kj * headDim, headDim) * scale;
+                scores[kj] = sc;
+                if (sc > mx) mx = sc;
             }
+
+            float sum = 0f;
+            for (int kj = 0; kj <= kLimit; kj++) { float e = MathF.Exp(scores[kj] - mx); scores[kj] = e; sum += e; }
+            float inv = sum > 0f ? 1f / sum : 0f;
+
+            int outRow = (b * qSeq + qi) * qHid + h * headDim;
+            System.Array.Clear(outArr, outRow, headDim);
+            for (int kj = 0; kj <= kLimit; kj++)
+                KernelSimd.AxpyInto(outArr, outRow, pvArr, kvBase + kj * headDim, scores[kj] * inv, headDim);
+        }
+
+        if (parallel)
+        {
+            Parallel.For(0, totalUnits,
+                () => new float[totalSeq],
+                (unit, _, scores) => { Compute(unit, scores); return scores; },
+                _ => { });
+        }
+        else
+        {
+            float[] scores = new float[totalSeq];
+            for (int unit = 0; unit < totalUnits; unit++) Compute(unit, scores);
         }
 
         ctx.Set(node.Outputs[0], outT);

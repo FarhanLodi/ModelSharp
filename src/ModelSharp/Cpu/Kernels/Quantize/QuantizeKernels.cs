@@ -313,37 +313,45 @@ public sealed class MatMulIntegerKernel : IKernel
         double aZpScalar = aZp is not null && aZp.Length > 0 ? aZp[0] : 0d;
         double bZpScalar = bZp is not null && bZp.Length > 0 ? bZp[0] : 0d;
 
-        var coord = new int[batchRank];
-        int aOff = 0, bOff = 0;   // in matrix units
-        for (int bi = 0; bi < totalBatch; bi++)
+        // Precompute, for each batch index, the A/B matrix offsets (in matrix units) so the row
+        // work is embarrassingly parallel. Integer-as-double values are exact for the int8/uint8
+        // ranges used here, and each output element is accumulated by a single thread, so the int32
+        // result is bit-identical to the serial reduction (no cross-thread reordering of any sum).
+        var aOffOf = new int[totalBatch];
+        var bOffOf = new int[totalBatch];
         {
-            int aBase = aOff * aMat, bBase = bOff * bMat, oBase = bi * oMat;
-            for (int m = 0; m < M; m++)
+            var coord = new int[batchRank];
+            int aOff = 0, bOff = 0;
+            for (int bi = 0; bi < totalBatch; bi++)
             {
-                double az = aZp is null ? 0d : (aZpPerRow ? aZp[m] : aZpScalar);
-                int aRow = aBase + m * K;
-                int oRow = oBase + m * N;
-                for (int nn = 0; nn < N; nn++)
+                aOffOf[bi] = aOff; bOffOf[bi] = bOff;
+                for (int ax = batchRank - 1; ax >= 0; ax--)
                 {
-                    double bz = bZp is null ? 0d : (bZpPerCol ? bZp[nn] : bZpScalar);
-                    long sum = 0;
-                    for (int kk = 0; kk < K; kk++)
-                        sum += (long)(a[aRow + kk] - az) * (long)(b[bBase + kk * N + nn] - bz);
-                    y[oRow + nn] = (int)sum;
+                    coord[ax]++; aOff += aBS[ax]; bOff += bBS[ax];
+                    if (coord[ax] < outBatch[ax]) break;
+                    coord[ax] = 0; aOff -= aBS[ax] * outBatch[ax]; bOff -= bBS[ax] * outBatch[ax];
                 }
             }
-
-            for (int ax = batchRank - 1; ax >= 0; ax--)
-            {
-                coord[ax]++;
-                aOff += aBS[ax];
-                bOff += bBS[ax];
-                if (coord[ax] < outBatch[ax]) break;
-                coord[ax] = 0;
-                aOff -= aBS[ax] * outBatch[ax];
-                bOff -= bBS[ax] * outBatch[ax];
-            }
         }
+
+        long totalRows = (long)totalBatch * M;
+        Linear.MatMulParallel.For(checked((int)totalRows), (long)K * N, row =>
+        {
+            int bi = row / M;
+            int m = row % M;
+            int aBase = aOffOf[bi] * aMat, bBase = bOffOf[bi] * bMat, oBase = bi * oMat;
+            double az = aZp is null ? 0d : (aZpPerRow ? aZp[m] : aZpScalar);
+            int aRow = aBase + m * K;
+            int oRow = oBase + m * N;
+            for (int nn = 0; nn < N; nn++)
+            {
+                double bz = bZp is null ? 0d : (bZpPerCol ? bZp[nn] : bZpScalar);
+                long sum = 0;
+                for (int kk = 0; kk < K; kk++)
+                    sum += (long)(a[aRow + kk] - az) * (long)(b[bBase + kk * N + nn] - bz);
+                y[oRow + nn] = (int)sum;
+            }
+        });
 
         ctx.Set(node.Outputs[0], new Tensor<int>(new TensorShape(outDims), y));
     }
