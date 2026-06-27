@@ -8,7 +8,7 @@
     <RootNamespace>ModelSharp.ImageSharp</RootNamespace>
     <AssemblyName>ModelSharp.ImageSharp</AssemblyName>
     <PackageId>ModelSharp.ImageSharp</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Authors>Farhan Lodi</Authors>
     <Description>ImageSharp-based image pre/post-processing adapter for ModelSharp — resize/normalize tensor preprocessing and classification/detection postprocessing.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
@@ -30,7 +30,7 @@
   <ItemGroup>
     <!-- Pinned to v3.x: ImageSharp v4 added a build-time commercial license-key gate
          that conflicts with ModelSharp's "works the moment you download it" goal. -->
-    <PackageReference Include="ModelSharp" Version="1.0.0" />
+    <PackageReference Include="ModelSharp" Version="1.0.1" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.*" />
   </ItemGroup>
 </Project>
