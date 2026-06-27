@@ -30,11 +30,7 @@
   <ItemGroup>
     <!-- Pinned to v3.x: ImageSharp v4 added a build-time commercial license-key gate
          that conflicts with ModelSharp's "works the moment you download it" goal. -->
+    <PackageReference Include="ModelSharp" Version="1.0.0" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.*" />
   </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\ModelSharp\ModelSharp.csproj" />
-  </ItemGroup>
-
 </Project>
