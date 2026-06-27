@@ -24,6 +24,7 @@ public sealed class BpeTokenizer
         @"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
         RegexOptions.Compiled);
 
+    private readonly Regex _splitPat;
     private readonly Dictionary<string, int> _vocab;
     private readonly Dictionary<int, string> _idToToken;
     private readonly Dictionary<(string, string), int> _bpeRanks;
@@ -45,14 +46,19 @@ public sealed class BpeTokenizer
     /// <param name="bosToken">Optional beginning-of-sequence token added when <c>addSpecial</c> is set; its id is resolved from <paramref name="specialTokens"/> or <paramref name="vocab"/>.</param>
     /// <param name="eosToken">Optional end-of-sequence token added when <c>addSpecial</c> is set.</param>
     /// <param name="unkToken">Optional fallback token for byte-level pieces absent from the vocab; when null such pieces throw.</param>
+    /// <param name="preTokenizePattern">Optional override for the pre-tokenization split regex (e.g. the Qwen/Llama-3 pattern, which splits digits singly and attaches a leading non-letter to letter runs). Defaults to the GPT-2 pattern.</param>
     public BpeTokenizer(
         IReadOnlyDictionary<string, int> vocab,
         IReadOnlyList<(string left, string right)> merges,
         IReadOnlyDictionary<string, int>? specialTokens = null,
         string? bosToken = null,
         string? eosToken = null,
-        string? unkToken = null)
+        string? unkToken = null,
+        string? preTokenizePattern = null)
     {
+        _splitPat = preTokenizePattern is null
+            ? _pat
+            : new Regex(preTokenizePattern, RegexOptions.Compiled);
         _vocab = new Dictionary<string, int>(vocab.Count);
         _idToToken = new Dictionary<int, string>(vocab.Count);
         foreach (KeyValuePair<string, int> kv in vocab)
@@ -126,9 +132,10 @@ public sealed class BpeTokenizer
         IReadOnlyDictionary<string, int>? specialTokens = null,
         string? bosToken = null,
         string? eosToken = null,
-        string? unkToken = null)
+        string? unkToken = null,
+        string? preTokenizePattern = null)
     {
-        return new BpeTokenizer(vocab, ParseMergeLines(mergeRules), specialTokens, bosToken, eosToken, unkToken);
+        return new BpeTokenizer(vocab, ParseMergeLines(mergeRules), specialTokens, bosToken, eosToken, unkToken, preTokenizePattern);
     }
 
     /// <summary>Number of distinct known tokens (base vocab plus any special tokens not already in it).</summary>
@@ -228,7 +235,7 @@ public sealed class BpeTokenizer
 
     private void EncodePlain(string text, List<int> ids)
     {
-        foreach (Match m in _pat.Matches(text))
+        foreach (Match m in _splitPat.Matches(text))
             foreach (string piece in Bpe(MapBytes(m.Value)))
             {
                 if (_vocab.TryGetValue(piece, out int id)) ids.Add(id);
@@ -239,7 +246,7 @@ public sealed class BpeTokenizer
 
     private void PlainPieces(string text, List<string> pieces)
     {
-        foreach (Match m in _pat.Matches(text))
+        foreach (Match m in _splitPat.Matches(text))
             pieces.AddRange(Bpe(MapBytes(m.Value)));
     }
 

@@ -313,6 +313,22 @@ public static class OnnxModelLoader
             else dataType = DtFloat;
         }
 
+        // DoS guard: a malformed/adversarial model can declare huge dims with little or no actual data,
+        // which would force a giant managed allocation (e.g. dims=[2^31] with a few bytes of data). Every
+        // element occupies at least 1 byte of raw data (or one entry of a typed list), so the declared
+        // element count cannot legitimately exceed the available data. Reject before allocating.
+        long availElems = hasRaw ? rawData.Length : 0;
+        if (!hasRaw)
+        {
+            if (int64Data is not null && int64Data.Count > availElems) availElems = int64Data.Count;
+            if (int32Data is not null && int32Data.Count > availElems) availElems = int32Data.Count;
+            if (floatData is not null && floatData.Count > availElems) availElems = floatData.Count;
+        }
+        if (count > availElems)
+            throw new ModelSharpException(
+                $"Initializer '{name}' declares {count} elements but only {availElems} are available in its " +
+                "data (malformed, truncated, or adversarial model).");
+
         switch (dataType)
         {
             case DtInt64:

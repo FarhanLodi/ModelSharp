@@ -8,18 +8,26 @@
 
 All **pure-managed, code-level** roadmap items are implemented + unit-tested, and everything previously
 pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + real exported ONNX models**
-(test suite: **847 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
+(test suite: **878 green (0 failed, 0 skipped)**). Items marked ✅ are done and validated.
 
+- **2026-06-27 (pass 8 — verification & hardening):** **bit-verified against ONNX Runtime** — Qwen-0.5B
+  (`MatMulNBits`) and Mistral-7B (genai `GroupQueryAttention`) next-token logits match ORT *exactly*
+  (argmax + logit to 3 dp). Real text generation via a `tokenizer.json` (HF BPE) loader: Qwen decodes
+  `"The capital of France is"` → `" Paris. It is the largest city in the world by population…"`.
+  Whisper-tiny transcribes correctly ("Mr. Quilter is the apostle…"). Added `local_window_size`
+  (sliding-window attention), Sequence/Optional values across If/Loop/Scan subgraphs, ONNX `ImageDecoder`
+  (ImageSharp), concurrency/thread-safety + malformed-model fuzzing tests, a loader allocation **DoS
+  guard**, and clean `ModelSharpException`s for missing execution-context values. Suite 847 → **878 green**.
 - **2026-06-27 (pass 7 — performance):** multithreaded (`Parallel.For`) + SIMD (`Vector<float>`) the
   CPU matmul/MatMulNBits/MatMulInteger/QLinear, attention (GQA/MHA), RMSNorm/LayerNorm, RoPE and Conv
   kernels; added **native GPU `MatMulNBits` + `GroupQueryAttention`**; confirmed single-token KV-cache
   decode. On the RTX 4090 (bit-identical outputs, just faster): **Mistral-7B INT4 forward 4m11s → ~16s
-  (~16×), Qwen-0.5B → ~2s, core suite 3m45s → 1m30s.** All pure-managed (no new deps). 802 → **847 green**.
+  (~16×), Qwen-0.5B → ~2s, core suite 3m45s → 1m30s.** All pure-managed (no new deps). 802 → **878 green**.
 - **2026-06-27 (pass 5 — scale & precision):** closed the last "at scale" gaps. Native on-device
   **`MatMulInteger` GEMM** (uint8/int8, bit-exact vs CPU) so quantized matmuls run on the GPU instead
   of the CPU fallback — the real INT8 gpt2 now decodes whole-graph on CUDA using it. **fp16/bf16 ONNX
   initializers** load (decoded to float32), so half-precision models run. **Whisper mel** features are
-  now bit-accurate via a true 400-point DFT (Bluestein). Suite 682 → **847 green**.
+  now bit-accurate via a true 400-point DFT (Bluestein). Suite 682 → **878 green**.
 
 - **2026-06-27 (pass 4 — breadth):** all 7 GGUF **grid-codebook IQ** families (IQ1/2/3) now
   dequantize (ggml lattice tables vendored from a pinned llama.cpp commit, MIT attribution in NOTICE);
@@ -75,7 +83,7 @@ pending hardware/assets has now been **validated on a real RTX 4090 (CUDA) + rea
 - **Target: `net10.0` ONLY.** Do **not** add `net8.0`/`net9.0` multi-targeting — this is a hard
   constraint the owner set. Single `<TargetFramework>net10.0</TargetFramework>` in every csproj.
 - License: **Apache-2.0** (LICENSE + NOTICE at root).
-- Build/test baseline: `dotnet test` must be **GREEN — 847 tests, 0 failures** (includes
+- Build/test baseline: `dotnet test` must be **GREEN — 878 tests, 0 failures** (includes
   hardware-gated CUDA/perf tests; real-model tests skip when assets are absent). Run it before and
   after every change. If it's not green on a fresh clone, stop and fix that first.
 - Projects: `src/ModelSharp` (core, zero deps), `src/ModelSharp.ImageSharp` (image adapter,
