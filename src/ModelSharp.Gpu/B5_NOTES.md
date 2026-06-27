@@ -40,18 +40,33 @@ asserting CUDA-vs-CPU parity to 1e-3 and confirming `IsHardwareGpu==true`, skipp
 `Run`'s `finally` now dedupes buffers by reference before disposing, so unwinding mid-graph (e.g. on an
 unsupported op) can't double-free a device buffer.
 
-## distilgpt2 GPU-op audit (see `GpuDistilGpt2AuditTests` and `GpuLlmTests.DistilGpt2_Gpu_Coverage_*`)
+## distilgpt2 GPU-op audit (see `GpuDistilGpt2AuditTests` and `GpuLlmTests.DistilGpt2_Gpu_Coverage_Is_Complete`)
 
-- **1548 / 1569 nodes (98.7%) are GPU-dispatchable** after this pass.
-- **Still falls back to CPU** (21 nodes, 6 distinct ops), all in the mask / position-id prologue:
-  `Range`, `ConstantOfShape`, `Equal`, `Greater`, `Trilu`, `ScatterND`.
-  These are integer/boolean control-flow ops that build the causal mask and position ids; they are not
-  on the float compute path. The first one in topo order is `/transformer/Range` (node #23).
-- Consequently a **whole-graph** distilgpt2 GPU run is **not** reachable yet (it would stop at `Range`),
-  and is also impractical to drive through `Run` because the empty (seq-0) `past_key_values` float
-  inputs produce zero-length device allocations. The transformer **compute** path itself
-  (Gemm/MatMul/Softmax/LayerNorm/attention, the Pow+Tanh GELU, and all the Reshape/Transpose/Split/
-  Concat/Gather/Slice plumbing) is GPU-complete.
+- **1569 / 1569 nodes (100%) are GPU-dispatchable** — the engine's `Run` switch now covers every distinct
+  op type in distilgpt2. No CPU fallback remains.
+- The mask / position-id prologue ops that previously fell back — `Range`, `ConstantOfShape`, `Equal`,
+  `Greater`, `Trilu`, `ScatterND` — are now dispatched **host-side** (see "Integer/mask prologue ops"
+  below). They are integer/boolean control-flow ops that build the causal mask and position ids and are
+  never on the float compute path, so computing them on the host-resident int/bool tensors (and uploading
+  any rare float result via `Load`) keeps GPU-vs-CPU parity exact while keeping the design's host/device
+  split. Each is covered by a hardware-CUDA parity test in `GpuPrologueOpsTests.cs`.
+- The transformer **compute** path itself (Gemm/MatMul/Softmax/LayerNorm/attention, the Pow+Tanh GELU, and
+  all the Reshape/Transpose/Split/Concat/Gather/Slice plumbing) is GPU-complete and proven by the
+  attention-block + multi-step KV-cache tests.
+
+## Integer/mask prologue ops added this pass (each with a hardware-CUDA parity test)
+
+| Op                | Host-side computation (output placement)                                              |
+|-------------------|---------------------------------------------------------------------------------------|
+| `Range`           | `start..limit` step `delta`, dtype follows inputs (int → host, float → device)        |
+| `ConstantOfShape` | shape from 1-D int input, fill from `value` attr; float fill → device, int/bool → host |
+| `Equal`           | same-dtype broadcast `==`, Boolean output (host)                                       |
+| `Greater`         | same-dtype broadcast `>` (IEEE NaN semantics on float), Boolean output (host)          |
+| `Trilu`           | upper/lower triangle with diagonal `k`, batched, dtype-preserving (float → device)     |
+| `ScatterND`       | copy-then-write index tuples (`batch_dims=0`, `reduction=none`), dtype-preserving      |
+
+All six mirror the ONNX semantics of their CPU kernels exactly, so a whole-graph distilgpt2 GPU run no
+longer stops at `/transformer/Range`.
 
 ## What now runs ENTIRELY on GPU end-to-end
 
@@ -82,8 +97,10 @@ public surface on the engine.
 
 ## Honest list of what still falls back / is not covered
 
-- The 6 integer/mask prologue ops above (`Range`/`ConstantOfShape`/`Equal`/`Greater`/`Trilu`/
-  `ScatterND`) are CPU-only; no GPU kernels were added for them this pass.
+- The 6 integer/mask prologue ops (`Range`/`ConstantOfShape`/`Equal`/`Greater`/`Trilu`/`ScatterND`) are
+  now dispatched by the engine, but **host-side** — they run on the CPU-resident int/bool tensors (no GPU
+  kernel), consistent with the engine's design where int/bool tensors always live on the host. This makes
+  the whole graph GPU-dispatchable without forcing a CPU fallback; the float compute path is unaffected.
 - `DecodeStepAttention` is a single self-attention block, not the whole decoder layer stack (no
   projections/MLP/residual wired into the seam) — those ops exist individually on the GPU but are not
   composed into the cache path here.

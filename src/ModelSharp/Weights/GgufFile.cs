@@ -25,10 +25,12 @@ namespace ModelSharp.Weights;
 /// so files larger than 2 GB load without allocating the whole file as a managed array. Native
 /// resources are released on <see cref="Dispose"/>.
 /// <para>
-/// Only the unquantized ggml types are materialized to tensors: <see cref="GgmlType.F32"/> and
-/// <see cref="GgmlType.F16"/> decode to <see cref="Tensor{Single}"/>. Quantized block types are
-/// surfaced as raw bytes via <see cref="GetRawTensorBytes"/> for a future dequantization kernel;
-/// asking <see cref="GetTensor"/> to materialize one throws.
+/// The unquantized ggml types materialize directly: <see cref="GgmlType.F32"/> and
+/// <see cref="GgmlType.F16"/> decode to <see cref="Tensor{Single}"/>. The common block-quantized
+/// types (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 and the Q2_K…Q6_K / Q8_K k-quants) are dequantized to
+/// <see cref="Tensor{Single}"/> by <see cref="GgufDequant"/>; the importance-matrix "IQ" families are
+/// still surfaced only as raw bytes via <see cref="GetRawTensorBytes"/>, and asking
+/// <see cref="GetTensor"/> to materialize one of those throws.
 /// </para>
 /// </summary>
 public sealed class GgufFile : IDisposable
@@ -456,23 +458,35 @@ public sealed class GgufFile : IDisposable
     }
 
     /// <summary>
-    /// Materializes an unquantized tensor as a managed tensor: <see cref="GgmlType.F32"/> →
+    /// Materializes a tensor as a managed tensor: <see cref="GgmlType.F32"/> →
     /// <see cref="Tensor{Single}"/>, <see cref="GgmlType.F16"/> → <see cref="Tensor{Single}"/>
     /// (half-decoded), <see cref="GgmlType.F64"/> → <see cref="Tensor{Double}"/>, and the integer
-    /// types to their managed equivalents. Quantized block types are not dequantized here.
+    /// types to their managed equivalents. The ggml block-quantized types supported by
+    /// <see cref="GgufDequant"/> — Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
+    /// and Q8_K — are dequantized to a <see cref="Tensor{Single}"/> of the tensor's shape. The
+    /// importance-matrix "IQ" quant families are not yet implemented and still throw.
     /// </summary>
     /// <exception cref="ModelSharpException">
-    /// No tensor with that name exists, or the tensor is a quantized type (use
-    /// <see cref="GetRawTensorBytes"/> and dequantize separately).
+    /// No tensor with that name exists, or the tensor is a quantized type that ModelSharp does not
+    /// yet dequantize (use <see cref="GetRawTensorBytes"/> and dequantize separately).
     /// </exception>
     public Tensor GetTensor(string name)
     {
         GgufTensorInfo info = GetEntry(name);
 
         if (GgmlTypeInfo.IsQuantized(info.Type))
-            throw new ModelSharpException(
-                $"GGUF tensor '{name}' is quantized type {info.Type}; ModelSharp does not yet " +
-                $"dequantize it. Use GetRawTensorBytes and the ggml type to dequantize separately.");
+        {
+            if (!GgufDequant.IsSupported(info.Type))
+                throw new ModelSharpException(
+                    $"GGUF tensor '{name}' is quantized type {info.Type}; ModelSharp does not yet " +
+                    "dequantize it. Supported quantized types are Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, " +
+                    "Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and Q8_K. Use GetRawTensorBytes and the " +
+                    "ggml type to dequantize separately.");
+
+            byte[] raw = GetRawTensorBytes(name);
+            float[] dequant = GgufDequant.Dequantize(raw, info.Type, info.Shape.Length);
+            return new Tensor<float>(info.Shape, dequant);
+        }
 
         byte[] bytes = GetRawTensorBytes(name);
         TensorShape shape = info.Shape;
