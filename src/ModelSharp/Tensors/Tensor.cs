@@ -25,6 +25,27 @@ public abstract class Tensor
     /// <summary>Recovers the float32 view; throws if the dtype is not Float32.</summary>
     public Tensor<float> AsFloat() => As<float>(ElementType.Float32);
 
+    /// <summary>Recovers the float16 view; throws if the dtype is not Float16.</summary>
+    public Tensor<System.Half> AsFloat16() => As<System.Half>(ElementType.Float16);
+
+    /// <summary>
+    /// Returns a float32 tensor: a zero-copy view when the dtype is already Float32, or a freshly
+    /// allocated upcast when the dtype is Float16 (fp16 weights are stored compactly and widened to
+    /// float on demand at the compute boundary). Throws for other dtypes.
+    /// </summary>
+    public Tensor<float> ToFloat32()
+    {
+        if (this is Tensor<float> f) return f;
+        if (this is Tensor<System.Half> h)
+        {
+            var data = new float[checked((int)Length)];
+            System.ReadOnlySpan<System.Half> hs = h.Buffer.Span;
+            for (int i = 0; i < data.Length; i++) data[i] = (float)hs[i];
+            return new Tensor<float>(Shape, data);
+        }
+        return AsFloat(); // clear error for any other dtype
+    }
+
     /// <summary>Recovers the int64 view; throws if the dtype is not Int64.</summary>
     public Tensor<long> AsInt64() => As<long>(ElementType.Int64);
 
@@ -85,6 +106,7 @@ public sealed class Tensor<T> : Tensor where T : unmanaged
         Type t = typeof(T);
         if (t == typeof(float)) return ElementType.Float32;
         if (t == typeof(double)) return ElementType.Float64;
+        if (t == typeof(System.Half)) return ElementType.Float16;
         if (t == typeof(int)) return ElementType.Int32;
         if (t == typeof(long)) return ElementType.Int64;
         if (t == typeof(sbyte)) return ElementType.Int8;
