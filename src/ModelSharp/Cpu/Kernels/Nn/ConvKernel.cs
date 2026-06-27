@@ -1,5 +1,8 @@
+using System;
+using System.Numerics;
 using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
+using ModelSharp.Cpu.Kernels.Linear;
 using ModelSharp.Cpu.Kernels.Llm;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
@@ -90,6 +93,75 @@ public sealed class ConvKernel : IKernel
         int wO = cinPerGroup * kH * kW, wC = kH * kW;
         int yN = cout * outH * outW, yC = outH * outW;
 
+        // ---- im2col + BlockedGemm path (heavy general convolutions). ----------------------------
+        // Lower each (batch n, group g) to the canonical row-major GEMM Y_g[M,P] = W_g[M,K]·Col[K,P]
+        // with M = outPerGroup, K = cinPerGroup·kH·kW, P = outH·outW. Weights are already [M,K]
+        // row-major per group and the output is already [M,P] row-major per group, so only the
+        // column matrix is materialized. Depthwise (outPerGroup==1) / tiny-K convs keep the
+        // cache-friendly direct loop below (im2col's copy is not worth it there).
+        {
+            int Mg = outPerGroup;
+            int Kg = wO;                 // contraction length == weight row length
+            int P = outH * outW;         // == yC
+            bool useGemm = Kg >= 16 && outPerGroup >= 2 && P >= 8;
+
+            if (useGemm)
+            {
+                bool fast1x1 =
+                    kH == 1 && kW == 1 && sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
+                    padTop == 0 && padBottom == 0 && padLeft == 0 && padRight == 0;
+
+                if (fast1x1)
+                {
+                    // Col == the input channel block verbatim: X[n, g*cinPerGroup.., :, :] is
+                    // already [K,P] row-major (ldb = xC == P), so feed X directly — zero copy.
+                    for (int n = 0; n < N; n++)
+                        for (int g = 0; g < group; g++)
+                            BlockedGemm.Multiply(
+                                ws, g * outPerGroup * wO, /*lda*/ Kg,
+                                xs, n * xN + g * cinPerGroup * xC, /*ldb*/ P,
+                                ys, n * yN + g * outPerGroup * yC, /*ldc*/ P,
+                                Mg, P, Kg);
+                }
+                else
+                {
+                    float[] col = new float[checked(Kg * P)]; // reused across (n, g)
+                    for (int n = 0; n < N; n++)
+                        for (int g = 0; g < group; g++)
+                        {
+                            BuildCol(col, xs, n, g, cinPerGroup, kH, kW, wC, H, W,
+                                     outH, outW, sH, sW, dH, dW, padTop, padLeft, xN, xC, P);
+                            BlockedGemm.Multiply(
+                                ws, g * outPerGroup * wO, /*lda*/ Kg,
+                                col, 0, /*ldb*/ P,
+                                ys, n * yN + g * outPerGroup * yC, /*ldc*/ P,
+                                Mg, P, Kg);
+                        }
+                }
+
+                // Bias epilogue: add bs[oc] across each output plane.
+                if (bs is not null)
+                {
+                    int wv = Vector<float>.Count;
+                    for (int n = 0; n < N; n++)
+                        for (int oc = 0; oc < cout; oc++)
+                        {
+                            float b0 = bs[oc];
+                            if (b0 == 0f) continue;
+                            int plane = n * yN + oc * yC;
+                            var bvec = new Vector<float>(b0);
+                            int p = 0, lastv = yC - wv;
+                            for (; p <= lastv; p += wv)
+                                (new Vector<float>(ys, plane + p) + bvec).CopyTo(ys, plane + p);
+                            for (; p < yC; p++) ys[plane + p] += b0;
+                        }
+                }
+
+                ctx.Set(node.Outputs[0], y);
+                return;
+            }
+        }
+
         // When the kernel runs contiguously along W (dilation 1) we can SIMD the inner
         // kx dot over an in-bounds sub-window; otherwise fall back to the scalar gather.
         bool simdW = dW == 1 && kW > 1;
@@ -155,5 +227,56 @@ public sealed class ConvKernel : IKernel
             for (int unit = 0; unit < units; unit++) Unit(unit);
 
         ctx.Set(node.Outputs[0], y);
+    }
+
+    /// <summary>
+    /// Builds the im2col matrix Col[K,P] for one (batch n, group g): row k = (icg·kH·kW + ky·kW + kx),
+    /// column p = (oy·outW + ox), value = X[n, g·cinPerGroup+icg, iy, ix] with the same
+    /// iy/ix/in-bounds expressions as the direct kernel; out-of-bounds taps are written as 0 (the
+    /// zero-pad that is bit-identical to the direct path adding nothing). Every entry is
+    /// unconditionally written so the reused buffer never leaks stale data.
+    /// </summary>
+    private static void BuildCol(
+        float[] col, float[] xs, int n, int g, int cinPerGroup, int kH, int kW, int wC,
+        int H, int W, int outH, int outW, int sH, int sW, int dH, int dW,
+        int padTop, int padLeft, int xN, int xC, int P)
+    {
+        for (int icg = 0; icg < cinPerGroup; icg++)
+        {
+            int ic = g * cinPerGroup + icg;
+            int xBase = n * xN + ic * xC;
+            for (int ky = 0; ky < kH; ky++)
+                for (int kx = 0; kx < kW; kx++)
+                {
+                    int colRow = (icg * wC + ky * kW + kx) * P;
+                    for (int oy = 0; oy < outH; oy++)
+                    {
+                        int iy = oy * sH - padTop + ky * dH;
+                        int dstRow = colRow + oy * outW;
+                        if (iy < 0 || iy >= H) { System.Array.Clear(col, dstRow, outW); continue; }
+
+                        int xRow = xBase + iy * W;
+                        if (sW == 1 && dW == 1)
+                        {
+                            // ix = ox + (kx - padLeft); the valid ox window is one contiguous run.
+                            int shift = kx - padLeft;
+                            int oxLo = Math.Clamp(-shift, 0, outW);
+                            int oxHi = Math.Clamp(W - shift, 0, outW);
+                            if (oxHi < oxLo) oxHi = oxLo;
+                            if (oxLo > 0) System.Array.Clear(col, dstRow, oxLo);
+                            if (oxHi > oxLo) System.Array.Copy(xs, xRow + oxLo + shift, col, dstRow + oxLo, oxHi - oxLo);
+                            if (oxHi < outW) System.Array.Clear(col, dstRow + oxHi, outW - oxHi);
+                        }
+                        else
+                        {
+                            for (int ox = 0; ox < outW; ox++)
+                            {
+                                int ix = ox * sW - padLeft + kx * dW;
+                                col[dstRow + ox] = (ix >= 0 && ix < W) ? xs[xRow + ix] : 0f;
+                            }
+                        }
+                    }
+                }
+        }
     }
 }

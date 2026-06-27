@@ -34,12 +34,25 @@ internal static class KernelSimd
         return t.Span.ToArray();
     }
 
-    /// <summary>Dot product of <c>a[aOff..]</c> and <c>b[bOff..]</c> over <paramref name="n"/> lanes.</summary>
+    /// <summary>Dot product of <c>a[aOff..]</c> and <c>b[bOff..]</c> over <paramref name="n"/> lanes.
+    /// Uses four independent SIMD accumulators so the CPU can keep multiple multiply-adds in flight
+    /// (a single accumulator serializes on the ~4-cycle FMA latency); the 4-wide unrolled body runs
+    /// before the 1-wide remainder and a scalar tail.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float Dot(float[] a, int aOff, float[] b, int bOff, int n)
     {
         int i = 0;
-        var acc = Vector<float>.Zero;
+        Vector<float> a0 = Vector<float>.Zero, a1 = Vector<float>.Zero,
+                      a2 = Vector<float>.Zero, a3 = Vector<float>.Zero;
+        int last4 = n - 4 * W;
+        for (; i <= last4; i += 4 * W)
+        {
+            a0 += new Vector<float>(a, aOff + i) * new Vector<float>(b, bOff + i);
+            a1 += new Vector<float>(a, aOff + i + W) * new Vector<float>(b, bOff + i + W);
+            a2 += new Vector<float>(a, aOff + i + 2 * W) * new Vector<float>(b, bOff + i + 2 * W);
+            a3 += new Vector<float>(a, aOff + i + 3 * W) * new Vector<float>(b, bOff + i + 3 * W);
+        }
+        var acc = (a0 + a1) + (a2 + a3);
         int last = n - W;
         for (; i <= last; i += W)
             acc += new Vector<float>(a, aOff + i) * new Vector<float>(b, bOff + i);

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using ModelSharp.Cpu.Kernels.Internal;
+using ModelSharp.Cpu.Kernels.Llm;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
@@ -48,78 +49,57 @@ public sealed class MatMulKernel : IKernel
         if (!bWas1D) outDims.Add(N);
         var y = new Tensor<float>(new TensorShape(outDims.ToArray()));
 
-        // Capture the backing buffers (Memory<T>) so the parallel lambdas can re-acquire spans;
-        // Span<T> is a ref struct and cannot be hoisted into a closure.
-        System.Memory<float> ma = a.Buffer, my = y.Buffer;
-
-        // Pre-transpose each distinct B batch matrix from [K,N] (column-strided) into row-major
-        // [N,K] so the inner dot is fully contiguous and SIMD-friendly. The transposed cache is
-        // indexed by the broadcast B-batch offset (bOff), so broadcast/shared B matrices are only
-        // transposed once.
-        var bTransposed = new float[totalBatch][];
-        {
-            var coordT = new int[batchRank];
-            System.Span<float> sbAll = b.Span;
-            int bOffT = 0;
-            var seen = new System.Collections.Generic.Dictionary<int, float[]>();
-            for (int bi = 0; bi < totalBatch; bi++)
-            {
-                if (!seen.TryGetValue(bOffT, out float[]? bt))
-                {
-                    bt = new float[bMat];
-                    int bBase = bOffT * bMat;
-                    for (int kk = 0; kk < K; kk++)
-                    {
-                        int src = bBase + kk * N;
-                        for (int n = 0; n < N; n++) bt[n * K + kk] = sbAll[src + n];
-                    }
-                    seen[bOffT] = bt;
-                }
-                bTransposed[bi] = bt;
-
-                for (int ax = batchRank - 1; ax >= 0; ax--)
-                {
-                    coordT[ax]++;
-                    bOffT += bBS[ax];
-                    if (coordT[ax] < outBatch[ax]) break;
-                    coordT[ax] = 0;
-                    bOffT -= bBS[ax] * outBatch[ax];
-                }
-            }
-        }
-
-        // Map each batch index to its A-matrix offset (in matrix units) up front so the per-row
-        // work is embarrassingly parallel over flattened (batch × M) output rows.
+        // Map each batch index to its A-matrix and B-matrix offsets (in matrix units) up front,
+        // honoring NumPy batch broadcasting. Both A[M,K] and B[K,N] are already row-major and
+        // contiguous along their natural axes, so the GEMM reads them in place (no transpose copy).
         var aOffOf = new int[totalBatch];
+        var bOffOf = new int[totalBatch];
         {
-            var coordA = new int[batchRank];
-            int aOff = 0;
+            var coord = new int[batchRank];
+            int aOff = 0, bOff = 0;
             for (int bi = 0; bi < totalBatch; bi++)
             {
                 aOffOf[bi] = aOff;
+                bOffOf[bi] = bOff;
                 for (int ax = batchRank - 1; ax >= 0; ax--)
                 {
-                    coordA[ax]++;
+                    coord[ax]++;
                     aOff += aBS[ax];
-                    if (coordA[ax] < outBatch[ax]) break;
-                    coordA[ax] = 0;
+                    bOff += bBS[ax];
+                    if (coord[ax] < outBatch[ax]) break;
+                    coord[ax] = 0;
                     aOff -= aBS[ax] * outBatch[ax];
+                    bOff -= bBS[ax] * outBatch[ax];
                 }
             }
         }
 
-        long totalRows = (long)totalBatch * M;
-        MatMulParallel.For(checked((int)totalRows), (long)K * N, row =>
+        float[] aArr = KernelSimd.Array(a);
+        float[] bArr = KernelSimd.Array(b);
+        float[] yArr = KernelSimd.Array(y);
+
+        // Parallelize over the flattened (batch × MR-row-tile × NR-col-tile) grid of disjoint
+        // output tiles; each tile streams A[mr,K] / B[K,ncols] and writes Y[mr,ncols].
+        int nr = BlockedGemm.NR;
+        int mTiles = (M + BlockedGemm.MR - 1) / BlockedGemm.MR;
+        int nTiles = (N + nr - 1) / nr;
+        long tilesPerBatch = (long)mTiles * nTiles;
+        long totalTiles = tilesPerBatch * totalBatch;
+        long innerCost = (long)BlockedGemm.MR * nr * K;
+
+        MatMulParallel.For(checked((int)totalTiles), innerCost, t =>
         {
-            int bi = row / M;
-            int m = row % M;
-            System.ReadOnlySpan<float> sa = ma.Span;
-            System.Span<float> sy = my.Span;
-            float[] bt = bTransposed[bi];
-            int aRow = aOffOf[bi] * aMat + m * K;
-            int oRow = bi * oMat + m * N;
-            for (int n = 0; n < N; n++)
-                sy[oRow + n] = MatMulParallel.Dot(sa, aRow, bt.AsSpan(n * K, K), K);
+            int bi = (int)(t / tilesPerBatch);
+            int local = (int)(t - bi * tilesPerBatch);
+            int mt = local / nTiles;
+            int nt = local - mt * nTiles;
+            int m0 = mt * BlockedGemm.MR;
+            int n0 = nt * nr;
+            BlockedGemm.Tile(
+                aArr, aOffOf[bi] * aMat, /*lda*/ K,
+                bArr, bOffOf[bi] * bMat, /*ldb*/ N,
+                yArr, bi * oMat, /*ldc*/ N,
+                m0, n0, Math.Min(BlockedGemm.MR, M - m0), Math.Min(nr, N - n0), K);
         });
 
         ctx.Set(node.Outputs[0], y);

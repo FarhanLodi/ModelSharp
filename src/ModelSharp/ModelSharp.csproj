@@ -10,7 +10,7 @@
     <RootNamespace>ModelSharp</RootNamespace>
     <AssemblyName>ModelSharp</AssemblyName>
     <PackageId>ModelSharp</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Authors>Farhan Lodi</Authors>
     <Description>Universal, manifest-driven, pure-managed model inference for .NET. All-in-one: ONNX loader, multi-dtype CPU engine, tensors, pipeline, plus audio (FFT/log-mel) and text (WordPiece) front ends — zero external, zero-native dependencies.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>

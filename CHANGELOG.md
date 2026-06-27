@@ -5,6 +5,33 @@ All notable changes to ModelSharp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-06-27
+
+### Fixed
+- Integer-dtype handling in `Identity`, `TopK`, `Clip` (plus `Ceil`/`Floor`/`Round`), and the
+  variadic `Min`/`Max`/`Sum`/`Mean` ops. These forced their inputs to float32 and threw
+  *"Tensor dtype is Int64; expected Float32"* on the int64 shape/index tensors that real
+  detection, layout, table-structure and formula graphs route through them — crashing the
+  models mid-graph. They are now dtype-aware (preserving int64/int32), matching the existing
+  broadcast-binary / Gather idiom. This unblocks RT-DETR (PP-DocLayoutV3 + table-cell),
+  PicoDet (PP-DocLayout), SLANeXt, SLANet_plus and LaTeX-OCR.
+
+### Performance
+- New `BlockedGemm`: a register-tiled, multithreaded, pure-managed
+  (`System.Numerics.Vector<float>`) float32 GEMM. `MatMul`, `Gemm` and `Conv` (via im2col,
+  with a 1×1 fast path) now route through it, reusing each loaded value across an output tile
+  instead of recomputing per element. ~2–5× faster CPU inference (the SVTR recognizer and
+  PP-LCNet classifier ~4–5×). Pure-managed, no new dependencies; results stay within float
+  tolerance (SIMD accumulation order only).
+
+### Added
+- `IntegerDtypeKernelTests` covering the int64/int32 paths of the dtype-fixed ops.
+
+### Notes
+- CPU output **parity verified against ONNX Runtime on 19 real OCR models** (detection,
+  recognition, classification, layout, table-structure, formula) — all match within tolerance.
+  Full test suite: 958 passing.
+
 ## [0.2.0-alpha] - 2026-06-27
 
 ### Verified & hardened

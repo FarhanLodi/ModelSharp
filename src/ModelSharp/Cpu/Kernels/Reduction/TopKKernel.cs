@@ -9,7 +9,9 @@ namespace ModelSharp.Cpu.Kernels.Reduction;
 /// ONNX <c>TopK</c>: for each slice along <c>axis</c> (default -1) returns the <c>k</c> largest
 /// (or smallest, when <c>largest=0</c>) values and their Int64 indices. <c>k</c> comes from the
 /// second input (opset 10+) or the <c>k</c> attribute (opset 1). Output is value-sorted; ties
-/// break toward the lower index. Float32 data only.
+/// break toward the lower index. Dtype-aware on the data input: float32/int64/int32 are supported
+/// (ONNX TopK's type constraint is all numeric types — detection NMS post-processing re-sorts
+/// int64 index tensors with TopK), and the values output preserves the input dtype.
 /// </summary>
 public sealed class TopKKernel : IKernel
 {
@@ -17,7 +19,17 @@ public sealed class TopKKernel : IKernel
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
-        Tensor<float> x = ctx.Get(node.Inputs[0]);
+        Tensor xt = ctx.GetTensor(node.Inputs[0]);
+        switch (xt.Dtype)
+        {
+            case ElementType.Int64: TopK(xt.AsInt64(), node, ctx); break;
+            case ElementType.Int32: TopK(xt.AsInt32(), node, ctx); break;
+            default: TopK(xt.ToFloat32(), node, ctx); break;
+        }
+    }
+
+    private static void TopK<T>(Tensor<T> x, GraphNode node, GraphContext ctx) where T : unmanaged, IComparable<T>
+    {
         ReadOnlySpan<int> dims = x.Shape.Dimensions;
         int rank = dims.Length;
 
@@ -40,12 +52,12 @@ public sealed class TopKKernel : IKernel
 
         int[] outDims = dims.ToArray();
         outDims[axis] = k;
-        var values = new Tensor<float>(new TensorShape(outDims));
+        var values = new Tensor<T>(new TensorShape(outDims));
         var indices = new Tensor<long>(new TensorShape(outDims));
-        Span<float> xs = x.Span, vs = values.Span;
+        Span<T> xs = x.Span, vs = values.Span;
         Span<long> ids = indices.Span;
 
-        var sliceVals = new float[axisDim];
+        var sliceVals = new T[axisDim];
         var sliceIdx = new int[axisDim];
         Comparison<int> cmp = largest
             ? (a, b) => { int c = sliceVals[b].CompareTo(sliceVals[a]); return c != 0 ? c : a.CompareTo(b); }

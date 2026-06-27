@@ -1,5 +1,6 @@
 using System;
 using ModelSharp.Cpu.Kernels.Internal;
+using ModelSharp.Cpu.Kernels.Llm;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
@@ -33,55 +34,56 @@ public sealed class GemmKernel : IKernel
         int aStride1 = ad[1], bStride1 = bd[1];
         var y = new Tensor<float>(new TensorShape(M, Ncol));
 
-        // Build a row-major [Ncol, K] copy of op(B) once, so every output row dots against a
-        // contiguous weight row (SIMD-friendly) regardless of the transA/transB flags. Likewise
-        // expose op(A) row i as a contiguous length-K vector. The transpose cost is O(K·Ncol),
-        // amortised across all M rows.
-        var bT = new float[(long)Ncol * K <= int.MaxValue ? Ncol * K : throw new ModelSharpException("Gemm too large")];
-        {
-            System.Span<float> sb = b.Span;
-            for (int j = 0; j < Ncol; j++)
-            for (int kk = 0; kk < K; kk++)
-                bT[j * K + kk] = transB ? sb[j * bStride1 + kk] : sb[kk * bStride1 + j];
-        }
+        float[] aArr = KernelSimd.Array(a);
+        float[] bArr = KernelSimd.Array(b);
+        float[] yArr = KernelSimd.Array(y);
 
-        // op(A): when not transposed each row is already contiguous; when transposed we gather.
-        float[]? aT = null;
-        if (transA)
+        // Present op(A) as row-major [M,K] (K contiguous) and op(B) as row-major [K,Ncol] (Ncol
+        // contiguous) — exactly what BlockedGemm wants. A not-transposed input is already [M,K]
+        // and a not-transposed B is already [K,Ncol], so only the transposed operands are copied.
+        float[] opA; int lda;
+        if (!transA) { opA = aArr; lda = aStride1; }            // a is [M,K], row stride = K
+        else
         {
-            aT = new float[(long)M * K <= int.MaxValue ? M * K : throw new ModelSharpException("Gemm too large")];
-            System.Span<float> sa = a.Span;
+            opA = new float[(long)M * K <= int.MaxValue ? M * K : throw new ModelSharpException("Gemm too large")];
             for (int i = 0; i < M; i++)
-            for (int kk = 0; kk < K; kk++)
-                aT[i * K + kk] = sa[kk * aStride1 + i];
+                for (int kk = 0; kk < K; kk++)
+                    opA[i * K + kk] = aArr[kk * aStride1 + i];  // a stored [K,M]
+            lda = K;
         }
 
-        System.Memory<float> ma = a.Buffer, my = y.Buffer;
-        System.Memory<float> mc = c is null ? default : c.Buffer;
-        int[] cdArr = c is null ? System.Array.Empty<int>() : c.Shape.Dimensions.ToArray();
-        float[]? aTLocal = aT;
-        int aStride1Local = aStride1;
-        bool hasCLocal = c is not null;
-
-        MatMulParallel.For(M, (long)Ncol * K, i =>
+        float[] opB; int ldb;
+        if (!transB) { opB = bArr; ldb = bStride1; }            // b is [K,Ncol], row stride = Ncol
+        else
         {
-            System.ReadOnlySpan<float> sa = ma.Span;
-            System.Span<float> sy = my.Span;
-            System.ReadOnlySpan<float> sc = mc.Span;
+            opB = new float[(long)K * Ncol <= int.MaxValue ? K * Ncol : throw new ModelSharpException("Gemm too large")];
+            for (int kk = 0; kk < K; kk++)
+                for (int j = 0; j < Ncol; j++)
+                    opB[kk * Ncol + j] = bArr[j * bStride1 + kk]; // b stored [Ncol,K]
+            ldb = Ncol;
+        }
 
-            // Contiguous length-K view of op(A) row i.
-            System.ReadOnlySpan<float> aRowSpan = aTLocal is not null
-                ? aTLocal.AsSpan(i * K, K)
-                : sa.Slice(i * aStride1Local, K);
+        // Raw Y = op(A) · op(B).
+        BlockedGemm.Multiply(opA, 0, lda, opB, 0, ldb, yArr, 0, Ncol, M, Ncol, K);
 
-            for (int j = 0; j < Ncol; j++)
+        // Epilogue: Y = alpha·Y (+ beta·C). Skipped entirely in the common alpha==1, no-C case.
+        if (alpha != 1f || hasC)
+        {
+            float[]? cArr = c is null ? null : KernelSimd.Array(c);
+            int[] cdArr = c is null ? System.Array.Empty<int>() : c.Shape.Dimensions.ToArray();
+            float alphaL = alpha, betaL = beta;
+            bool hasCLocal = c is not null;
+            MatMulParallel.For(M, Ncol, i =>
             {
-                float sum = MatMulParallel.Dot(aRowSpan, 0, bT.AsSpan(j * K, K), K);
-                float val = alpha * sum;
-                if (hasCLocal) val += beta * BroadcastC(sc, cdArr, i, j);
-                sy[i * Ncol + j] = val;
-            }
-        });
+                int row = i * Ncol;
+                for (int j = 0; j < Ncol; j++)
+                {
+                    float val = alphaL * yArr[row + j];
+                    if (hasCLocal) val += betaL * BroadcastC(cArr!, cdArr, i, j);
+                    yArr[row + j] = val;
+                }
+            });
+        }
 
         ctx.Set(node.Outputs[0], y);
     }

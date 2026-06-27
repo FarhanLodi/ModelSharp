@@ -63,15 +63,23 @@ internal static class MatMulParallel
     public static float Dot(ReadOnlySpan<float> a, int aBase, ReadOnlySpan<float> w, int k)
     {
         int width = Vector<float>.Count;
-        var acc = Vector<float>.Zero;
+        // Four independent accumulators break the single-dependency chain so the CPU can keep
+        // multiple multiply-adds in flight (a lone accumulator stalls on FMA latency).
+        Vector<float> a0 = Vector<float>.Zero, a1 = Vector<float>.Zero,
+                      a2 = Vector<float>.Zero, a3 = Vector<float>.Zero;
         int i = 0;
-        int limit = k - (k % width);
-        for (; i < limit; i += width)
+        int limit4 = k - 4 * width;
+        for (; i <= limit4; i += 4 * width)
         {
-            var va = new Vector<float>(a.Slice(aBase + i, width));
-            var vw = new Vector<float>(w.Slice(i, width));
-            acc += va * vw;
+            a0 += new Vector<float>(a.Slice(aBase + i, width)) * new Vector<float>(w.Slice(i, width));
+            a1 += new Vector<float>(a.Slice(aBase + i + width, width)) * new Vector<float>(w.Slice(i + width, width));
+            a2 += new Vector<float>(a.Slice(aBase + i + 2 * width, width)) * new Vector<float>(w.Slice(i + 2 * width, width));
+            a3 += new Vector<float>(a.Slice(aBase + i + 3 * width, width)) * new Vector<float>(w.Slice(i + 3 * width, width));
         }
+        var acc = (a0 + a1) + (a2 + a3);
+        int limit = k - width;
+        for (; i <= limit; i += width)
+            acc += new Vector<float>(a.Slice(aBase + i, width)) * new Vector<float>(w.Slice(i, width));
         float sum = Vector.Dot(acc, Vector<float>.One);
         for (; i < k; i++) sum += a[aBase + i] * w[i];
         return sum;
