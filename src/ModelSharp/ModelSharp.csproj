@@ -19,12 +19,14 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>onnx;inference;ml;machine-learning;managed;tensor;pure-managed</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>modelsharp_logo.png</PackageIcon>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\modelsharp_logo.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <!-- White-box tests reach internal helpers (e.g. GgmlTypeInfo, DftCore) while keeping the public API minimal. -->

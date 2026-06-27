@@ -17,8 +17,15 @@
     <RepositoryUrl>https://github.com/FarhanLodi/ModelSharp</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>onnx;gguf;safetensors;huggingface;download;model-hub;inference;ml;managed</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>modelsharp_logo.png</PackageIcon>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\modelsharp_logo.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>
