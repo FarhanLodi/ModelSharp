@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -17,10 +18,26 @@ namespace ModelSharp.Onnx;
 public static class OnnxModelLoader
 {
     /// <summary>Loads an ONNX model from a file path.</summary>
-    public static ModelGraph LoadModel(string path) => ParseModel(File.ReadAllBytes(path));
+    public static ModelGraph LoadModel(string path)
+    {
+        // External-data initializers (TensorProto.data_location == EXTERNAL) reference a
+        // sibling weights file relative to the .onnx file's directory. The resolver memory-maps
+        // each referenced file once and reuses the mapping across every tensor in this load.
+        string? baseDir = Path.GetDirectoryName(Path.GetFullPath(path));
+        using var resolver = new ExternalDataResolver(baseDir);
+        return ParseModel(File.ReadAllBytes(path), resolver);
+    }
 
     /// <summary>Parses an ONNX ModelProto from bytes.</summary>
     public static ModelGraph ParseModel(ReadOnlySpan<byte> modelProto)
+        => ParseModel(modelProto, resolver: null);
+
+    /// <summary>
+    /// Parses an ONNX ModelProto from bytes, resolving external-data initializers via
+    /// <paramref name="resolver"/>. When <paramref name="resolver"/> is null (in-memory parse with
+    /// no backing file path), any EXTERNAL initializer encountered throws a clear error.
+    /// </summary>
+    private static ModelGraph ParseModel(ReadOnlySpan<byte> modelProto, ExternalDataResolver? resolver)
     {
         ReadOnlySpan<byte> graphBytes = default;
         bool hasGraph = false;
@@ -40,16 +57,25 @@ public static class OnnxModelLoader
         }
 
         if (!hasGraph) throw new ModelSharpException("ONNX model contains no graph (field 7).");
-        return ParseGraph(graphBytes, metadata);
+        return ParseGraph(graphBytes, metadata, resolver);
     }
 
     /// <summary>Loads a standalone TensorProto (e.g. an ONNX test-data <c>.pb</c>) as a float32 tensor.</summary>
-    public static Tensor<float> LoadTensor(string path) => ParseTensor(File.ReadAllBytes(path)).Tensor.AsFloat();
+    public static Tensor<float> LoadTensor(string path)
+    {
+        using var resolver = new ExternalDataResolver(Path.GetDirectoryName(Path.GetFullPath(path)));
+        return ParseTensor(File.ReadAllBytes(path), resolver).Tensor.AsFloat();
+    }
 
     /// <summary>Loads a standalone TensorProto preserving its declared dtype.</summary>
-    public static Tensor LoadTensorTyped(string path) => ParseTensor(File.ReadAllBytes(path)).Tensor;
+    public static Tensor LoadTensorTyped(string path)
+    {
+        using var resolver = new ExternalDataResolver(Path.GetDirectoryName(Path.GetFullPath(path)));
+        return ParseTensor(File.ReadAllBytes(path), resolver).Tensor;
+    }
 
-    private static ModelGraph ParseGraph(ReadOnlySpan<byte> bytes, Dictionary<string, string>? metadata)
+    private static ModelGraph ParseGraph(
+        ReadOnlySpan<byte> bytes, Dictionary<string, string>? metadata, ExternalDataResolver? resolver)
     {
         var nodes = new List<GraphNode>();
         var initializers = new Dictionary<string, Tensor>();
@@ -62,10 +88,10 @@ public static class OnnxModelLoader
             switch (field)
             {
                 case 1 when wire == 2:
-                    nodes.Add(ParseNode(r.ReadLengthDelimited()));
+                    nodes.Add(ParseNode(r.ReadLengthDelimited(), resolver));
                     break;
                 case 5 when wire == 2:
-                    (string tn, Tensor tt) = ParseTensor(r.ReadLengthDelimited());
+                    (string tn, Tensor tt) = ParseTensor(r.ReadLengthDelimited(), resolver);
                     initializers[tn] = tt;
                     break;
                 case 11 when wire == 2:
@@ -113,7 +139,7 @@ public static class OnnxModelLoader
         return (key, value);
     }
 
-    private static GraphNode ParseNode(ReadOnlySpan<byte> bytes)
+    private static GraphNode ParseNode(ReadOnlySpan<byte> bytes, ExternalDataResolver? resolver)
     {
         var inputs = new List<string>();
         var outputs = new List<string>();
@@ -131,7 +157,7 @@ public static class OnnxModelLoader
                 case 3 when wire == 2: name = r.ReadString(); break;
                 case 4 when wire == 2: opType = r.ReadString(); break;
                 case 5 when wire == 2:
-                    (string an, object? av) = ParseAttribute(r.ReadLengthDelimited());
+                    (string an, object? av) = ParseAttribute(r.ReadLengthDelimited(), resolver);
                     if (av is not null) attrs[an] = av;
                     break;
                 default: r.SkipField(wire); break;
@@ -141,7 +167,8 @@ public static class OnnxModelLoader
         return new GraphNode(opType, name.Length == 0 ? opType : name, inputs, outputs, attrs);
     }
 
-    private static (string Name, object? Value) ParseAttribute(ReadOnlySpan<byte> bytes)
+    private static (string Name, object? Value) ParseAttribute(
+        ReadOnlySpan<byte> bytes, ExternalDataResolver? resolver)
     {
         string name = "";
         long type = 0;
@@ -164,15 +191,15 @@ public static class OnnxModelLoader
                 case 2 when wire == 5: f = r.ReadFloat(); break;
                 case 3 when wire == 0: i = r.ReadInt64(); break;
                 case 4 when wire == 2: s = Encoding.UTF8.GetString(r.ReadLengthDelimited()); break;
-                case 5 when wire == 2: t = ParseTensor(r.ReadLengthDelimited()).Tensor; break;
+                case 5 when wire == 2: t = ParseTensor(r.ReadLengthDelimited(), resolver).Tensor; break;
                 // AttributeProto.g (field 6): single nested GraphProto.
-                case 6 when wire == 2: g = ParseGraph(r.ReadLengthDelimited(), metadata: null); break;
+                case 6 when wire == 2: g = ParseGraph(r.ReadLengthDelimited(), metadata: null, resolver); break;
                 case 7 when wire == 5: (floats ??= new()).Add(r.ReadFloat()); break;
                 case 7 when wire == 2: ReadPackedFloats(r.ReadLengthDelimited(), floats ??= new()); break;
                 case 8 when wire == 0: (ints ??= new()).Add(r.ReadInt64()); break;
                 case 8 when wire == 2: ReadPackedVarints(r.ReadLengthDelimited(), ints ??= new()); break;
                 // AttributeProto.graphs (field 10): repeated GraphProto.
-                case 10 when wire == 2: (graphs ??= new()).Add(ParseGraph(r.ReadLengthDelimited(), metadata: null)); break;
+                case 10 when wire == 2: (graphs ??= new()).Add(ParseGraph(r.ReadLengthDelimited(), metadata: null, resolver)); break;
                 default: r.SkipField(wire); break;
             }
         }
@@ -206,7 +233,8 @@ public static class OnnxModelLoader
     private const long DtFloat = 1, DtUint8 = 2, DtInt8 = 3, DtInt32 = 6, DtInt64 = 7, DtBool = 9,
         DtFloat16 = 10, DtBFloat16 = 16;
 
-    private static (string Name, Tensor Tensor) ParseTensor(ReadOnlySpan<byte> bytes)
+    private static (string Name, Tensor Tensor) ParseTensor(
+        ReadOnlySpan<byte> bytes, ExternalDataResolver? resolver)
     {
         var dims = new List<long>();
         long dataType = 0;
@@ -216,6 +244,13 @@ public static class OnnxModelLoader
         List<float>? floatData = null;
         List<long>? int64Data = null;
         List<int>? int32Data = null;
+
+        // External-data fields (only meaningful when dataLocation == 1 / EXTERNAL).
+        long dataLocation = 0;
+        string? extLocation = null;
+        long extOffset = 0;
+        long extLength = -1; // -1 => "to end of file".
+        bool hasExtLength = false;
 
         var r = new ProtoReader(bytes);
         while (r.TryReadTag(out int field, out int wire))
@@ -233,6 +268,14 @@ public static class OnnxModelLoader
                 case 7 when wire == 2: ReadPackedVarints(r.ReadLengthDelimited(), int64Data ??= new()); break;
                 case 8 when wire == 2: name = r.ReadString(); break;
                 case 9 when wire == 2: rawData = r.ReadLengthDelimited(); hasRaw = true; break;
+                // external_data (field 13): repeated StringStringEntryProto (key/value).
+                case 13 when wire == 2:
+                    ApplyExternalDataEntry(
+                        r.ReadLengthDelimited(),
+                        ref extLocation, ref extOffset, ref extLength, ref hasExtLength);
+                    break;
+                // data_location (field 14): 0 = DEFAULT (inline), 1 = EXTERNAL.
+                case 14 when wire == 0: dataLocation = r.ReadInt64(); break;
                 default: r.SkipField(wire); break;
             }
         }
@@ -240,6 +283,26 @@ public static class OnnxModelLoader
         int[] shapeDims = dims.Select(d => (int)d).ToArray();
         var shape = new TensorShape(shapeDims);
         int count = checked((int)shape.Length);
+
+        // EXTERNAL: pull the tensor's raw bytes from the sibling data file via the resolver, then
+        // feed them through the SAME dtype switch as inline raw_data (identical little-endian
+        // MemoryMarshal.Cast decode). Only this tensor's [offset, length] slice is copied.
+        byte[]? externalRaw = null;
+        if (dataLocation == 1 /* EXTERNAL */)
+        {
+            if (extLocation is null)
+                throw new ModelSharpException(
+                    $"Initializer '{name}' is EXTERNAL but has no 'location' in external_data.");
+            if (resolver is null)
+                throw new ModelSharpException(
+                    $"Initializer '{name}' references external data file '{extLocation}', but the model " +
+                    "was parsed from an in-memory byte buffer with no base directory; load it from a " +
+                    "file path (OnnxModelLoader.LoadModel) so external data can be resolved.");
+
+            externalRaw = resolver.Read(extLocation, extOffset, hasExtLength ? extLength : -1, name);
+            rawData = externalRaw;
+            hasRaw = true;
+        }
 
         // If data_type is unset (0) but typed fields are present, infer it so we
         // still materialize the right dtype.
@@ -349,6 +412,94 @@ public static class OnnxModelLoader
             default:
                 throw new ModelSharpException(
                     $"Unsupported tensor data_type {dataType} for '{name}'.");
+        }
+    }
+
+    /// <summary>
+    /// Parses one <c>external_data</c> StringStringEntryProto (key = field 1, value = field 2) and
+    /// folds the recognized keys (<c>location</c>, <c>offset</c>, <c>length</c>) into the running
+    /// external-data descriptor. <c>checksum</c> and any unknown keys are ignored.
+    /// </summary>
+    private static void ApplyExternalDataEntry(
+        ReadOnlySpan<byte> bytes,
+        ref string? location, ref long offset, ref long length, ref bool hasLength)
+    {
+        (string key, string value) = ParseMetadataEntry(bytes);
+        switch (key)
+        {
+            case "location": location = value; break;
+            case "offset":
+                offset = value.Length == 0 ? 0 : long.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                break;
+            case "length":
+                if (value.Length != 0)
+                {
+                    length = long.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                    hasLength = true;
+                }
+                break;
+            // "checksum" and any unrecognized keys: ignored.
+        }
+    }
+
+    /// <summary>
+    /// Resolves and reads ONNX external-data weight files relative to the model's directory.
+    /// Each referenced file is memory-mapped exactly once and the mapping is reused across every
+    /// tensor in a single load, so a multi-GB weights file is never copied into the heap in full —
+    /// only each tensor's own [offset, length] slice is copied into its managed array. Mappings are
+    /// released when the resolver is disposed at the end of the load.
+    /// </summary>
+    private sealed class ExternalDataResolver : IDisposable
+    {
+        private readonly string? _baseDir;
+        private readonly Dictionary<string, (MemoryMappedFile File, long Length)> _maps =
+            new(StringComparer.Ordinal);
+
+        public ExternalDataResolver(string? baseDir) => _baseDir = baseDir;
+
+        /// <summary>
+        /// Reads <paramref name="length"/> bytes (or to end-of-file when <paramref name="length"/>
+        /// is negative) starting at <paramref name="offset"/> from the external file named by
+        /// <paramref name="location"/> (resolved relative to the model directory) into a fresh array.
+        /// </summary>
+        public byte[] Read(string location, long offset, long length, string tensorName)
+        {
+            string resolved = _baseDir is null ? location : Path.Combine(_baseDir, location);
+
+            if (!_maps.TryGetValue(resolved, out var entry))
+            {
+                if (!File.Exists(resolved))
+                    throw new ModelSharpException(
+                        $"External data file '{resolved}' for initializer '{tensorName}' was not found.");
+                long fileLen = new FileInfo(resolved).Length;
+                // A zero-length file cannot be memory-mapped; record it so empty slices still work.
+                MemoryMappedFile mmf = fileLen == 0
+                    ? null!
+                    : MemoryMappedFile.CreateFromFile(
+                        resolved, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+                entry = (mmf, fileLen);
+                _maps[resolved] = entry;
+            }
+
+            if (length < 0) length = entry.Length - offset;
+            if (offset < 0 || length < 0 || offset + length > entry.Length)
+                throw new ModelSharpException(
+                    $"External data slice [{offset}, {offset + length}) for initializer '{tensorName}' " +
+                    $"is out of bounds for file '{resolved}' (length {entry.Length}).");
+
+            var buffer = new byte[length];
+            if (length == 0) return buffer;
+
+            using MemoryMappedViewAccessor view =
+                entry.File.CreateViewAccessor(offset, length, MemoryMappedFileAccess.Read);
+            view.ReadArray(0, buffer, 0, checked((int)length));
+            return buffer;
+        }
+
+        public void Dispose()
+        {
+            foreach (var entry in _maps.Values) entry.File?.Dispose();
+            _maps.Clear();
         }
     }
 

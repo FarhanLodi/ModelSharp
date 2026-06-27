@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0-alpha] - 2026-06-27
 
 ### Added
+- Real **INT4 LLMs run end-to-end**, including a **7B** (Mistral-7B-Instruct):
+  ONNX **external-data** loading (`data_location=EXTERNAL`, memory-mapped) for
+  >2 GB models; the `MatMulNBits` block-quant op; and the onnxruntime-genai
+  `GroupQueryAttention` variant (packed-QKV, in-op rotary via cos/sin caches,
+  seqlens_k). Qwen2.5-0.5B (INT4, decomposed attention) and Mistral-7B (INT4,
+  genai GQA) both validated end-to-end.
+- 9 more standard/contrib ops (CastLike, Scatter, RNN, AffineGrid, RoiAlign,
+  DeformConv, NLLLoss, SoftmaxCrossEntropyLoss, SequenceMap) → ~200 registered.
+- Native GPU kernels for many former CPU-fallback ops (Pad/Tile/Clip/reductions/
+  activations) and a shared-memory-tiled int8 GEMM.
 - Native on-device `MatMulInteger` GEMM (uint8/int8, bit-exact vs the CPU
   engine), so quantized matmuls run on the GPU instead of the CPU fallback;
   the real INT8 GPT-2 decodes whole-graph on CUDA through it.
