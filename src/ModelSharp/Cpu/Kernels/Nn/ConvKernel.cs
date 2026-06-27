@@ -1,4 +1,6 @@
+using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
+using ModelSharp.Cpu.Kernels.Llm;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
 
@@ -13,6 +15,9 @@ namespace ModelSharp.Cpu.Kernels.Nn;
 public sealed class ConvKernel : IKernel
 {
     public string OpType => "Conv";
+
+    /// <summary>Below this many output MACs the conv stays serial (dispatch not worth it).</summary>
+    private const long ParallelThreshold = 1L << 16;
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -78,19 +83,29 @@ public sealed class ConvKernel : IKernel
         var y = new Tensor<float>(is1d
             ? new TensorShape(N, cout, outW)
             : new TensorShape(N, cout, outH, outW));
-        System.Span<float> xs = x.Span, ws = w.Span, ys = y.Span;
-        System.Span<float> bs = bias is null ? default : bias.Span;
+        float[] xs = KernelSimd.Array(x), ws = KernelSimd.Array(w), ys = KernelSimd.Array(y);
+        float[]? bs = bias is null ? null : KernelSimd.Array(bias);
 
         int xN = xd[1] * H * W, xC = H * W;
         int wO = cinPerGroup * kH * kW, wC = kH * kW;
         int yN = cout * outH * outW, yC = outH * outW;
 
-        for (int n = 0; n < N; n++)
-        for (int g = 0; g < group; g++)
-        for (int ocg = 0; ocg < outPerGroup; ocg++)
+        // When the kernel runs contiguously along W (dilation 1) we can SIMD the inner
+        // kx dot over an in-bounds sub-window; otherwise fall back to the scalar gather.
+        bool simdW = dW == 1 && kW > 1;
+
+        // Parallelize over the independent (batch × output-channel) outer index; each unit
+        // owns a disjoint [outH×outW] output plane, so there are no write conflicts.
+        int units = N * cout;
+
+        void Unit(int unit)
         {
-            int oc = g * outPerGroup + ocg;
-            float b0 = bias is null ? 0f : bs[oc];
+            int oc = unit % cout;
+            int n = unit / cout;
+            int g = oc / outPerGroup;
+            float b0 = bs is null ? 0f : bs[oc];
+            int yPlane = n * yN + oc * yC;
+
             for (int oy = 0; oy < outH; oy++)
             for (int ox = 0; ox < outW; ox++)
             {
@@ -106,17 +121,38 @@ public sealed class ConvKernel : IKernel
                         if (iy < 0 || iy >= H) continue;
                         int xRow = xBase + iy * W;
                         int wRow = wBase + ky * kW;
-                        for (int kx = 0; kx < kW; kx++)
+
+                        if (simdW)
                         {
-                            int ix = ox * sW - padLeft + kx * dW;
-                            if (ix < 0 || ix >= W) continue;
-                            sum += xs[xRow + ix] * ws[wRow + kx];
+                            // ix = ox*sW - padLeft + kx; the in-bounds kx span is contiguous.
+                            int ixStart = ox * sW - padLeft;
+                            int kxLo = ixStart < 0 ? -ixStart : 0;
+                            int kxHi = kW;                          // exclusive
+                            if (ixStart + kxHi > W) kxHi = W - ixStart;
+                            int len = kxHi - kxLo;
+                            if (len > 0)
+                                sum += KernelSimd.Dot(xs, xRow + ixStart + kxLo, ws, wRow + kxLo, len);
+                        }
+                        else
+                        {
+                            for (int kx = 0; kx < kW; kx++)
+                            {
+                                int ix = ox * sW - padLeft + kx * dW;
+                                if (ix < 0 || ix >= W) continue;
+                                sum += xs[xRow + ix] * ws[wRow + kx];
+                            }
                         }
                     }
                 }
-                ys[n * yN + oc * yC + oy * outW + ox] = sum;
+                ys[yPlane + oy * outW + ox] = sum;
             }
         }
+
+        long macs = (long)units * outH * outW * cinPerGroup * kH * kW;
+        if (macs >= ParallelThreshold && units > 1)
+            Parallel.For(0, units, Unit);
+        else
+            for (int unit = 0; unit < units; unit++) Unit(unit);
 
         ctx.Set(node.Outputs[0], y);
     }

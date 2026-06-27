@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Graph;
 using ModelSharp.Tensors;
@@ -32,6 +33,9 @@ namespace ModelSharp.Cpu.Kernels.Llm;
 public sealed class RotaryEmbeddingKernel : IKernel
 {
     public string OpType => "RotaryEmbedding";
+
+    /// <summary>Below this many rotated pairs the token loop stays serial.</summary>
+    private const long RotaryThreshold = 1L << 15;
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -69,43 +73,58 @@ public sealed class RotaryEmbeddingKernel : IKernel
         int rotHalf = rotary / 2;
 
         var y = new Tensor<float>(input.Shape);
-        Span<float> xs = input.Span, ys = y.Span, cos = cosCache.Span, sin = sinCache.Span;
-        xs.CopyTo(ys);
+        input.Span.CopyTo(y.Span);
+
+        // Flat backing arrays so each (batch, token) row can be rotated in a Parallel.For
+        // body — every iteration writes disjoint head rows, so no synchronization is needed.
+        float[] xs = KernelSimd.Array(input);
+        float[] ys = KernelSimd.Array(y);
+        float[] cos = KernelSimd.Array(cosCache);
+        float[] sin = KernelSimd.Array(sinCache);
+        bool rank4 = dims.Length == 4;
+        int hd = heads, hs = headSize, rh = rotHalf, hf = half, sq = seq;
+        bool il = interleaved;
+        long[] posIds = positionIds;
 
         // Stride to step from one (batch, head, token) row to the next inside `xs`.
         // For 4-D [B,N,S,D] the token axis is innermost-but-one; for 3-D [B,S,H] heads
         // are packed inside hidden so a head's row is contiguous of length headSize.
-        for (int bch = 0; bch < batch; bch++)
+        void Token(int unit)
         {
-            for (int s = 0; s < seq; s++)
+            int s = unit % sq;
+            int bch = unit / sq;
+            long pos = posIds.Length == 1
+                ? posIds[0] + s
+                : posIds[Math.Min(bch * sq + s, posIds.Length - 1)];
+            int cacheBase = (int)pos * hf;
+
+            for (int h = 0; h < hd; h++)
             {
-                long pos = positionIds.Length == 1
-                    ? positionIds[0] + s
-                    : positionIds[Math.Min(bch * seq + s, positionIds.Length - 1)];
-                int cacheBase = (int)pos * half;
+                int rowBase = rank4
+                    ? ((bch * hd + h) * sq + s) * hs
+                    : ((bch * sq + s) * hd + h) * hs;
 
-                for (int h = 0; h < heads; h++)
+                for (int j = 0; j < rh; j++)
                 {
-                    int rowBase = dims.Length == 4
-                        ? ((bch * heads + h) * seq + s) * headSize
-                        : ((bch * seq + s) * heads + h) * headSize;
+                    float c = cos[cacheBase + j];
+                    float sn = sin[cacheBase + j];
+                    int i0, i1;
+                    if (il) { i0 = rowBase + 2 * j; i1 = i0 + 1; }
+                    else { i0 = rowBase + j; i1 = rowBase + j + rh; }
 
-                    for (int j = 0; j < rotHalf; j++)
-                    {
-                        float c = cos[cacheBase + j];
-                        float sn = sin[cacheBase + j];
-                        int i0, i1;
-                        if (interleaved) { i0 = rowBase + 2 * j; i1 = i0 + 1; }
-                        else { i0 = rowBase + j; i1 = rowBase + j + rotHalf; }
-
-                        float a = xs[i0];
-                        float b = xs[i1];
-                        ys[i0] = a * c - b * sn;
-                        ys[i1] = b * c + a * sn;
-                    }
+                    float a = xs[i0];
+                    float b = xs[i1];
+                    ys[i0] = a * c - b * sn;
+                    ys[i1] = b * c + a * sn;
                 }
             }
         }
+
+        int tokens = batch * seq;
+        if ((long)tokens * heads * rotHalf >= RotaryThreshold && tokens > 1)
+            Parallel.For(0, tokens, Token);
+        else
+            for (int unit = 0; unit < tokens; unit++) Token(unit);
 
         ctx.Set(node.Outputs[0], y);
     }

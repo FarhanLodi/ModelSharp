@@ -137,6 +137,18 @@ public sealed class IlgpuEngine : IExecutionEngine
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>, int> _where;
 
+    // MatMulNBits: dequant-in-kernel block-quant (INT4/INT8) GEMM. One thread per output element.
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>, ArrayView<float>,
+        ArrayView<int>, ArrayView<float>, MatMulNBitsParams> _matmulNBits;
+
+    // GroupQueryAttention on-device kernels: in-op rotary, present-K/V scatter, and the attention core.
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        int, int, int, int, int, int, int, int> _rotary;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>,
+        int, int, int, int, int> _gqaScatter;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        ArrayView<int>, int, int, int, int, int, int, int, float, int> _gqaAttention;
+
     /// <inheritdoc />
     public IReadOnlyList<TensorInfo> Inputs { get; }
 
@@ -224,6 +236,15 @@ public sealed class IlgpuEngine : IExecutionEngine
         _where = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>, int>(GpuKernels.WhereK);
 
+        _matmulNBits = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, ArrayView<float>, MatMulNBitsParams>(GpuKernels.MatMulNBitsK);
+        _rotary = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            int, int, int, int, int, int, int, int>(GpuKernels.RotaryK);
+        _gqaScatter = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>,
+            int, int, int, int, int>(GpuKernels.GqaScatterKvK);
+        _gqaAttention = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, int, int, int, int, int, int, int, float, int>(GpuKernels.GqaAttentionK);
+
         Inputs = graph.Inputs.Select(n => new TensorInfo(n, ElementType.Float32, Array.Empty<int>())).ToList();
         Outputs = graph.Outputs.Select(n => new TensorInfo(n, ElementType.Float32, Array.Empty<int>())).ToList();
     }
@@ -308,6 +329,8 @@ public sealed class IlgpuEngine : IExecutionEngine
                     case "Cast": RunCast(node, values); break;
                     case "MatMul": RunMatMul(node, values, temps); break;
                     case "MatMulInteger": RunMatMulInteger(node, values, temps); break;
+                    case "MatMulNBits": RunMatMulNBits(node, values, temps); break;
+                    case "GroupQueryAttention": RunGroupQueryAttention(node, values, temps); break;
                     case "Gemm": RunGemm(node, values, temps); break;
                     case "Conv": RunConv(node, values, temps); break;
                     case "Erf": RunUnary(_erf, node, values); break;
@@ -1958,6 +1981,335 @@ public sealed class IlgpuEngine : IExecutionEngine
         string name = node.Inputs[inputIndex];
         if (string.IsNullOrEmpty(name) || !values.TryGetValue(name, out DeviceValue v)) return Array.Empty<int>();
         return ReadQuantAsInts(v.ToHost());
+    }
+
+    /// <summary>
+    /// ONNX Runtime contrib <c>MatMulNBits</c>: block-wise INT4/INT8 weight-quantized matmul, run natively on the
+    /// device with the per-block dequantization done <b>inside the kernel</b> (no host dequant, no per-op round-trip).
+    /// <c>A</c> (float <c>[..., K]</c>) and the packed quantized <c>B</c> (uint8 <c>[N, nBlocksPerRow, blobSize]</c>,
+    /// + per-(row,block) <c>scales</c> + optional <c>zero_points</c>) are uploaded to the device; the kernel
+    /// (<see cref="GpuKernels.MatMulNBitsK"/>, one thread per output element) unpacks each n-bit code, dequantizes
+    /// <c>W[n,k] = (q − zp) · scale</c> on the fly and accumulates the dot product in float — writing the float
+    /// <c>[..., N]</c> result. Matches the CPU <see cref="ModelSharp.Cpu.Kernels.Quantize.MatMulNBitsKernel"/> in
+    /// dequant semantics (nibble order, default symmetric zp <c>2^(bits-1)</c>, accumulation order); float results
+    /// agree to a relative tolerance (GPU vs CPU float rounding). Wired as <c>case "MatMulNBits"</c>. <c>g_idx</c>
+    /// (non-trivial block permutation) is not supported and throws — matching the CPU kernel.
+    /// </summary>
+    private void RunMatMulNBits(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        int N = (int)AttrInt(node, "N", 0);
+        int K = (int)AttrInt(node, "K", 0);
+        int bits = (int)AttrInt(node, "bits", 4);
+        int blockSize = (int)AttrInt(node, "block_size", 0);
+        if (N <= 0 || K <= 0)
+            throw new ModelSharpException($"MatMulNBits requires positive N and K attributes (got N={N}, K={K}).");
+        if (bits != 4 && bits != 8)
+            throw new ModelSharpException($"MatMulNBits supports bits=4 or bits=8; got {bits}.");
+        if (blockSize <= 0)
+            throw new ModelSharpException($"MatMulNBits requires a positive block_size; got {blockSize}.");
+
+        int nBlocksPerRow = (K + blockSize - 1) / blockSize;
+        int blobSize = (blockSize * bits + 7) / 8;
+        int zpRowBytes = (nBlocksPerRow * bits + 7) / 8;
+
+        // A is a device float tensor [..., K]; flatten its leading dims to [M, K].
+        MemoryBuffer1D<float, Stride1D.Dense> aBuf = FloatBuf(values, node.Inputs[0]);
+        TensorShape aShape = values[node.Inputs[0]].Shape;
+        ReadOnlySpan<int> aDims = aShape.Dimensions;
+        if (aDims.Length == 0 || aDims[aDims.Length - 1] != K)
+            throw new ModelSharpException(
+                $"MatMulNBits A inner dimension must equal K={K}; got [{string.Join(",", aDims.ToArray())}].");
+        int M = 1;
+        for (int i = 0; i < aDims.Length - 1; i++) M *= aDims[i];
+
+        // Packed quantized B (uint8/int8/int32 host tensor) widened to one int per byte for the device.
+        int[] b = ReadQuantAsInts(values[node.Inputs[1]].ToHost());
+        long expectedB = (long)N * nBlocksPerRow * blobSize;
+        if (b.LongLength != expectedB)
+            throw new ModelSharpException(
+                $"MatMulNBits B has {b.LongLength} elements; expected {expectedB} "
+                + $"(N={N} × n_blocks_per_row={nBlocksPerRow} × blob_size={blobSize}).");
+
+        // scales: float [N · nBlocksPerRow], on the device.
+        Tensor scalesT = values[node.Inputs[2]].ToHost();
+        float[] scales = scalesT.AsFloat().Span.ToArray();
+        long expectedScales = (long)N * nBlocksPerRow;
+        if (scales.LongLength != expectedScales)
+            throw new ModelSharpException(
+                $"MatMulNBits scales has {scales.LongLength} elements; expected {expectedScales}.");
+
+        // zero_points (optional): float per-(row,block), packed n-bit, or absent (default symmetric).
+        int zpMode = 0;                       // 0=default, 1=float, 2=packed
+        float[] zpFloat = { 0f };             // sentinel 1-element buffers when unused.
+        int[] zpPacked = { 0 };
+        bool hasZp = node.Inputs.Count > 3 && !string.IsNullOrEmpty(node.Inputs[3])
+                     && values.ContainsKey(node.Inputs[3]);
+        if (hasZp)
+        {
+            Tensor zpT = values[node.Inputs[3]].ToHost();
+            if (zpT.Dtype == ElementType.Float32)
+            {
+                zpFloat = zpT.AsFloat().Span.ToArray();
+                if (zpFloat.LongLength != expectedScales)
+                    throw new ModelSharpException(
+                        $"MatMulNBits float zero_points has {zpFloat.LongLength} elements; expected {expectedScales}.");
+                zpMode = 1;
+            }
+            else
+            {
+                zpPacked = ReadQuantAsInts(zpT);
+                long expectedZp = (long)N * zpRowBytes;
+                if (zpPacked.LongLength != expectedZp)
+                    throw new ModelSharpException(
+                        $"MatMulNBits packed zero_points has {zpPacked.LongLength} bytes; "
+                        + $"expected {expectedZp} (N={N} × {zpRowBytes}).");
+                zpMode = 2;
+            }
+        }
+
+        // g_idx (optional): only the trivial identity permutation is supported, matching the CPU kernel.
+        if (node.Inputs.Count > 4 && !string.IsNullOrEmpty(node.Inputs[4]) && values.ContainsKey(node.Inputs[4]))
+        {
+            long[] gIdx = ReadInts(values, node.Inputs[4]);
+            for (int k = 0; k < gIdx.Length; k++)
+                if (gIdx[k] != k / blockSize)
+                    throw new ModelSharpException(
+                        "MatMulNBits g_idx with a non-trivial block permutation is not supported.");
+        }
+
+        var outDims = new int[aDims.Length];
+        for (int i = 0; i < aDims.Length - 1; i++) outDims[i] = aDims[i];
+        outDims[aDims.Length - 1] = N;
+        var outShape = new TensorShape(outDims);
+
+        int total = M * N;
+        MemoryBuffer1D<float, Stride1D.Dense> y = AllocFloat(total);
+        if (total > 0)
+        {
+            MemoryBuffer1D<int, Stride1D.Dense> bDev = _accelerator.Allocate1D(b.Length == 0 ? new[] { 0 } : b);
+            MemoryBuffer1D<float, Stride1D.Dense> scDev = _accelerator.Allocate1D(scales);
+            MemoryBuffer1D<float, Stride1D.Dense> zpfDev = _accelerator.Allocate1D(zpFloat);
+            MemoryBuffer1D<int, Stride1D.Dense> zppDev = _accelerator.Allocate1D(zpPacked);
+            temps.Add(bDev); temps.Add(scDev); temps.Add(zpfDev); temps.Add(zppDev);
+            var p = new MatMulNBitsParams(M, K, N, bits, blockSize, nBlocksPerRow, blobSize, zpRowBytes, zpMode);
+            _matmulNBits(total, aBuf.View, bDev.View, scDev.View, zpfDev.View, zppDev.View, y.View, p);
+        }
+        values[node.Outputs[0]] = DeviceValue.Device(y, outShape);
+    }
+
+    /// <summary>
+    /// ONNX Runtime contrib <c>GroupQueryAttention</c> (onnxruntime-genai INT4 LLM exports), run natively on the
+    /// device. The packed-QKV split, in-op rotary, present-K/V build (past concat + new scatter), and the per-head
+    /// causal scaled-dot-product attention all execute on the accelerator — the float compute path stays on-device
+    /// (no per-op host round-trip for the heavy attention). The packed Q/K/V split and the past→present staging are
+    /// host-orchestrated device copies/uploads; rotary, the new-K/V scatter, and the attention core run in
+    /// <see cref="GpuKernels.RotaryK"/>/<see cref="GpuKernels.GqaScatterKvK"/>/<see cref="GpuKernels.GqaAttentionK"/>.
+    /// Matches the CPU <see cref="ModelSharp.Cpu.Kernels.Llm.GroupQueryAttentionKernel"/> to ~1e-3 (GPU float
+    /// rounding). Outputs <c>output</c> and (when named) <c>present_key</c>/<c>present_value</c>. Wired as
+    /// <c>case "GroupQueryAttention"</c>.
+    /// </summary>
+    private void RunGroupQueryAttention(GraphNode node, Dictionary<string, DeviceValue> values, List<MemoryBuffer> temps)
+    {
+        int numHeads = (int)AttrInt(node, "num_heads", 0);
+        int kvNumHeads = (int)AttrInt(node, "kv_num_heads", 0);
+        if (numHeads <= 0 || kvNumHeads <= 0)
+            throw new ModelSharpException("GroupQueryAttention requires positive 'num_heads' and 'kv_num_heads'.");
+        if (numHeads % kvNumHeads != 0)
+            throw new ModelSharpException(
+                $"GroupQueryAttention num_heads={numHeads} must be a multiple of kv_num_heads={kvNumHeads}.");
+        int groupSize = numHeads / kvNumHeads;
+
+        DeviceValue queryV = values[node.Inputs[0]];
+        TensorShape qShape = queryV.Shape;
+        if (qShape.Rank != 3)
+            throw new ModelSharpException(
+                $"GroupQueryAttention supports only 3-D query [B, S, hidden]; got rank {qShape.Rank}.");
+        MemoryBuffer1D<float, Stride1D.Dense> queryBuf = FloatBuf(values, node.Inputs[0]);
+
+        string keyName = node.Inputs.Count > 1 ? node.Inputs[1] : "";
+        string valueName = node.Inputs.Count > 2 ? node.Inputs[2] : "";
+        bool packed = keyName.Length == 0 || valueName.Length == 0;
+
+        int batch = qShape[0];
+        int qSeq = qShape[1];
+        int headDim, kvSeq;
+        int qHid, kvHid;
+        // Device-resident per-token Q/K/V buffers [B, S, heads·head_dim]. Mutable so rotary can apply in place.
+        MemoryBuffer1D<float, Stride1D.Dense> qBuf, kBuf, vBuf;
+
+        if (packed)
+        {
+            int hidden = qShape[2];
+            int unit = numHeads + 2 * kvNumHeads;
+            if (hidden % unit != 0)
+                throw new ModelSharpException(
+                    $"GroupQueryAttention packed-QKV hidden {hidden} not divisible by "
+                    + $"(num_heads + 2·kv_num_heads) = {unit}.");
+            headDim = hidden / unit;
+            kvSeq = qSeq;
+            qHid = numHeads * headDim;
+            kvHid = kvNumHeads * headDim;
+
+            qBuf = AllocFloat((long)batch * qSeq * qHid);
+            kBuf = AllocFloat((long)batch * kvSeq * kvHid);
+            vBuf = AllocFloat((long)batch * kvSeq * kvHid);
+            temps.Add(qBuf); temps.Add(kBuf); temps.Add(vBuf);
+            // Split the packed last dim Q|K|V per (b, s) row via device→device copies (no host round-trip).
+            for (int b = 0; b < batch; b++)
+            for (int s = 0; s < qSeq; s++)
+            {
+                int row = (b * qSeq + s) * hidden;
+                int qDst = (b * qSeq + s) * qHid;
+                int kvDst = (b * kvSeq + s) * kvHid;
+                queryBuf.View.SubView(row, qHid).CopyTo(_accelerator.DefaultStream, qBuf.View.SubView(qDst, qHid));
+                queryBuf.View.SubView(row + qHid, kvHid).CopyTo(_accelerator.DefaultStream, kBuf.View.SubView(kvDst, kvHid));
+                queryBuf.View.SubView(row + qHid + kvHid, kvHid).CopyTo(_accelerator.DefaultStream, vBuf.View.SubView(kvDst, kvHid));
+            }
+        }
+        else
+        {
+            DeviceValue keyV = values[keyName];
+            DeviceValue valV = values[valueName];
+            if (keyV.Shape.Rank != 3 || valV.Shape.Rank != 3)
+                throw new ModelSharpException("GroupQueryAttention supports only unpacked 3-D key/value.");
+            qHid = qShape[2];
+            kvSeq = keyV.Shape[1];
+            kvHid = keyV.Shape[2];
+            if (keyV.Shape[0] != batch || valV.Shape[0] != batch)
+                throw new ModelSharpException("GroupQueryAttention query/key/value batch sizes disagree.");
+            if (valV.Shape[1] != kvSeq || valV.Shape[2] != kvHid)
+                throw new ModelSharpException("GroupQueryAttention key/value shapes disagree.");
+            if (qHid % numHeads != 0)
+                throw new ModelSharpException(
+                    $"GroupQueryAttention query hidden {qHid} not divisible by num_heads={numHeads}.");
+            headDim = qHid / numHeads;
+            if (kvHid != kvNumHeads * headDim)
+                throw new ModelSharpException(
+                    $"GroupQueryAttention key/value hidden {kvHid} must equal kv_num_heads·head_dim = {kvNumHeads * headDim}.");
+            // Copy into fresh mutable buffers (rotary mutates Q/K in place; the inputs must not be clobbered).
+            qBuf = CopyBuf(queryBuf, (long)batch * qSeq * qHid, temps);
+            kBuf = CopyBuf(FloatBuf(values, keyName), (long)batch * kvSeq * kvHid, temps);
+            vBuf = CopyBuf(FloatBuf(values, valueName), (long)batch * kvSeq * kvHid, temps);
+        }
+
+        // Optional past_key / past_value: [B, kv_num_heads, pastSeq, head_dim].
+        bool hasPast = node.Inputs.Count > 3 && !string.IsNullOrEmpty(node.Inputs[3]);
+        bool hasPastV = node.Inputs.Count > 4 && !string.IsNullOrEmpty(node.Inputs[4]);
+        int pastSeq = 0;
+        MemoryBuffer1D<float, Stride1D.Dense>? pastK = null, pastV = null;
+        if (hasPast)
+        {
+            if (!hasPastV)
+                throw new ModelSharpException("GroupQueryAttention past_key provided without past_value.");
+            DeviceValue pkV = values[node.Inputs[3]];
+            if (pkV.Shape.Length > 0)
+            {
+                if (pkV.Shape.Rank != 4 || pkV.Shape[0] != batch ||
+                    pkV.Shape[1] != kvNumHeads || pkV.Shape[3] != headDim)
+                    throw new ModelSharpException(
+                        "GroupQueryAttention past_key must be [B, kv_num_heads, pastSeq, head_dim].");
+                pastSeq = pkV.Shape[2];
+                pastK = FloatBuf(values, node.Inputs[3]);
+                pastV = FloatBuf(values, node.Inputs[4]);
+            }
+        }
+        int totalSeq = pastSeq + kvSeq;
+
+        // Optional seqlens_k (int32 [B]): last-valid-key index per batch (host int → int buffer for the kernel).
+        bool hasSeqBound = node.Inputs.Count > 5 && !string.IsNullOrEmpty(node.Inputs[5]);
+        int[] seqBounds;
+        if (hasSeqBound)
+        {
+            long[] sl = ReadInts(values, node.Inputs[5]);
+            seqBounds = new int[batch];
+            for (int b = 0; b < batch; b++)
+                seqBounds[b] = (int)sl[Math.Min(b, sl.Length - 1)];
+        }
+        else
+        {
+            seqBounds = new[] { totalSeq - 1 };
+        }
+
+        // ---- In-op rotary (do_rotary == 1): apply RoPE to Q and K (not V) before attention. ----
+        bool doRotary = AttrInt(node, "do_rotary", 0) != 0;
+        if (doRotary)
+        {
+            if (node.Inputs.Count <= 8 || string.IsNullOrEmpty(node.Inputs[7]) || string.IsNullOrEmpty(node.Inputs[8]))
+                throw new ModelSharpException(
+                    "GroupQueryAttention do_rotary=1 requires cos_cache (input 7) and sin_cache (input 8).");
+            DeviceValue cosV = values[node.Inputs[7]];
+            MemoryBuffer1D<float, Stride1D.Dense> cosBuf = FloatBuf(values, node.Inputs[7]);
+            MemoryBuffer1D<float, Stride1D.Dense> sinBuf = FloatBuf(values, node.Inputs[8]);
+            int half = cosV.Shape[cosV.Shape.Rank - 1];
+            int maxPos = cosV.Shape[0];
+            int rotary = Math.Min(2 * half, headDim);
+            int rotHalf = rotary / 2;
+            int interleaved = AttrInt(node, "rotary_interleaved", 0) != 0 ? 1 : 0;
+            int qPairs = batch * qSeq * numHeads * rotHalf;
+            int kPairs = batch * kvSeq * kvNumHeads * rotHalf;
+            if (qPairs > 0)
+                _rotary(qPairs, qBuf.View, cosBuf.View, sinBuf.View, qSeq, numHeads, headDim, rotHalf, half, pastSeq, maxPos, interleaved);
+            if (kPairs > 0)
+                _rotary(kPairs, kBuf.View, cosBuf.View, sinBuf.View, kvSeq, kvNumHeads, headDim, rotHalf, half, pastSeq, maxPos, interleaved);
+        }
+
+        float scaleAttr = AttrFloat(node, "scale", 0f);
+        float scale = scaleAttr != 0f ? scaleAttr : 1f / MathF.Sqrt(headDim);
+
+        // present_key / present_value [B, kv_num_heads, totalSeq, head_dim]: stage past then scatter new K/V.
+        var presentShape = new TensorShape(batch, kvNumHeads, totalSeq, headDim);
+        long presentLen = (long)batch * kvNumHeads * totalSeq * headDim;
+        MemoryBuffer1D<float, Stride1D.Dense> presentK = AllocFloat(presentLen);
+        MemoryBuffer1D<float, Stride1D.Dense> presentV = AllocFloat(presentLen);
+
+        if (pastSeq > 0 && pastK is not null)
+        {
+            // Copy past [B, kvh, pastSeq, hd] into present [B, kvh, totalSeq, hd] at sequence 0 (per head row).
+            for (int b = 0; b < batch; b++)
+            for (int g = 0; g < kvNumHeads; g++)
+            {
+                int len = pastSeq * headDim;
+                int src = ((b * kvNumHeads + g) * pastSeq) * headDim;
+                int dst = ((b * kvNumHeads + g) * totalSeq) * headDim;
+                pastK.View.SubView(src, len).CopyTo(_accelerator.DefaultStream, presentK.View.SubView(dst, len));
+                pastV!.View.SubView(src, len).CopyTo(_accelerator.DefaultStream, presentV.View.SubView(dst, len));
+            }
+        }
+        // Scatter the new K/V [B, kvSeq, kvHid] into present at offset pastSeq.
+        int scatterN = batch * kvSeq * kvNumHeads * headDim;
+        if (scatterN > 0)
+        {
+            _gqaScatter(scatterN, kBuf.View, presentK.View, kvSeq, kvNumHeads, headDim, totalSeq, pastSeq);
+            _gqaScatter(scatterN, vBuf.View, presentV.View, kvSeq, kvNumHeads, headDim, totalSeq, pastSeq);
+        }
+
+        // Attention core: one thread per (b, h, qi) output row.
+        MemoryBuffer1D<float, Stride1D.Dense> outBuf = AllocFloat((long)batch * qSeq * qHid);
+        ArrayView<int> vSeqBounds = Upload(seqBounds, temps);
+        int rows = batch * numHeads * qSeq;
+        if (rows > 0)
+            _gqaAttention(rows, qBuf.View, presentK.View, presentV.View, outBuf.View, vSeqBounds,
+                qSeq, numHeads, kvNumHeads, headDim, totalSeq, pastSeq, groupSize, scale, hasSeqBound ? 1 : 0);
+
+        values[node.Outputs[0]] = DeviceValue.Device(outBuf, new TensorShape(batch, qSeq, qHid));
+        if (node.Outputs.Count > 1 && !string.IsNullOrEmpty(node.Outputs[1]))
+            values[node.Outputs[1]] = DeviceValue.Device(presentK, presentShape);
+        else
+            temps.Add(presentK);
+        if (node.Outputs.Count > 2 && !string.IsNullOrEmpty(node.Outputs[2]))
+            values[node.Outputs[2]] = DeviceValue.Device(presentV, presentShape);
+        else
+            temps.Add(presentV);
+    }
+
+    /// <summary>Allocates a fresh device float buffer of <paramref name="len"/> elements and copies <paramref name="src"/> into it (device→device).</summary>
+    private MemoryBuffer1D<float, Stride1D.Dense> CopyBuf(
+        MemoryBuffer1D<float, Stride1D.Dense> src, long len, List<MemoryBuffer> temps)
+    {
+        MemoryBuffer1D<float, Stride1D.Dense> dst = AllocFloat(len);
+        temps.Add(dst);
+        if (len > 0) src.View.SubView(0, len).CopyTo(_accelerator.DefaultStream, dst.View.SubView(0, len));
+        return dst;
     }
 
     /// <summary>
