@@ -76,7 +76,9 @@ public static class ExtraOpsRegistrations
         // Optional value type
         .Register(new ModelSharp.Cpu.Kernels.Sequence.OptionalKernel())
         .Register(new ModelSharp.Cpu.Kernels.Sequence.OptionalGetElementKernel())
-        .Register(new ModelSharp.Cpu.Kernels.Sequence.OptionalHasElementKernel());
+        .Register(new ModelSharp.Cpu.Kernels.Sequence.OptionalHasElementKernel())
+        // Sequence higher-order op (subgraph mapped over a sequence)
+        .Register(new ModelSharp.Cpu.Kernels.Sequence.SequenceMapKernel());
 
     /// <summary>
     /// Adds the <c>QLinear*</c> quantized op family (common in quantized ONNX exports):
@@ -92,4 +94,23 @@ public static class ExtraOpsRegistrations
         .Register(new ModelSharp.Cpu.Kernels.Quantize.QLinearConvKernel())
         .Register(new ModelSharp.Cpu.Kernels.Quantize.ConvIntegerKernel())
         .Register(new ModelSharp.Cpu.Kernels.Quantize.QLinearGlobalAveragePoolKernel());
+
+    /// <summary>
+    /// Adds the remaining pure-managed-feasible standard ops that close the last coverage gaps:
+    /// <c>CastLike</c> (cast to another tensor's dtype), <c>Scatter</c> (deprecated alias of
+    /// <c>ScatterElements</c>), <c>RNN</c> (vanilla Elman recurrence), <c>AffineGrid</c> (affine
+    /// sampling-grid generator), <c>RoiAlign</c> (bilinear RoI pooling), <c>DeformConv</c>
+    /// (deformable convolution v2), and the two loss ops <c>NegativeLogLikelihoodLoss</c> and
+    /// <c>SoftmaxCrossEntropyLoss</c>. (<c>SequenceMap</c> is registered with the sequence family;
+    /// the string ops are intentionally skipped — the tensor backing store is unmanaged-only.)
+    /// </summary>
+    public static KernelRegistry AddMoreStandardOps(this KernelRegistry r) => r
+        .Register(new ModelSharp.Cpu.Kernels.Shape.CastLikeKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Shape.ScatterKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Rnn.RnnKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Nn.AffineGridKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Nn.RoiAlignKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Nn.DeformConvKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Loss.NegativeLogLikelihoodLossKernel())
+        .Register(new ModelSharp.Cpu.Kernels.Loss.SoftmaxCrossEntropyLossKernel());
 }

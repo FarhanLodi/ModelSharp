@@ -14,6 +14,138 @@ internal static class GpuKernels
     /// <summary>Op selector for <see cref="BroadcastBinaryK"/>: 0=Add, 1=Sub, 2=Mul, 3=Div.</summary>
     internal const int OpAdd = 0, OpSub = 1, OpMul = 2, OpDiv = 3;
 
+    // --- Extra native unary float ops (one thread per element; mirror the CPU UnaryKernel/Activation kernels) ---
+
+    /// <summary>Sign: -1, 0, or +1 (NaN preserved). Mirrors the CPU <c>SignKernel</c>.</summary>
+    internal static void SignK(Index1D i, ArrayView<float> a, ArrayView<float> y)
+        => y[i] = a[i] > 0f ? 1f : (a[i] < 0f ? -1f : a[i]);
+
+    /// <summary>Floor (round toward −∞). Mirrors the CPU <c>FloorKernel</c>.</summary>
+    internal static void FloorK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Floor(a[i]);
+
+    /// <summary>Ceiling (round toward +∞). Mirrors the CPU <c>CeilKernel</c>.</summary>
+    internal static void CeilK(Index1D i, ArrayView<float> a, ArrayView<float> y) => y[i] = MathF.Ceiling(a[i]);
+
+    /// <summary>Round-half-to-even (banker's rounding). Mirrors the CPU <c>RoundKernel</c>.</summary>
+    internal static void RoundK(Index1D i, ArrayView<float> a, ArrayView<float> y)
+        => y[i] = MathF.Round(a[i], MidpointRounding.ToEven);
+
+    /// <summary>Softplus: <c>log(1 + exp(x))</c>. Mirrors the CPU <c>SoftplusKernel</c>.</summary>
+    internal static void SoftplusK(Index1D i, ArrayView<float> a, ArrayView<float> y)
+        => y[i] = MathF.Log(1f + MathF.Exp(a[i]));
+
+    /// <summary>Mish: <c>x · tanh(softplus(x))</c>. Mirrors the CPU <c>MishKernel</c>.</summary>
+    internal static void MishK(Index1D i, ArrayView<float> a, ArrayView<float> y)
+        => y[i] = a[i] * MathF.Tanh(MathF.Log(1f + MathF.Exp(a[i])));
+
+    /// <summary>HardSwish: <c>x · relu6(x+3) / 6</c>. Mirrors the CPU <c>HardSwishKernel</c>.</summary>
+    internal static void HardSwishK(Index1D i, ArrayView<float> a, ArrayView<float> y)
+    {
+        float v = a[i] + 3f;
+        v = v < 0f ? 0f : (v > 6f ? 6f : v);
+        y[i] = a[i] * v / 6f;
+    }
+
+    /// <summary>HardSigmoid: <c>clip(α·x + β, 0, 1)</c>. Mirrors the CPU <c>HardSigmoidKernel</c>.</summary>
+    internal static void HardSigmoidK(Index1D i, ArrayView<float> a, ArrayView<float> y, float alpha, float beta)
+    {
+        float v = alpha * a[i] + beta;
+        y[i] = v < 0f ? 0f : (v > 1f ? 1f : v);
+    }
+
+    /// <summary>ELU: <c>x</c> if x ≥ 0 else <c>α·(exp(x) − 1)</c>. Mirrors the CPU <c>EluKernel</c>.</summary>
+    internal static void EluK(Index1D i, ArrayView<float> a, ArrayView<float> y, float alpha)
+        => y[i] = a[i] >= 0f ? a[i] : alpha * (MathF.Exp(a[i]) - 1f);
+
+    /// <summary>SELU: <c>γ·x</c> if x &gt; 0 else <c>γ·α·(exp(x) − 1)</c>. Mirrors the CPU <c>SeluKernel</c>.</summary>
+    internal static void SeluK(Index1D i, ArrayView<float> a, ArrayView<float> y, float alpha, float gamma)
+        => y[i] = a[i] > 0f ? gamma * a[i] : gamma * (alpha * (MathF.Exp(a[i]) - 1f));
+
+    /// <summary>Clip: clamp each element to <c>[lo, hi]</c>. Mirrors the CPU <c>ClipKernel</c>.</summary>
+    internal static void ClipK(Index1D i, ArrayView<float> a, ArrayView<float> y, float lo, float hi)
+    {
+        float v = a[i];
+        y[i] = v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    /// <summary>Reduce op selector for <see cref="ReduceOpK"/>: 0=Max, 1=Min, 2=Prod.</summary>
+    internal const int RedMax = 0, RedMin = 1, RedProd = 2;
+
+    /// <summary>
+    /// Axis reduction by Max / Min / Prod (ONNX <c>ReduceMax</c>/<c>ReduceMin</c>/<c>ReduceProd</c>), selected by
+    /// <paramref name="op"/>. Same indexing/fold scheme as <see cref="ReduceK"/> (which does Sum/Mean): one thread
+    /// per output element, <paramref name="outBase"/> giving the all-reduced-coords-zero input offset and the
+    /// reduced coordinates enumerated row-major via <paramref name="redOutStrides"/>/<paramref name="redStrides"/>.
+    /// The accumulator is seeded with the op identity (Prod→1, Max→−∞, Min→+∞) and folded in the same order as the
+    /// CPU reduce kernels, so float results match.
+    /// </summary>
+    internal static void ReduceOpK(
+        Index1D idx,
+        ArrayView<float> x,
+        ArrayView<float> y,
+        ArrayView<int> outBase,
+        ArrayView<int> redOutStrides,
+        ArrayView<int> redStrides,
+        int numRed,
+        int redCount,
+        int op)
+    {
+        int o = idx.X;
+        int baseOff = outBase[o];
+        float acc = op == RedProd ? 1f : (op == RedMax ? float.NegativeInfinity : float.PositiveInfinity);
+        for (int r = 0; r < redCount; r++)
+        {
+            int rem = r;
+            int off = baseOff;
+            for (int k = 0; k < numRed; k++)
+            {
+                int st = redOutStrides[k];
+                int c = rem / st;
+                rem -= c * st;
+                off += c * redStrides[k];
+            }
+            float v = x[off];
+            if (op == RedMax) acc = v > acc ? v : acc;
+            else if (op == RedMin) acc = v < acc ? v : acc;
+            else acc *= v;
+        }
+        y[o] = acc;
+    }
+
+    /// <summary>Variadic-fold op selector for <see cref="VariadicFoldK"/>: 0=Min, 1=Max, 2=Sum/Mean.</summary>
+    internal const int VarMin = 0, VarMax = 1, VarSum = 2;
+
+    /// <summary>
+    /// Folds ONE input of a variadic elementwise op (ONNX <c>Min</c>/<c>Max</c>/<c>Sum</c>/<c>Mean</c>) into a
+    /// running accumulator buffer, with NumPy-style broadcasting of the input over the output shape. One thread per
+    /// output element; the host calls this once per input (seeding <paramref name="acc"/> with the op's identity
+    /// first), matching the CPU <c>VariadicElementwiseKernel</c> fold order. <paramref name="op"/> selects the
+    /// combine; Mean's divide-by-count is applied by a separate scalar pass on the host side.
+    /// </summary>
+    internal static void VariadicFoldK(
+        Index1D i,
+        ArrayView<float> acc,
+        ArrayView<float> input,
+        ArrayView<int> outStrides,
+        ArrayView<int> inStrides,
+        int rank,
+        int op)
+    {
+        int rem = i.X;
+        int off = 0;
+        for (int ax = 0; ax < rank; ax++)
+        {
+            int st = outStrides[ax];
+            int c = rem / st;
+            rem -= c * st;
+            off += c * inStrides[ax];
+        }
+        float a = acc[i], x = input[off];
+        if (op == VarMin) acc[i] = x < a ? x : a;
+        else if (op == VarMax) acc[i] = x > a ? x : a;
+        else acc[i] = a + x;
+    }
+
     /// <summary>Equal-shape elementwise divide (the broadcasting fast-path twin of Add/Sub/Mul).</summary>
     internal static void DivK(Index1D i, ArrayView<float> a, ArrayView<float> b, ArrayView<float> y)
         => y[i] = a[i] / b[i];
@@ -131,6 +263,65 @@ internal static class GpuKernels
         for (int kk = 0; kk < K; kk++)
             sum += (a[aRow + kk] - az) * (b[bBase + kk * N + n] - bz);
         y[gid] = sum;
+    }
+
+    /// <summary>Tile edge for the shared-memory blocked int8 GEMM (<see cref="MatMulIntegerTiledK"/>). 16×16 threads/group.</summary>
+    internal const int IntTile = 16;
+
+    /// <summary>
+    /// Shared-memory-tiled integer GEMM for one (already broadcast-resolved) batch of ONNX <c>MatMulInteger</c>:
+    /// <c>Y[m,n] = Σ_k A'[m,k] · B'[k,n]</c> over int32 operands, where the zero points have ALREADY been
+    /// subtracted on the host into <paramref name="a"/>/<paramref name="b"/> (so <c>A' = A − a_zp</c>,
+    /// <c>B' = B − b_zp</c>). A 2-D grouped launch of <see cref="IntTile"/>×<see cref="IntTile"/> threads computes one
+    /// output tile per group: each k-step stages an <c>IntTile×IntTile</c> block of A' and B' into shared memory
+    /// (coalesced, one element per thread), barrier-syncs, then accumulates the tile's partial dot product. The
+    /// running sum is <b>int32</b> (wrapping on overflow) — bit-identical to the naïve <see cref="MatMulIntegerK"/>
+    /// (and to the CPU <c>MatMulIntegerKernel</c>'s <c>(int)</c> cast of its int64 accumulator for in-range models),
+    /// since pre-subtracting the (int32) zero point and summing int32 products is the same arithmetic, just blocked.
+    /// Out-of-range threads (M/N not a multiple of the tile) read zeros into shared memory and skip the store.
+    /// <paramref name="aBase"/>/<paramref name="bBase"/>/<paramref name="yBase"/> are this batch's element offsets.
+    /// </summary>
+    internal static void MatMulIntegerTiledK(
+        ArrayView<int> a,
+        ArrayView<int> b,
+        ArrayView<int> y,
+        int aBase,
+        int bBase,
+        int yBase,
+        int M,
+        int K,
+        int N)
+    {
+        // Shared staging tiles for A' [row, k] and B' [k, col], laid out row-major as flat 1-D shared memory
+        // (index = localRow * IntTile + localCol) to keep the indexing unambiguous across backends.
+        var aTile = SharedMemory.Allocate1D<int>(IntTile * IntTile);
+        var bTile = SharedMemory.Allocate1D<int>(IntTile * IntTile);
+
+        int ty = Group.IdxY;
+        int tx = Group.IdxX;
+        int row = Grid.IdxY * IntTile + ty;   // output m
+        int col = Grid.IdxX * IntTile + tx;   // output n
+
+        int sum = 0;
+        int numTiles = (K + IntTile - 1) / IntTile;
+        for (int t = 0; t < numTiles; t++)
+        {
+            int kA = t * IntTile + tx;   // column of A' this thread stages
+            int kB = t * IntTile + ty;   // row of B' this thread stages
+
+            aTile[ty * IntTile + tx] = (row < M && kA < K) ? a[aBase + row * K + kA] : 0;
+            bTile[ty * IntTile + tx] = (kB < K && col < N) ? b[bBase + kB * N + col] : 0;
+
+            Group.Barrier();
+
+            for (int kk = 0; kk < IntTile; kk++)
+                sum += aTile[ty * IntTile + kk] * bTile[kk * IntTile + tx];
+
+            Group.Barrier();
+        }
+
+        if (row < M && col < N)
+            y[yBase + row * N + col] = sum;
     }
 
     /// <summary>

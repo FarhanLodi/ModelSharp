@@ -18,13 +18,18 @@ public sealed class CastKernel : IKernel
     {
         Tensor input = ctx.GetTensor(node.Inputs[0]);
         ElementType target = MapOnnxType(Attr.Int(node, "to", 0));
+        ctx.Set(node.Outputs[0], CastTo(input, target));
+    }
 
+    /// <summary>
+    /// Converts <paramref name="input"/> element-wise to <paramref name="target"/>, preserving
+    /// shape. Same-dtype returns the input unchanged. Shared by <c>Cast</c> and <c>CastLike</c>.
+    /// </summary>
+    public static Tensor CastTo(Tensor input, ElementType target)
+    {
         // Same dtype: pass the tensor through unchanged (Cast is a no-op view here).
         if (target == input.Dtype)
-        {
-            ctx.Set(node.Outputs[0], input);
-            return;
-        }
+            return input;
 
         TensorShape shape = input.Shape;
         double[] src = ReadAsDoubles(input);
@@ -71,7 +76,7 @@ public sealed class CastKernel : IKernel
                 throw new ModelSharpException($"Cast target dtype {target} is not supported.");
         }
 
-        ctx.Set(node.Outputs[0], result);
+        return result;
     }
 
     /// <summary>Reads any supported source tensor's values as <c>double</c>
