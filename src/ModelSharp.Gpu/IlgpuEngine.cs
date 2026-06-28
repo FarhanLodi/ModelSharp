@@ -1823,18 +1823,43 @@ public sealed class IlgpuEngine : IExecutionEngine
         // the single un-batched matrix (totalBatch==1, offsets 0); batched stays on the ILGPU kernel. Any
         // failure falls back to the portable kernel below.
         bool cublasDone = false;
-        if (total > 0 && UseCublas && IsHardwareGpu && NativeCuda.Available
-            && totalBatch == 1 && M > 0 && N > 0 && K > 0)
+        if (total > 0 && UseCublas && IsHardwareGpu && NativeCuda.Available && M > 0 && N > 0 && K > 0)
         {
             IntPtr ctx = _accelerator.NativePtr;
             IntPtr strm = (_accelerator.DefaultStream as ILGPU.Runtime.Cuda.CudaStream)?.StreamPtr ?? IntPtr.Zero;
             IntPtr dA = a.View.BaseView.LoadEffectiveAddressAsPtr();
             IntPtr dB = b.View.BaseView.LoadEffectiveAddressAsPtr();
             IntPtr dY = y.View.BaseView.LoadEffectiveAddressAsPtr();
-            cublasDone = NativeCuda.SgemmCtx(ctx, strm, dA, dB, dY, M, N, K) == 0;
+            if (totalBatch == 1)
+            {
+                cublasDone = NativeCuda.SgemmCtx(ctx, strm, dA, dB, dY, M, N, K) == 0;
+            }
+            // Batched MatMul (incl. the Q·Kᵀ / scores·V of decomposed attention): when the per-batch operand
+            // offsets are a constant arithmetic stride (the normal contiguous/broadcast case; broadcast B → stride 0)
+            // the whole batch is one cublasSgemmStridedBatched. Irregular multi-axis broadcasts fall through to ILGPU.
+            else if (ConstStride(aOffArr, out long sA) && ConstStride(bOffArr, out long sB))
+            {
+                cublasDone = NativeCuda.SgemmStridedBatchedCtx(ctx, strm, dA, dB, dY, M, N, K,
+                                                              sA, sB, oMat, totalBatch) == 0;
+            }
         }
         if (total > 0 && !cublasDone) _matmul(total, a.View, b.View, y.View, vAOff, vBOff, M, K, N);
         values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(outDims.ToArray()));
+    }
+
+    /// <summary>True when <paramref name="off"/> is the arithmetic sequence 0, s, 2s, … (constant element stride
+    /// from a zero base), returning that stride <paramref name="s"/> — the precondition for a single
+    /// <c>cublasSgemmStridedBatched</c>. A constant 0 (a broadcast operand reused on every batch) qualifies with
+    /// stride 0. Irregular multi-axis broadcast offset patterns return false (caller uses the ILGPU kernel).</summary>
+    private static bool ConstStride(int[] off, out long s)
+    {
+        s = 0;
+        if (off.Length == 0 || off[0] != 0) return false;
+        if (off.Length == 1) return true;
+        s = (long)off[1] - off[0];
+        for (int i = 2; i < off.Length; i++)
+            if ((long)off[i] - off[i - 1] != s) return false;
+        return true;
     }
 
     /// <summary>
@@ -3779,6 +3804,10 @@ public sealed class IlgpuEngine : IExecutionEngine
         foreach (DeviceValue w in _weightCache.Values)
             w.FloatBuf?.Dispose();
         _weightCache.Clear();
+        // Drop the cuBLAS handle cached for this accelerator's CUDA context BEFORE the context is destroyed,
+        // so a later accelerator that reuses the same context pointer can't pick up a stale handle.
+        if (IsHardwareGpu && NativeCuda.Available)
+            NativeCuda.ReleaseContext(_accelerator.NativePtr);
         _accelerator.Dispose();
         _context.Dispose();
     }

@@ -173,6 +173,17 @@ int         ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
 int         ms_cuda_bind_context(void* cuContext);   // get-or-create cached handle for ctx
 void        ms_cuda_release_context(void* cuContext); // destroy cached handle for ctx
 int         ms_cuda_sync_stream(void* cuStream);     // sync stream (NULL = device sync)
+
+// Strided-batched context-aware GEMM (cublasSgemmStridedBatched). For each
+// b in [0,batch): C[b]=A[b]*B[b], where the b-th matrices start at
+// dA+b*strideA, dB+b*strideB, dC+b*strideC (strides in ELEMENTS). strideA
+// and/or strideB may be 0 to broadcast a shared matrix across all batches.
+int         ms_cuda_sgemm_strided_batched_ctx(
+                void* cuContext, void* cuStream,
+                void* dA, void* dB, void* dC,
+                int M, int N, int K,
+                long long strideA, long long strideB, long long strideC,
+                int batch);
 ```
 
 The cuBLAS handle is created once and cached, and a dedicated non-blocking CUDA
@@ -372,6 +383,87 @@ Notes:
   context). Do **not** mix these with the runtime-context `ms_cuda_*` pointers.
 - The library links `-lcuda` (the CUDA driver) in addition to `-lcublas
   -lcudart` for the `cuCtx*` calls — see the Makefile / §3.
+
+---
+
+## 6c. Strided-batched context-aware GEMM (attention / batched matmul)
+
+`ms_cuda_sgemm_strided_batched_ctx` is the batched analogue of
+`ms_cuda_sgemm_ctx`: a single `cublasSgemmStridedBatched` launch computes, for
+every `b` in `[0, batch)`, the row-major
+
+```
+C[b][M,N] = A[b][M,K] * B[b][K,N]   (alpha = 1, beta = 0)
+```
+
+where the `b`-th matrices begin at `dA + b*strideA`, `dB + b*strideB`,
+`dC + b*strideC`. **Strides are in ELEMENTS (floats), not bytes.** It reuses the
+exact same infrastructure as `ms_cuda_sgemm_ctx` — the `CtxGuard` push/pop and
+the per-context cached `cublasHandle_t` — and the same column-major
+`Cᵀ = Bᵀ·Aᵀ` transpose trick, lifted to the batched call:
+
+```c
+cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+    N, M, K, &alpha,
+    dB, N, strideB,     // first operand  = our B, lda = N, stride pairs with B
+    dA, K, strideA,     // second operand = our A, ldb = K, stride pairs with A
+    &beta,
+    dC, N, strideC,     // output         = our C, ldc = N, stride pairs with C
+    batch);
+```
+
+Each stride pairs with the operand it belongs to; cuBLAS adds `stride * b` to the
+base pointer independently per operand. Leading dims are the row-major
+`cols`: `lda(B)=N`, `ldb(A)=K`, `ldc(C)=N`. The GEMM is **enqueued only** on
+`cuStream` (no sync); call `ms_cuda_sync_stream(cuStream)` — or, for a
+non-blocking user stream feeding a large batched launch, a context/device sync —
+before reading results.
+
+**Broadcast / shared weight.** Passing `strideB = 0` reuses one `[K,N]` `B`
+matrix for every batch (e.g. a shared projection weight applied to a batch of
+activations); `strideA = 0` similarly broadcasts a single `A`. `strideC` must be
+non-zero so each batch writes a distinct output.
+
+**Use cases.** Multi-head attention: the per-head `scores = Q·Kᵀ`-shaped batch
+(`batch = B*H`, `[M,K]·[K,N]`) and the `context = scores·V` second matmul are
+each a single strided-batched call; a per-token decode with a shared weight is
+the `strideB = 0` broadcast case.
+
+### How the C# side must call it
+
+Identical to the `ms_cuda_sgemm_ctx` pattern (§6b) — pass ILGPU's `CUcontext`,
+`CUstream`, and the batched buffer device pointers straight through, plus the
+three element strides as `long`:
+
+```csharp
+// dA/dB/dC are device pointers to the full batched buffers (valid in cuContext).
+// strides are in ELEMENTS (floats). strideB = 0 broadcasts a shared B weight.
+long strideA = (long)M * K;
+long strideB = (long)K * N;   // or 0 to share one B across all batches
+long strideC = (long)M * N;
+
+int rc = CudaKernels.SgemmStridedBatchedCtx(
+    cuContext, cuStreamPtr, dA, dB, dC,
+    M, N, K, strideA, strideB, strideC, batch);
+if (rc != 0) throw new Exception($"ms_cuda_sgemm_strided_batched_ctx failed: {rc}");
+
+CudaKernels.SyncStream(cuStreamPtr);   // wait before reading C back through ILGPU
+```
+
+Matching P/Invoke declaration (add to the `CudaKernels` class from §6):
+
+```csharp
+[DllImport(Lib, EntryPoint = "ms_cuda_sgemm_strided_batched_ctx")]
+public static extern int SgemmStridedBatchedCtx(
+    IntPtr cuContext, IntPtr cuStream,
+    IntPtr dA, IntPtr dB, IntPtr dC,
+    int m, int n, int k,
+    long strideA, long strideB, long strideC,
+    int batch);
+```
+
+`long` on the C# side marshals to the `long long` strides cuBLAS expects. All
+existing entry points are unchanged.
 
 ---
 

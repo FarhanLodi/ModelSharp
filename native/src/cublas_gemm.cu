@@ -614,4 +614,85 @@ int ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
     return 0;   // guard pops the context here
 }
 
+// ---------------------------------------------------------------------------
+// Strided-batched row-major SGEMM, context-aware.
+// ---------------------------------------------------------------------------
+// For each b in [0, batch):
+//     C[b][M,N] = A[b][M,K] * B[b][K,N]     (all row-major, alpha=1, beta=0)
+// where the b-th matrices begin at dA + b*strideA, dB + b*strideB,
+// dC + b*strideC. Strides are in ELEMENTS (floats), not bytes. strideA and/or
+// strideB may be 0 to broadcast a single matrix across every batch (e.g. a
+// shared weight reused for all batches); strideC must point at distinct outputs.
+//
+// Same column-major Cᵀ = Bᵀ·Aᵀ transpose trick as ms_cuda_sgemm_ctx, applied to
+// cublasSgemmStridedBatched. In the swapped column-major form our row-major B
+// becomes the "A" operand and our row-major A becomes the "B" operand; the
+// dimensions become (m,n,k) = (N,M,K) and the leading dims/strides pair with the
+// operand they belong to:
+//
+//   cublasSgemmStridedBatched(handle, OP_N, OP_N,
+//       N, M, K, &alpha,
+//       dB, N, strideB,     // first operand = our B, lda = N, stride = strideB
+//       dA, K, strideA,     // second operand = our A, ldb = K, stride = strideA
+//       &beta,
+//       dC, N, strideC,     // output = our C, ldc = N, stride = strideC
+//       batch);
+//
+// Enqueued only on cuStream (no sync). Pointers live in driver context
+// cuContext. Returns 0 on success, else a CUresult / cublasStatus_t code.
+int ms_cuda_sgemm_strided_batched_ctx(void* cuContext, void* cuStream,
+                                      void* dA, void* dB, void* dC,
+                                      int M, int N, int K,
+                                      long long strideA, long long strideB,
+                                      long long strideC,
+                                      int batch) {
+    if (cuContext == nullptr) {
+        fprintf(stderr, "[ms_cuda] sgemm_strided_batched_ctx: null context\n");
+        return -1;
+    }
+    if (M <= 0 || N <= 0 || K <= 0 || batch <= 0 || !dA || !dB || !dC) {
+        fprintf(stderr, "[ms_cuda] sgemm_strided_batched_ctx: bad args "
+                        "(M=%d N=%d K=%d batch=%d)\n", M, N, K, batch);
+        return -1;
+    }
+
+    CUcontext ctx = (CUcontext)cuContext;
+    CtxGuard guard(ctx);                 // push now, pop on every exit path
+    if (!guard.pushed) return (int)guard.err;
+
+    cublasHandle_t handle = ms_get_ctx_handle(ctx);
+    if (!handle) return -2;
+
+    cublasStatus_t ss = cublasSetStream(handle, (cudaStream_t)cuStream);
+    if (ss != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] sgemm_strided_batched_ctx: cublasSetStream "
+                        "status %d\n", (int)ss);
+        return (int)ss;
+    }
+
+    const float* a = (const float*)dA;
+    const float* b = (const float*)dB;
+    float*       c = (float*)dC;
+    const float alpha = 1.0f, beta = 0.0f;
+
+    // Column-major transpose trick (see comment above). cuBLAS takes the strides
+    // as `long long int`; pass them straight through.
+    cublasStatus_t s =
+        cublasSgemmStridedBatched(handle,
+                                  CUBLAS_OP_N, CUBLAS_OP_N,
+                                  N, M, K,
+                                  &alpha,
+                                  b, N, (long long)strideB,  // our B, lda=N
+                                  a, K, (long long)strideA,  // our A, ldb=K
+                                  &beta,
+                                  c, N, (long long)strideC,  // our C, ldc=N
+                                  batch);
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] sgemm_strided_batched_ctx: cublas status "
+                        "%d\n", (int)s);
+        return (int)s;
+    }
+    return 0;   // guard pops the context here
+}
+
 } // extern "C"

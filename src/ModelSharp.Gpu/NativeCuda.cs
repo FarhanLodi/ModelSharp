@@ -138,6 +138,25 @@ public static class NativeCuda
     /// <summary>Diagnostics: status returned by the most recent <see cref="SgemmCtx"/> (0 = success).</summary>
     public static int LastCtxStatus;
 
+    /// <summary>
+    /// Strided-batched GEMM inside <paramref name="cuContext"/>: for each b in [0,batch),
+    /// <c>C[b]=A[b]·B[b]</c> where the b-th matrix starts at base + b·stride (strides in elements).
+    /// <paramref name="strideB"/> (or A) may be 0 for a shared/broadcast operand. Returns 0 on success.
+    /// </summary>
+    public static int SgemmStridedBatchedCtx(IntPtr cuContext, IntPtr cuStream, IntPtr dA, IntPtr dB, IntPtr dC,
+        int M, int N, int K, long strideA, long strideB, long strideC, int batch) =>
+        ms_cuda_sgemm_strided_batched_ctx(cuContext, cuStream, dA, dB, dC, M, N, K, strideA, strideB, strideC, batch);
+
+    /// <summary>
+    /// Destroy the cached cuBLAS handle bound to <paramref name="cuContext"/>. Must be called while that context
+    /// is still alive (e.g. just before ILGPU disposes its accelerator), otherwise a later CUDA context that
+    /// reuses the same pointer value would receive a handle bound to the destroyed context. No-op if uncached.
+    /// </summary>
+    public static void ReleaseContext(IntPtr cuContext)
+    {
+        if (_available) ms_cuda_release_context(cuContext);
+    }
+
     /// <summary>Synchronize a specific stream (or the device if <see cref="IntPtr.Zero"/>). Returns 0 on success.</summary>
     public static int SyncStream(IntPtr cuStream) => ms_cuda_sync_stream(cuStream);
 
@@ -185,4 +204,6 @@ public static class NativeCuda
     [DllImport(Lib)] private static extern void ms_cuda_shutdown();
     [DllImport(Lib)] private static extern int ms_cuda_sgemm_ctx(IntPtr cuContext, IntPtr cuStream, IntPtr dA, IntPtr dB, IntPtr dC, int M, int N, int K);
     [DllImport(Lib)] private static extern int ms_cuda_sync_stream(IntPtr cuStream);
+    [DllImport(Lib)] private static extern int ms_cuda_sgemm_strided_batched_ctx(IntPtr cuContext, IntPtr cuStream, IntPtr dA, IntPtr dB, IntPtr dC, int M, int N, int K, long strideA, long strideB, long strideC, int batch);
+    [DllImport(Lib)] private static extern void ms_cuda_release_context(IntPtr cuContext);
 }
