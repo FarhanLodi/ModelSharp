@@ -84,8 +84,12 @@ RTX 4090; `nvcc 12.0` accepts `-arch=sm_89`):
 
 ```bash
 nvcc -O3 -arch=sm_89 -Xcompiler -fPIC --shared \
-     -o build/libms_cuda.so src/cublas_gemm.cu -lcublas -lcudart
+     -o build/libms_cuda.so src/cublas_gemm.cu -lcublas -lcudart -lcuda
 ```
+
+`-lcuda` (the CUDA **driver** library) is required for the externally-provided
+context API (`cuCtxPushCurrent` / `cuCtxPopCurrent`); see §6b. Confirm it is
+present with `ldconfig -p | grep libcuda` (it ships with the NVIDIA driver).
 
 Adjust `-arch` for other GPUs: `sm_80` (A100), `sm_86` (RTX 30xx),
 `sm_90` (H100).
@@ -97,8 +101,8 @@ the wrapper directly. Verified working command:
 
 ```bash
 nvcc -O3 -arch=sm_89 native/test/cublas_test.cu native/src/cublas_gemm.cu \
-     -lcublas -lcudart -o /tmp/cublas_test
-/tmp/cublas_test
+     -lcublas -lcudart -lcuda -o /tmp/cublas_ctx_test
+/tmp/cublas_ctx_test
 ```
 
 It prints `ms_cuda_available()` / `ms_cuda_device_name()`, runs correctness
@@ -160,6 +164,15 @@ int         ms_cuda_download(void* dev, float* host, size_t n);          // dev 
 int         ms_cuda_sgemm_dev(void* dA, void* dB, void* dC,
                               int M, int N, int K); // C=A*B, all device ptrs, enqueue only
 int         ms_cuda_sync(void);                   // wait for the stream
+
+// Externally-provided CUDA DRIVER context API (the ILGPU-interop path — runs on
+// the caller's own driver context + stream + device pointers, zero copies):
+int         ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
+                              void* dA, void* dB, void* dC,
+                              int M, int N, int K); // C=A*B in cuContext on cuStream
+int         ms_cuda_bind_context(void* cuContext);   // get-or-create cached handle for ctx
+void        ms_cuda_release_context(void* cuContext); // destroy cached handle for ctx
+int         ms_cuda_sync_stream(void* cuStream);     // sync stream (NULL = device sync)
 ```
 
 The cuBLAS handle is created once and cached, and a dedicated non-blocking CUDA
@@ -243,6 +256,122 @@ internal static class CudaKernels
 Note the layout/order matches `ms_cuda_sgemm` exactly: row-major `C[M,N] =
 A[M,K] * B[K,N]`, the same `(a, b, c, m, n, k)` argument order as the existing
 CPU `ms_sgemm_f32` binding — so it can drop into the same call sites.
+
+---
+
+## 6b. Externally-provided CUDA driver context (ILGPU interop)
+
+**Why this exists.** The default entry points (`ms_cuda_sgemm`,
+`ms_cuda_sgemm_dev`, …) implicitly use the CUDA **runtime primary context** and
+cache a single `cublasHandle_t` created in it. ILGPU, however, owns its **own
+CUDA driver-API context** and hands out device pointers that are valid only in
+THAT context. A `cublasHandle_t` and a device pointer are bound to whichever CUDA
+context is current when they are created/used. Calling the runtime-primary-context
+handle on ILGPU's pointers dereferenced them in the wrong address space and
+produced a **deterministic wrong region** (the bug that motivated this API;
+1024³ failed reproducibly). Note it is not a hard fault — the numbers are simply
+wrong — so you must route through the context-aware path, not rely on a crash.
+
+**The fix — context-aware entry points.** These run cuBLAS *inside the caller's
+driver context*, on the caller's stream, against the caller's device pointers,
+with **zero cross-context copies**:
+
+```c
+int  ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
+                       void* dA, void* dB, void* dC, int M, int N, int K);
+int  ms_cuda_bind_context(void* cuContext);     // optional: pre-create handle
+void ms_cuda_release_context(void* cuContext);  // destroy this ctx's handle
+int  ms_cuda_sync_stream(void* cuStream);       // NULL => device sync
+```
+
+`ms_cuda_sgemm_ctx` computes row-major `C[M,N]=A[M,K]*B[K,N]` (same
+`Cᵀ=Bᵀ·Aᵀ` column-major trick) and:
+
+1. `cuCtxPushCurrent(cuContext)` to make the caller's context current.
+2. Looks up (or lazily `cublasCreate`s, **while that context is current**) the
+   handle from a per-context cache: `std::map<CUcontext, cublasHandle_t>`,
+   mutex-guarded so it is thread-safe.
+3. `cublasSetStream(handle, cuStream)` — a driver `CUstream` is interchangeable
+   with a runtime `cudaStream_t`; `NULL` = that context's default stream.
+4. Runs `cublasSgemm`, then **always** `cuCtxPopCurrent` — including on every
+   error path (an RAII guard guarantees the push/pop are balanced).
+
+The GEMM is **enqueued only**; call `ms_cuda_sync_stream(cuStream)` when you need
+the result. `ms_cuda_bind_context` lets you pay the `cublasCreate` cost once up
+front; `ms_cuda_release_context` destroys that context's handle (call it before
+you tear down the ILGPU context). All existing runtime-API entry points are
+unchanged and keep working independently of this cache.
+
+**Verified:** correctness vs CPU reference (rel err ≤ 8.1e-7, threshold 1e-3)
+for 64³, 256×384×500, **1024³** (the previously-failing shape) and 2048³, on a
+driver context that the wrapper did **not** create and that was **not current on
+entry** — on both a user `cuStreamCreate`'d stream and the NULL default stream.
+External-context compute-only throughput matches the native path: ~38 TFLOP/s at
+1024³, ~60 TFLOP/s at 2048³, ~56 TFLOP/s at 4096³.
+
+### How the C# side must call it
+
+Pass ILGPU's own context, stream, and buffer device pointers straight through —
+no marshalling of data, only handles:
+
+```csharp
+using ILGPU;
+using ILGPU.Runtime;
+using ILGPU.Runtime.Cuda;
+
+// accelerator is an ILGPU CudaAccelerator; a, b, c are MemoryBuffer1D<float,...>
+// already allocated on it (so their pointers live in ILGPU's driver context).
+
+var cuAccel = (CudaAccelerator)accelerator;
+
+// ILGPU's underlying CUDA driver context (CUcontext) and a stream (CUstream).
+IntPtr cuContext = cuAccel.NativePtr;                       // the CUcontext
+var    cuStream  = (CudaStream)accelerator.DefaultStream;   // or a CudaStream you made
+IntPtr cuStreamPtr = cuStream.StreamPtr;                    // the CUstream (IntPtr.Zero => default)
+
+// Raw device pointers of the ILGPU buffers (valid in cuContext).
+IntPtr dA = a.View.LoadEffectiveAddressAsPtr();  // [M,K] activations, row-major
+IntPtr dB = b.View.LoadEffectiveAddressAsPtr();  // [K,N] weights,     row-major
+IntPtr dC = c.View.LoadEffectiveAddressAsPtr();  // [M,N] output,      row-major
+
+// Optional: create the per-context cuBLAS handle once up front.
+CudaKernels.BindContext(cuContext);
+
+int rc = CudaKernels.SgemmCtx(cuContext, cuStreamPtr, dA, dB, dC, M, N, K);
+if (rc != 0) throw new Exception($"ms_cuda_sgemm_ctx failed: {rc}");
+
+// Wait for the result on that stream before reading c back through ILGPU.
+CudaKernels.SyncStream(cuStreamPtr);
+
+// On shutdown, before disposing the ILGPU accelerator/context:
+CudaKernels.ReleaseContext(cuContext);
+```
+
+Matching P/Invoke declarations (add to the `CudaKernels` class from §6):
+
+```csharp
+[DllImport(Lib, EntryPoint = "ms_cuda_sgemm_ctx")]
+public static extern int SgemmCtx(IntPtr cuContext, IntPtr cuStream,
+                                  IntPtr dA, IntPtr dB, IntPtr dC,
+                                  int m, int n, int k);
+
+[DllImport(Lib, EntryPoint = "ms_cuda_bind_context")]
+public static extern int BindContext(IntPtr cuContext);
+
+[DllImport(Lib, EntryPoint = "ms_cuda_release_context")]
+public static extern void ReleaseContext(IntPtr cuContext);
+
+[DllImport(Lib, EntryPoint = "ms_cuda_sync_stream")]
+public static extern int SyncStream(IntPtr cuStream);
+```
+
+Notes:
+- Exact accessor names vary slightly by ILGPU version; the load-bearing point is
+  that `cuContext` is ILGPU's `CUcontext`, `cuStream` is ILGPU's `CUstream`, and
+  `dA/dB/dC` are device pointers allocated *by ILGPU* (so they live in that
+  context). Do **not** mix these with the runtime-context `ms_cuda_*` pointers.
+- The library links `-lcuda` (the CUDA driver) in addition to `-lcublas
+  -lcudart` for the `cuCtx*` calls — see the Makefile / §3.
 
 ---
 

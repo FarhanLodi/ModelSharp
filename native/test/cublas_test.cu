@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda.h>          // driver API: CUcontext / CUstream / cuMemAlloc ...
 
 // Entry points from src/cublas_gemm.cu (extern "C").
 extern "C" {
@@ -39,6 +40,13 @@ extern "C" {
     int         ms_cuda_sgemm_dev(void* dA, void* dB, void* dC,
                                   int M, int N, int K);
     int         ms_cuda_sync(void);
+    // Externally-provided driver-context API (the ILGPU-interop path).
+    int         ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
+                                  void* dA, void* dB, void* dC,
+                                  int M, int N, int K);
+    int         ms_cuda_bind_context(void* cuContext);
+    void        ms_cuda_release_context(void* cuContext);
+    int         ms_cuda_sync_stream(void* cuStream);
 }
 
 using clk = std::chrono::high_resolution_clock;
@@ -310,6 +318,176 @@ static void bench_chain_dev(int N, int chain, int iters) {
     ms_cuda_free(dA); ms_cuda_free(dB); ms_cuda_free(dX); ms_cuda_free(dY);
 }
 
+// ---------------------------------------------------------------------------
+// EXTERNALLY-PROVIDED DRIVER CONTEXT correctness. We cannot create an ILGPU
+// context here, but we can reproduce the exact condition it creates: a CUDA
+// DRIVER-API context that ms_cuda_* did NOT make, holding driver-allocated
+// device pointers (cuMemAlloc). We:
+//   1. cuInit(0); cuDevicePrimaryCtxRetain to get a CUcontext.
+//   2. cuMemAlloc dA/dB/dC IN that context; cuMemcpyHtoD the inputs.
+//   3. CRITICALLY pop the context so it is NOT current on entry to the wrapper
+//      (the whole point: the wrapper must push it itself).
+//   4. call ms_cuda_sgemm_ctx(ctx, stream, dA, dB, dC, ...).
+//   5. ms_cuda_sync_stream; cuMemcpyDtoH; compare to CPU reference.
+// Returns true on PASS (rel err < 1e-3).
+// ---------------------------------------------------------------------------
+#define DRV_CHECK(call, label)                                                 \
+    do {                                                                       \
+        CUresult _r = (call);                                                  \
+        if (_r != CUDA_SUCCESS) {                                              \
+            const char* _m = nullptr; cuGetErrorString(_r, &_m);              \
+            printf("  [FAIL] %s: CUresult %d (%s)\n", (label), (int)_r,        \
+                   _m ? _m : "?");                                             \
+            return false;                                                      \
+        }                                                                      \
+    } while (0)
+
+static bool correctness_ctx(CUcontext ctx, CUstream stream,
+                            int M, int N, int K, const char* tag) {
+    std::vector<float> A((size_t)M * K), B((size_t)K * N);
+    std::vector<float> C((size_t)M * N), Cref((size_t)M * N);
+    fill_rand(A, 2468 + M);
+    fill_rand(B, 1357 + N);
+
+    const size_t bytesA = (size_t)M * K * sizeof(float);
+    const size_t bytesB = (size_t)K * N * sizeof(float);
+    const size_t bytesC = (size_t)M * N * sizeof(float);
+
+    // Allocate + upload IN the externally-created context (push it for the
+    // driver memory ops, then pop so it is NOT current on the wrapper call).
+    DRV_CHECK(cuCtxPushCurrent(ctx), "push (alloc)");
+    CUdeviceptr dA = 0, dB = 0, dC = 0;
+    DRV_CHECK(cuMemAlloc(&dA, bytesA), "cuMemAlloc dA");
+    DRV_CHECK(cuMemAlloc(&dB, bytesB), "cuMemAlloc dB");
+    DRV_CHECK(cuMemAlloc(&dC, bytesC), "cuMemAlloc dC");
+    DRV_CHECK(cuMemcpyHtoD(dA, A.data(), bytesA), "HtoD A");
+    DRV_CHECK(cuMemcpyHtoD(dB, B.data(), bytesB), "HtoD B");
+    CUcontext popped = nullptr;
+    DRV_CHECK(cuCtxPopCurrent(&popped), "pop (alloc)");
+
+    // Sanity: the context must NOT be current here (proves the wrapper does the
+    // push itself, which is the whole point of this API).
+    CUcontext cur = (CUcontext)1;
+    cuCtxGetCurrent(&cur);
+    bool not_current_on_entry = (cur != ctx);
+
+    int rc = ms_cuda_sgemm_ctx((void*)ctx, (void*)stream,
+                               (void*)dA, (void*)dB, (void*)dC, M, N, K);
+    if (rc != 0) {
+        printf("  [FAIL] %s ctx %dx%dx%d: ms_cuda_sgemm_ctx rc=%d\n",
+               tag, M, N, K, rc);
+        return false;
+    }
+    int sc = ms_cuda_sync_stream((void*)stream);
+    if (sc != 0) {
+        printf("  [FAIL] %s ctx %dx%dx%d: ms_cuda_sync_stream rc=%d\n",
+               tag, M, N, K, sc);
+        return false;
+    }
+
+    DRV_CHECK(cuCtxPushCurrent(ctx), "push (D2H)");
+    DRV_CHECK(cuMemcpyDtoH(C.data(), dC, bytesC), "DtoH C");
+    cuMemFree(dA); cuMemFree(dB); cuMemFree(dC);
+    DRV_CHECK(cuCtxPopCurrent(&popped), "pop (D2H)");
+
+    cpu_ref(A.data(), B.data(), Cref.data(), M, N, K);
+    double e = rel_err(C, Cref);
+    bool ok = e < 1e-3;
+    printf("  [%s] ctx %s %4dx%4dx%4d  rel_err=%.3e  (not-current-on-entry=%s)\n",
+           ok ? "PASS" : "FAIL", tag, M, N, K, e,
+           not_current_on_entry ? "yes" : "NO!");
+    return ok && not_current_on_entry;
+}
+
+// Benchmark the context path on a NULL (default) stream, square N, compute-only
+// (buffers resident in the external context, single sync after the loop).
+static bool bench_ctx(CUcontext ctx, CUstream stream, int N, int iters) {
+    std::vector<float> A((size_t)N * N), B((size_t)N * N);
+    fill_rand(A, 13); fill_rand(B, 14);
+    const size_t bytes = (size_t)N * N * sizeof(float);
+    const double flops = 2.0 * (double)N * N * N;
+
+    DRV_CHECK(cuCtxPushCurrent(ctx), "push bench alloc");
+    CUdeviceptr dA = 0, dB = 0, dC = 0;
+    DRV_CHECK(cuMemAlloc(&dA, bytes), "alloc dA");
+    DRV_CHECK(cuMemAlloc(&dB, bytes), "alloc dB");
+    DRV_CHECK(cuMemAlloc(&dC, bytes), "alloc dC");
+    DRV_CHECK(cuMemcpyHtoD(dA, A.data(), bytes), "HtoD A");
+    DRV_CHECK(cuMemcpyHtoD(dB, B.data(), bytes), "HtoD B");
+    CUcontext popped = nullptr;
+    DRV_CHECK(cuCtxPopCurrent(&popped), "pop bench alloc");
+
+    for (int i = 0; i < 3; ++i)
+        ms_cuda_sgemm_ctx((void*)ctx,(void*)stream,(void*)dA,(void*)dB,(void*)dC,N,N,N);
+    ms_cuda_sync_stream((void*)stream);
+
+    std::vector<double> t;
+    for (int i = 0; i < iters; ++i) {
+        double t0 = now_ms();
+        ms_cuda_sgemm_ctx((void*)ctx,(void*)stream,(void*)dA,(void*)dB,(void*)dC,N,N,N);
+        ms_cuda_sync_stream((void*)stream);
+        t.push_back(now_ms() - t0);
+    }
+    double ms = median(t);
+    double gflops = flops / (ms * 1e6);
+    printf("  ctx-gemm   %4d^3  %8.3f ms/gemm  %8.1f GFLOP/s  %6.2f TFLOP/s\n",
+           N, ms, gflops, gflops / 1000.0);
+
+    DRV_CHECK(cuCtxPushCurrent(ctx), "push bench free");
+    cuMemFree(dA); cuMemFree(dB); cuMemFree(dC);
+    DRV_CHECK(cuCtxPopCurrent(&popped), "pop bench free");
+    return true;
+}
+
+static bool run_ctx_tests() {
+    printf("\n--- EXTERNALLY-PROVIDED DRIVER CONTEXT path "
+           "(simulates ILGPU interop) ---\n");
+    CUresult r = cuInit(0);
+    if (r != CUDA_SUCCESS) { printf("  cuInit failed (%d)\n", (int)r); return false; }
+    CUdevice dev = 0;
+    if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) { printf("  cuDeviceGet failed\n"); return false; }
+
+    // Externally-created context the wrapper did NOT make (cuCtxCreate gives an
+    // independent driver context, the closest analogue to ILGPU's own context).
+    CUcontext ctx = nullptr;
+    if (cuCtxCreate(&ctx, 0, dev) != CUDA_SUCCESS) {
+        printf("  cuCtxCreate failed\n"); return false;
+    }
+    // Create a stream in that context, then pop it (cuCtxCreate leaves it
+    // current; we want the wrapper to push it itself).
+    CUstream stream = nullptr;
+    cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
+    CUcontext popped = nullptr;
+    cuCtxPopCurrent(&popped);
+
+    // Up-front bind (optional lifecycle): create the cached handle once.
+    int br = ms_cuda_bind_context((void*)ctx);
+    printf("  ms_cuda_bind_context rc=%d\n", br);
+
+    bool ok = true;
+    // On a user stream:
+    ok &= correctness_ctx(ctx, stream, 64, 64, 64, "stream");
+    ok &= correctness_ctx(ctx, stream, 256, 384, 500, "stream");
+    ok &= correctness_ctx(ctx, stream, 1024, 1024, 1024, "stream");  // the shape that failed
+    // On the NULL/default stream of that context:
+    ok &= correctness_ctx(ctx, nullptr, 1024, 1024, 1024, "null-strm");
+    ok &= correctness_ctx(ctx, nullptr, 2048, 2048, 2048, "null-strm");
+    printf("CONTEXT CORRECTNESS: %s\n", ok ? "ALL PASS" : "FAILURE");
+
+    printf("\n--- BENCHMARK: external-context GEMM (compute-only) ---\n");
+    bench_ctx(ctx, stream, 1024, 9);
+    bench_ctx(ctx, stream, 2048, 9);
+    bench_ctx(ctx, stream, 4096, 7);
+
+    // Lifecycle: release the per-context handle, then destroy the context.
+    ms_cuda_release_context((void*)ctx);
+    cuCtxPushCurrent(ctx);
+    cuStreamDestroy(stream);
+    cuCtxPopCurrent(&popped);
+    cuCtxDestroy(ctx);
+    return ok;
+}
+
 int main() {
     printf("=== ModelSharp cuBLAS SGEMM test/bench ===\n");
     printf("ms_cuda_available() = %d\n", ms_cuda_available());
@@ -353,6 +531,11 @@ int main() {
     bench_chain_dev(2048, 8, 9);
     bench_chain_dev(4096, 8, 7);
 
+    // The headline new path: externally-provided driver context (ILGPU interop).
+    bool ctx_ok = run_ctx_tests();
+    ok &= ctx_ok;
+
     ms_cuda_shutdown();
+    printf("\n=== OVERALL: %s ===\n", ok ? "ALL PASS" : "FAILURE");
     return ok ? 0 : 2;
 }

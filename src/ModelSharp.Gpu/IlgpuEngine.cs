@@ -60,6 +60,16 @@ public sealed class IlgpuEngine : IExecutionEngine
     /// </summary>
     public bool UseNaiveIntGemm { get; set; }
 
+    /// <summary>
+    /// Opt-in cuBLAS fast path for the single (un-batched) MatMul. When true and running on real CUDA hardware
+    /// with <c>libms_cuda.so</c> present, the GEMM runs through cuBLAS <em>inside ILGPU's own driver context</em>
+    /// (via <see cref="NativeCuda.SgemmCtx"/>), operating directly on the resident ILGPU device buffers with no
+    /// copies, then falls back to the ILGPU dot-product kernel on any failure. Default seeded from
+    /// <c>MODELSHARP_CUBLAS=1</c>. Off → the portable ILGPU kernel (unchanged behavior).
+    /// </summary>
+    public bool UseCublas { get; set; } =
+        Environment.GetEnvironmentVariable("MODELSHARP_CUBLAS") is "1" or "on" or "true" or "True" or "ON" or "TRUE";
+
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _add;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _sub;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _mul;
@@ -1777,18 +1787,25 @@ public sealed class IlgpuEngine : IExecutionEngine
         // K==0 (a contraction over an empty past) still produces a well-defined all-zero output: the kernel
         // runs (total>0) and its inner k-loop executes zero times, so every output element is written as 0.
         //
-        // cuBLAS seam (DEFERRED — see NativeCuda integration note below). We tried routing the single
-        // un-batched MatMul through NativeCuda.Sgemm (host copy-in/out) under MODELSHARP_CUBLAS=1. Small
-        // shapes matched, but a 1024x1024x1024 MatMul came back with a DETERMINISTIC zero region
-        // (e.g. y[468031]=0 vs cpu 2.617). Root cause: this engine's ILGPU accelerator owns a driver-API
-        // CUDA context that is current on the calling thread, while libms_cuda.so / cuBLAS use the
-        // runtime-API primary context; cuBLAS's internal device staging allocations land in the wrong
-        // context, so the host copy-in/out is NOT context-safe while an ILGPU context is live. The binding
-        // is proven correct standalone (bench: 9.5e-7 rel err, up to 8.2 TFLOP/s copy-in/out, 54.8 TFLOP/s
-        // resident prefill). Safe integration requires pushing the cuBLAS primary context current (and
-        // popping ILGPU's) around the call, or keeping the operand resident on the cuBLAS side end-to-end.
-        // Until that is implemented and verified, the ILGPU dot-product kernel stays the only MatMul path.
-        if (total > 0) _matmul(total, a.View, b.View, y.View, vAOff, vBOff, M, K, N);
+        // cuBLAS fast path (opt-in via UseCublas / MODELSHARP_CUBLAS=1). The earlier deferral — a wrong
+        // result on 1024^3 — was the ILGPU-driver-context vs cuBLAS-runtime-primary-context mismatch.
+        // ms_cuda_sgemm_ctx fixes it: it pushes ILGPU's CUcontext current and uses a per-context cuBLAS
+        // handle, so it runs directly on the resident ILGPU device buffers (a/b/y) with zero copies, on
+        // ILGPU's DefaultStream (so ordering with surrounding ILGPU kernels needs no extra sync). Only for
+        // the single un-batched matrix (totalBatch==1, offsets 0); batched stays on the ILGPU kernel. Any
+        // failure falls back to the portable kernel below.
+        bool cublasDone = false;
+        if (total > 0 && UseCublas && IsHardwareGpu && NativeCuda.Available
+            && totalBatch == 1 && M > 0 && N > 0 && K > 0)
+        {
+            IntPtr ctx = _accelerator.NativePtr;
+            IntPtr strm = (_accelerator.DefaultStream as ILGPU.Runtime.Cuda.CudaStream)?.StreamPtr ?? IntPtr.Zero;
+            IntPtr dA = a.View.BaseView.LoadEffectiveAddressAsPtr();
+            IntPtr dB = b.View.BaseView.LoadEffectiveAddressAsPtr();
+            IntPtr dY = y.View.BaseView.LoadEffectiveAddressAsPtr();
+            cublasDone = NativeCuda.SgemmCtx(ctx, strm, dA, dB, dY, M, N, K) == 0;
+        }
+        if (total > 0 && !cublasDone) _matmul(total, a.View, b.View, y.View, vAOff, vBOff, M, K, N);
         values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(outDims.ToArray()));
     }
 

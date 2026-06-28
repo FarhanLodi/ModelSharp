@@ -116,6 +116,31 @@ public static class NativeCuda
         }
     }
 
+    // ---- context-aware path (operates inside a caller-supplied driver CUcontext) ----
+
+    /// <summary>
+    /// Enqueue-only GEMM <c>C[M,N]=A[M,K]·B[K,N]</c> (row-major) where the device pointers belong to the
+    /// driver context <paramref name="cuContext"/> (e.g. ILGPU's <c>Accelerator.NativePtr</c>), run on
+    /// <paramref name="cuStream"/> (ILGPU's <c>DefaultStream.StreamPtr</c>, or <see cref="IntPtr.Zero"/> for
+    /// the context default). This is the context-safe way to call cuBLAS directly on ILGPU buffers — it
+    /// pushes the context, uses a per-context cached cuBLAS handle, and pops. Returns 0 on success.
+    /// </summary>
+    public static int SgemmCtx(IntPtr cuContext, IntPtr cuStream, IntPtr dA, IntPtr dB, IntPtr dC, int M, int N, int K)
+    {
+        int rc = ms_cuda_sgemm_ctx(cuContext, cuStream, dA, dB, dC, M, N, K);
+        CtxCalls++;
+        LastCtxStatus = rc;
+        return rc;
+    }
+
+    /// <summary>Diagnostics: number of <see cref="SgemmCtx"/> invocations this process.</summary>
+    public static long CtxCalls;
+    /// <summary>Diagnostics: status returned by the most recent <see cref="SgemmCtx"/> (0 = success).</summary>
+    public static int LastCtxStatus;
+
+    /// <summary>Synchronize a specific stream (or the device if <see cref="IntPtr.Zero"/>). Returns 0 on success.</summary>
+    public static int SyncStream(IntPtr cuStream) => ms_cuda_sync_stream(cuStream);
+
     /// <summary>Block until all enqueued device work completes. Returns 0 on success.</summary>
     public static int Sync() => ms_cuda_sync();
 
@@ -158,4 +183,6 @@ public static class NativeCuda
     [DllImport(Lib)] private static extern unsafe void ms_cuda_sgemm_with_resident_b(float* a, IntPtr dB, float* c, int M, int N, int K);
     [DllImport(Lib)] private static extern int ms_cuda_sync();
     [DllImport(Lib)] private static extern void ms_cuda_shutdown();
+    [DllImport(Lib)] private static extern int ms_cuda_sgemm_ctx(IntPtr cuContext, IntPtr cuStream, IntPtr dA, IntPtr dB, IntPtr dC, int M, int N, int K);
+    [DllImport(Lib)] private static extern int ms_cuda_sync_stream(IntPtr cuStream);
 }

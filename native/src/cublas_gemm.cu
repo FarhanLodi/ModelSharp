@@ -52,9 +52,13 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda.h>          // CUDA driver API (CUcontext, CUstream, cuCtxPush/Pop)
 
 #include <cstdio>
 #include <cstring>
+
+#include <map>
+#include <mutex>
 
 extern "C" {
 
@@ -405,6 +409,209 @@ void ms_cuda_shutdown(void) {
         cudaStreamDestroy(g_stream);
         g_stream = nullptr;
     }
+}
+
+// ===========================================================================
+// Externally-provided CUDA driver context API
+// ===========================================================================
+// The functions above all live in (and implicitly create) the CUDA RUNTIME
+// primary context. That is fine when ModelSharp owns the GPU, but it is WRONG
+// when an interop layer such as ILGPU owns its own DRIVER-API context and hands
+// us device pointers that are only valid in THAT context.
+//
+// A cublasHandle_t and a device pointer are bound to whatever CUDA context is
+// CURRENT at the time they are created / used. If we create a handle in the
+// runtime primary context and then run a GEMM on ILGPU's device pointers (which
+// belong to ILGPU's driver context), cuBLAS dereferences those pointers in the
+// wrong address space — producing a deterministic garbage region rather than a
+// hard fault. (This is the bug that motivated this API.)
+//
+// The fix below: before every cuBLAS call we cuCtxPushCurrent(caller_ctx) to
+// make the caller's context current, run the GEMM through a cublasHandle_t that
+// was created WHILE that context was current (cached per-context), then always
+// cuCtxPopCurrent — even on error paths — so we never corrupt the caller's
+// context stack. Zero cross-context copies: we use the caller's device pointers
+// and the caller's stream directly.
+
+// Per-context cublas handle cache, keyed by the driver-API CUcontext. Guarded
+// by a mutex so it is safe to call from multiple host threads. cublasCreate is
+// expensive, so we create one handle per context lazily and reuse it.
+static std::map<CUcontext, cublasHandle_t> g_ctx_handles;
+static std::mutex                          g_ctx_mutex;
+
+// RAII guard: push a driver context current on construction, pop on
+// destruction. Guarantees the push/pop are balanced on every code path,
+// including early returns and error paths.
+namespace {
+struct CtxGuard {
+    bool       pushed = false;
+    CUresult   err    = CUDA_SUCCESS;
+    explicit CtxGuard(CUcontext ctx) {
+        err = cuCtxPushCurrent(ctx);
+        pushed = (err == CUDA_SUCCESS);
+        if (!pushed) {
+            fprintf(stderr, "[ms_cuda] cuCtxPushCurrent failed: CUresult %d\n",
+                    (int)err);
+        }
+    }
+    ~CtxGuard() {
+        if (pushed) {
+            CUcontext popped = nullptr;
+            CUresult e = cuCtxPopCurrent(&popped);
+            if (e != CUDA_SUCCESS) {
+                fprintf(stderr, "[ms_cuda] cuCtxPopCurrent failed: "
+                                "CUresult %d\n", (int)e);
+            }
+        }
+    }
+    CtxGuard(const CtxGuard&)            = delete;
+    CtxGuard& operator=(const CtxGuard&) = delete;
+};
+} // anonymous namespace
+
+// Get-or-create the cached cublasHandle_t for the currently-current context
+// `ctx`. MUST be called with `ctx` already pushed current (the handle is bound
+// to whatever context is current at cublasCreate time). Returns nullptr on
+// failure. Thread-safe.
+static cublasHandle_t ms_get_ctx_handle(CUcontext ctx) {
+    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    auto it = g_ctx_handles.find(ctx);
+    if (it != g_ctx_handles.end()) {
+        return it->second;
+    }
+    cublasHandle_t h = nullptr;
+    cublasStatus_t s = cublasCreate(&h);   // bound to the current (pushed) ctx
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] cublasCreate (ctx) failed: status %d\n",
+                (int)s);
+        return nullptr;
+    }
+    g_ctx_handles[ctx] = h;
+    return h;
+}
+
+// Get-or-create the cached cublasHandle_t for an EXTERNALLY-provided driver
+// context. Pushes the context current, creates/looks up the handle, pops.
+// Returns 0 on success, non-zero (CUresult or cublas status) on failure.
+int ms_cuda_bind_context(void* cuContext) {
+    CUcontext ctx = (CUcontext)cuContext;
+    if (ctx == nullptr) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_bind_context: null context\n");
+        return -1;
+    }
+    CtxGuard guard(ctx);
+    if (!guard.pushed) return (int)guard.err;
+    cublasHandle_t h = ms_get_ctx_handle(ctx);
+    return h ? 0 : -2;
+}
+
+// Destroy and remove the cached handle for `cuContext`. Pushes the context
+// current for cublasDestroy (the handle belongs to that context), then pops.
+// Idempotent: a no-op if no handle is cached for the context.
+void ms_cuda_release_context(void* cuContext) {
+    CUcontext ctx = (CUcontext)cuContext;
+    if (ctx == nullptr) return;
+
+    cublasHandle_t h = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx_mutex);
+        auto it = g_ctx_handles.find(ctx);
+        if (it == g_ctx_handles.end()) return;
+        h = it->second;
+        g_ctx_handles.erase(it);
+    }
+    // Destroy with the owning context current so cublas frees its workspace in
+    // the right address space.
+    CtxGuard guard(ctx);
+    if (h) cublasDestroy(h);
+}
+
+// Synchronise the given driver stream. If cuStream is NULL, synchronise the
+// device (whichever context is current). Uses the runtime API, which is
+// interoperable with driver-created streams (a CUstream IS a cudaStream_t).
+// Returns 0 on success, non-zero cudaError_t otherwise.
+//
+// Note: cudaStreamSynchronize operates on the calling context. The caller
+// should ensure the relevant context is current, OR rely on the fact that a
+// stream sync issued right after ms_cuda_sgemm_ctx (which already pushed/popped)
+// is most robustly done by passing the same CUstream here; if you need it bound
+// to a specific context, push it first on the C# side. For the common single-
+// context ILGPU case this is sufficient.
+int ms_cuda_sync_stream(void* cuStream) {
+    cudaError_t e;
+    if (cuStream) {
+        e = cudaStreamSynchronize((cudaStream_t)cuStream);
+    } else {
+        e = cudaDeviceSynchronize();
+    }
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sync_stream failed: %s\n",
+                cudaGetErrorString(e));
+        return (int)e;
+    }
+    return 0;
+}
+
+// Row-major SGEMM C[M,N] = A[M,K] * B[K,N] (alpha=1, beta=0) on device pointers
+// dA, dB, dC that live in the EXTERNALLY-PROVIDED driver context `cuContext`,
+// enqueued on `cuStream` (NULL = that context's default stream). Zero copies:
+// we operate directly on the caller's device pointers and stream.
+//
+// Steps: push cuContext current (balanced pop guaranteed via CtxGuard) -> get
+// or lazily create the per-context cublas handle -> bind cuStream to it -> run
+// the column-major Cᵀ = Bᵀ·Aᵀ transpose trick (identical to ms_cuda_sgemm_dev)
+// -> pop. The GEMM is enqueued only; the caller syncs (ms_cuda_sync_stream)
+// when it needs the result. Returns 0 on success, non-zero cublas/cuda status.
+int ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
+                      void* dA, void* dB, void* dC,
+                      int M, int N, int K) {
+    if (cuContext == nullptr) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sgemm_ctx: null context\n");
+        return -1;
+    }
+    if (M <= 0 || N <= 0 || K <= 0 || !dA || !dB || !dC) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sgemm_ctx: bad args "
+                        "(M=%d N=%d K=%d)\n", M, N, K);
+        return -1;
+    }
+
+    CUcontext ctx = (CUcontext)cuContext;
+    CtxGuard guard(ctx);                 // push now, pop on every exit path
+    if (!guard.pushed) return (int)guard.err;
+
+    cublasHandle_t handle = ms_get_ctx_handle(ctx);
+    if (!handle) return -2;
+
+    // Bind the caller's stream (or the context default stream if NULL). A
+    // driver CUstream is interchangeable with a runtime cudaStream_t here.
+    cublasStatus_t ss = cublasSetStream(handle, (cudaStream_t)cuStream);
+    if (ss != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sgemm_ctx: cublasSetStream "
+                        "status %d\n", (int)ss);
+        return (int)ss;
+    }
+
+    const float* a = (const float*)dA;
+    const float* b = (const float*)dB;
+    float*       c = (float*)dC;
+    const float alpha = 1.0f, beta = 0.0f;
+
+    // Column-major transpose trick (see file header): compute, in column-major
+    // terms, C_cm[N,M] = B_cm[N,K] * A_cm[K,M], which lands the bytes as our
+    // desired row-major C[M,N]. Both ops OP_N.
+    cublasStatus_t s =
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    N, M, K, &alpha,
+                    b, N,       // first operand = our B (weights), lda = N
+                    a, K,       // second operand = our A (acts),    ldb = K
+                    &beta,
+                    c, N);      // output = our C,                   ldc = N
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sgemm_ctx: cublas status %d\n",
+                (int)s);
+        return (int)s;
+    }
+    return 0;   // guard pops the context here
 }
 
 } // extern "C"
