@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MODELSHARP_RESIDENT_WEIGHTS`, default on), removing the dominant per-call PCIe upload for
   repeated inference.
 
+### Changed
+- Professional README redesign: added a table of contents and a dedicated, honest
+  **"Performance & optional native acceleration"** section, refreshed badges, and clarified that
+  the native layer is opt-in and **not** part of the published NuGet packages.
+- Added native build & tuning docs under `native/` (`native/README.md`, `native/GPU.md`).
+- Bumped all packages (`ModelSharp`, `ModelSharp.Gpu`, `ModelSharp.Hub`, `ModelSharp.ImageSharp`)
+  to 1.0.2.
+
 ### Notes
 - The native layer accelerates ModelSharp's own hot paths and is opt-in; the managed engine
   remains the portable, zero-dependency default.
