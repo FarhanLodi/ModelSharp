@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Cpu.Kernels.Linear;
 using ModelSharp.Graph;
+using ModelSharp.Native;
 using ModelSharp.Tensors;
 
 namespace ModelSharp.Cpu.Kernels.Quantize;
@@ -138,6 +139,28 @@ public sealed class MatMulNBitsKernel : IKernel
         for (int i = 0; i < aDims.Length - 1; i++) outDims[i] = aDims[i];
         outDims[aDims.Length - 1] = N;
         var y = new Tensor<float>(new TensorShape(outDims));
+
+        // ---- Optional native fast path (opt-in; default off) ------------------------------------
+        // The native ABI takes packed-uint8 (or null/symmetric) zero points only; if float zero
+        // points are present we must run managed. Requires contiguous array-backed buffers.
+        if ((NativeQuant.W4A8Enabled || NativeQuant.NativeNBitsEnabled) && zpFloat is null
+            && System.Runtime.InteropServices.MemoryMarshal.TryGetArray<float>(a.Buffer, out var aSeg)
+            && aSeg.Offset == 0 && aSeg.Array is not null
+            && System.Runtime.InteropServices.MemoryMarshal.TryGetArray<byte>(b.Buffer, out var bSeg)
+            && bSeg.Offset == 0 && bSeg.Array is not null
+            && System.Runtime.InteropServices.MemoryMarshal.TryGetArray<float>(scales.Buffer, out var sSeg)
+            && sSeg.Offset == 0 && sSeg.Array is not null
+            && System.Runtime.InteropServices.MemoryMarshal.TryGetArray<float>(y.Buffer, out var ySeg)
+            && ySeg.Offset == 0 && ySeg.Array is not null)
+        {
+            if (NativeQuant.TryMatMulNBits(
+                    aSeg.Array, bSeg.Array, sSeg.Array, zpPacked, ySeg.Array,
+                    M, N, K, bits, blockSize))
+            {
+                ctx.Set(node.Outputs[0], y);
+                return;
+            }
+        }
 
         int bRowBytes = nBlocksPerRow * blobSize;
         byte mask = (byte)((1 << bits) - 1);

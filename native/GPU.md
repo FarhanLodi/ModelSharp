@@ -1,22 +1,23 @@
-# GPU GEMM path (cuBLAS) — UNTESTED
+# GPU GEMM path (cuBLAS) — TESTED
 
 A cuBLAS-backed SGEMM for ModelSharp's GEMM hot path, targeting the
 **NVIDIA RTX 4090** (Ada, compute capability `sm_89`).
 
-> **⚠️ UNTESTED — NOT COMPILED, NOT RUN.**
-> This code was written on a machine that has the **NVIDIA driver only**
-> (`nvidia-smi` works) but **no CUDA toolkit** — `nvcc`, the cuBLAS headers
-> (`cublas_v2.h`) and libraries are **not installed**. Therefore:
-> - `nvcc` was never invoked (it is not present and would fail).
-> - `build/libms_cuda.so` was never produced.
-> - Nothing here was verified by execution.
+> **✅ TESTED — BUILT, VERIFIED, BENCHMARKED.**
+> Built and run on **NVIDIA GeForce RTX 4090** (24 GB, driver 580.159.03) with
+> the **CUDA 12.0 toolkit** (`nvcc` V12.0.140, cuBLAS 12). Results:
+> - `build/libms_cuda.so` builds cleanly with `make -f Makefile.cuda`.
+> - Correctness verified vs a CPU triple-loop reference for 64³, 256×384×500,
+>   and 1024³ (relative error ≤ 4.1e-7, threshold 1e-3) — **all PASS**.
+> - Benchmarked for 1024³ / 2048³ / 4096³, copy-inclusive and compute-only —
+>   see the table in §7. Peak compute-only ≈ **60 TFLOP/s** (fp32).
 >
-> Everything below is written to be correct and buildable, but you **must**
-> build and validate it on a CUDA-enabled host before relying on the numbers.
+> Standalone harness: `test/cublas_test.cu`.
 
 Files:
 - `src/cublas_gemm.cu` — the cuBLAS SGEMM wrapper (`extern "C"` entry points).
 - `Makefile.cuda` — `nvcc` build into `build/libms_cuda.so`.
+- `test/cublas_test.cu` — standalone correctness + benchmark harness.
 - this file.
 
 ---
@@ -76,7 +77,8 @@ make -f Makefile.cuda
 # -> build/libms_cuda.so
 ```
 
-Exact compile command the Makefile runs (for reference / manual build):
+Exact compile command the Makefile ran (verified working with CUDA 12.0 on the
+RTX 4090; `nvcc 12.0` accepts `-arch=sm_89`):
 
 ```bash
 nvcc -O3 -arch=sm_89 -Xcompiler -fPIC --shared \
@@ -85,6 +87,21 @@ nvcc -O3 -arch=sm_89 -Xcompiler -fPIC --shared \
 
 Adjust `-arch` for other GPUs: `sm_80` (A100), `sm_86` (RTX 30xx),
 `sm_90` (H100).
+
+### Build & run the test/benchmark
+
+The standalone harness (`test/cublas_test.cu`) has its own `main()` and links
+the wrapper directly. Verified working command:
+
+```bash
+nvcc -O3 -arch=sm_89 native/test/cublas_test.cu native/src/cublas_gemm.cu \
+     -lcublas -lcudart -o /tmp/cublas_test
+/tmp/cublas_test
+```
+
+It prints `ms_cuda_available()` / `ms_cuda_device_name()`, runs correctness
+checks (rel err vs CPU reference, threshold 1e-3), then benchmarks
+copy-inclusive and compute-only GEMM (median of several runs after warmup).
 
 ---
 
@@ -206,19 +223,42 @@ CPU `ms_sgemm_f32` binding — so it can drop into the same call sites.
 
 ---
 
-## 7. Expected performance (ballpark, UNTESTED)
+## 7. Measured performance (RTX 4090, CUDA 12.0, fp32)
 
-On an RTX 4090, cuBLAS SGEMM (fp32, large square matrices) typically reaches
-**~tens of TFLOP/s** (order ~40–80 TFLOP/s fp32 depending on shape; far more in
-TF32 mode). That is far above the current **ILGPU JIT** GEMM in
-`src/ModelSharp.Gpu` and the CPU AVX-512 path. Caveats:
+Measured on **NVIDIA GeForce RTX 4090** (driver 580.159.03) with the CUDA 12.0
+toolkit, via `test/cublas_test.cu` (median of 7–9 runs after warmup).
 
-- The copy-in/out `ms_cuda_sgemm` pays PCIe transfer + per-call `cudaMalloc`
-  each invocation; for small matrices or tight loops that overhead can dominate.
-  Use `ms_cuda_upload` + `ms_cuda_sgemm_with_resident_b` for reused weights, or
-  extend with a persistent buffer pool / streams for production.
-- Real measured numbers require building on a CUDA host — none of the above was
-  measured here.
+Square `N×N×N` SGEMM, FLOPs = `2·N³`:
+
+| Shape   | Copy-inclusive (H2D+GEMM+D2H) | Compute-only (A/B/C resident, kernel only) |
+|---------|-------------------------------|--------------------------------------------|
+| 1024³   | ~1.8–1.9 TFLOP/s (~1.1 ms)    | ~38 TFLOP/s (~0.06 ms)                      |
+| 2048³   | ~2.5–4.6 TFLOP/s (~3.8–6.9 ms)| ~60 TFLOP/s (~0.29 ms)  ← peak             |
+| 4096³   | ~7.6–8.1 TFLOP/s (~17 ms)     | ~50–56 TFLOP/s (~2.5 ms)                    |
+
+Correctness: relative error vs CPU reference ≤ **4.1e-7** for all tested shapes
+(threshold 1e-3) — all PASS.
+
+Notes:
+
+- The **compute-only** numbers are the real cuBLAS kernel ceiling (~60 TFLOP/s
+  fp32 peak at 2048³, settling to ~50–56 TFLOP/s at 4096³ — typical cuBLAS fp32
+  on Ada; TF32 mode would be far higher again).
+- The **copy-inclusive** `ms_cuda_sgemm` pays PCIe transfer **plus a per-call
+  `cudaMalloc`/`cudaFree`** of all three buffers every invocation, which
+  dominates and makes these numbers noisy run-to-run (e.g. 2048³ varied
+  3.8–6.9 ms). For reused weights use `ms_cuda_upload` +
+  `ms_cuda_sgemm_with_resident_b`, or add a persistent buffer pool / streams to
+  approach the compute-only ceiling.
+- **vs the CPU native kernel** (`libms_kernels.so` `ms_sgemm_f32`, ~1.1
+  TFLOP/s): the compute-only cuBLAS path is **~35–55× faster** (≈54× at the
+  2048³ peak); even the naive copy-inclusive path is **~1.6–7×** faster, with
+  the gap widening as the matrix grows and PCIe/alloc overhead amortizes.
+- **vs the ILGPU path** (`src/ModelSharp.Gpu`, which JIT-compiles generic C#
+  kernels at runtime): cuBLAS is vendor-tuned hand-optimized SGEMM and is
+  expected to be far faster than an ILGPU-generated GEMM kernel for raw
+  throughput on NVIDIA hardware. (ILGPU was not re-benchmarked here; keep it as
+  the cross-vendor fallback per §8.)
 
 ---
 
