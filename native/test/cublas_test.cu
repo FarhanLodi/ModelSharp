@@ -54,6 +54,9 @@ extern "C" {
                     int M, int N, int K,
                     long long strideA, long long strideB, long long strideC,
                     int batch);
+    // TF32 Tensor Core toggle.
+    void        ms_cuda_set_tf32(int enable);
+    int         ms_cuda_get_tf32(void);
 }
 
 using clk = std::chrono::high_resolution_clock;
@@ -689,6 +692,212 @@ static bool run_batched_tests() {
     return ok;
 }
 
+// ===========================================================================
+// TF32 Tensor Core toggle: accuracy + speed.
+// ===========================================================================
+// For each shape we run the SAME GEMM twice — once with TF32 OFF (strict fp32)
+// and once with TF32 ON — through the device-resident compute-only path
+// (ms_cuda_upload / ms_cuda_sgemm_dev / ms_cuda_sync) so PCIe copies and
+// cudaMalloc do not pollute the timing. Accuracy is checked against a DOUBLE
+// CPU reference:
+//   - fp32 mode  : rel-L2 must be < 1e-5
+//   - TF32 mode  : rel-L2 must be < 5e-3 (TF32 is intentionally approximate)
+// Speed reports fp32 vs TF32 TFLOP/s and the TF32/fp32 speedup.
+
+// Double-precision row-major reference: C[M,N] = A[M,K] * B[K,N], accumulated
+// in double and kept in double for the most faithful comparison.
+static void cpu_ref_double(const float* A, const float* B, std::vector<double>& C,
+                           int M, int N, int K) {
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            double acc = 0.0;
+            for (int k = 0; k < K; ++k)
+                acc += (double)A[(size_t)i * K + k] * (double)B[(size_t)k * N + j];
+            C[(size_t)i * N + j] = acc;
+        }
+    }
+}
+
+// Relative L2 error of a float result vs a double reference.
+static double rel_l2_vs_double(const std::vector<float>& got,
+                               const std::vector<double>& ref) {
+    double sd = 0.0, sr = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        double d = (double)got[i] - ref[i];
+        sd += d * d;
+        sr += ref[i] * ref[i];
+    }
+    return sr > 0 ? std::sqrt(sd / sr) : std::sqrt(sd);
+}
+
+// Run one square GEMM device-resident, return median ms over `iters` (warmup
+// runs first). TF32 mode is set by the caller via ms_cuda_set_tf32.
+static double time_gemm_dev(void* dA, void* dB, void* dC, int N,
+                            int warmup, int iters) {
+    for (int i = 0; i < warmup; ++i) ms_cuda_sgemm_dev(dA, dB, dC, N, N, N);
+    ms_cuda_sync();
+    std::vector<double> t;
+    for (int i = 0; i < iters; ++i) {
+        double t0 = now_ms();
+        ms_cuda_sgemm_dev(dA, dB, dC, N, N, N);
+        ms_cuda_sync();
+        t.push_back(now_ms() - t0);
+    }
+    return median(t);
+}
+
+// One square shape: accuracy (fp32 + TF32 vs double ref) and speed (fp32 vs
+// TF32 TFLOP/s + speedup). Returns true if both accuracy asserts pass.
+static bool tf32_square(int N, int warmup, int iters) {
+    std::vector<float> A((size_t)N * N), B((size_t)N * N);
+    std::vector<float> Cf((size_t)N * N), Ct((size_t)N * N);
+    fill_rand(A, 101 + N); fill_rand(B, 202 + N);
+    std::vector<double> Cref((size_t)N * N);
+    cpu_ref_double(A.data(), B.data(), Cref, N, N, N);
+
+    void* dA = ms_cuda_upload(A.data(), N, N);
+    void* dB = ms_cuda_upload(B.data(), N, N);
+    void* dC = ms_cuda_alloc((size_t)N * N);
+    const double flops = 2.0 * (double)N * N * N;
+
+    // ---- fp32 (TF32 OFF) ----
+    ms_cuda_set_tf32(0);
+    double ms_f = time_gemm_dev(dA, dB, dC, N, warmup, iters);
+    ms_cuda_download(dC, Cf.data(), (size_t)N * N);
+    double err_f = rel_l2_vs_double(Cf, Cref);
+
+    // ---- TF32 (ON) ----
+    ms_cuda_set_tf32(1);
+    double ms_t = time_gemm_dev(dA, dB, dC, N, warmup, iters);
+    ms_cuda_download(dC, Ct.data(), (size_t)N * N);
+    double err_t = rel_l2_vs_double(Ct, Cref);
+    ms_cuda_set_tf32(0);   // restore default
+
+    ms_cuda_free(dA); ms_cuda_free(dB); ms_cuda_free(dC);
+
+    double tf_f = (flops / (ms_f * 1e6)) / 1000.0;   // TFLOP/s fp32
+    double tf_t = (flops / (ms_t * 1e6)) / 1000.0;   // TFLOP/s TF32
+    double speedup = ms_f / ms_t;
+
+    bool ok_f = err_f < 1e-5;
+    bool ok_t = err_t < 5e-3;
+    printf("  %4d^3  fp32 %6.2f TFLOP/s (relL2=%.2e %s)  |  "
+           "TF32 %6.2f TFLOP/s (relL2=%.2e %s)  |  speedup %.2fx\n",
+           N, tf_f, err_f, ok_f ? "ok" : "FAIL",
+           tf_t, err_t, ok_t ? "ok" : "FAIL", speedup);
+    return ok_f && ok_t;
+}
+
+// Attention-ish strided-batched case, run fp32 then TF32 on the external-context
+// path. Accuracy vs double ref per batch; speed = aggregate TFLOP/s + speedup.
+static bool tf32_batched(CUcontext ctx, CUstream stream,
+                         int M, int N, int K, int batch, int iters) {
+    long long strideA = (long long)M * K;
+    long long strideB = (long long)K * N;
+    long long strideC = (long long)M * N;
+    long long nA = strideA * batch, nB = strideB * batch, nC = strideC * batch;
+
+    std::vector<float> A((size_t)nA), B((size_t)nB);
+    std::vector<float> Cf((size_t)nC), Ct((size_t)nC);
+    fill_rand(A, 303 + batch); fill_rand(B, 404 + batch);
+    std::vector<double> Cref((size_t)nC);
+    for (int bi = 0; bi < batch; ++bi) {
+        std::vector<double> Cb((size_t)M * N);
+        cpu_ref_double(A.data() + (size_t)strideA * bi,
+                       B.data() + (size_t)strideB * bi, Cb, M, N, K);
+        for (size_t e = 0; e < (size_t)M * N; ++e)
+            Cref[(size_t)strideC * bi + e] = Cb[e];
+    }
+
+    const size_t bytesA = (size_t)nA * sizeof(float);
+    const size_t bytesB = (size_t)nB * sizeof(float);
+    const size_t bytesC = (size_t)nC * sizeof(float);
+    const double flops = 2.0 * (double)M * N * K * batch;
+
+    DRV_CHECK(cuCtxPushCurrent(ctx), "push (tf32 batched alloc)");
+    CUdeviceptr dA = 0, dB = 0, dC = 0;
+    DRV_CHECK(cuMemAlloc(&dA, bytesA), "alloc dA");
+    DRV_CHECK(cuMemAlloc(&dB, bytesB), "alloc dB");
+    DRV_CHECK(cuMemAlloc(&dC, bytesC), "alloc dC");
+    DRV_CHECK(cuMemcpyHtoD(dA, A.data(), bytesA), "HtoD A");
+    DRV_CHECK(cuMemcpyHtoD(dB, B.data(), bytesB), "HtoD B");
+
+    auto run = [&](std::vector<float>& out, double& ms_out) {
+        for (int i = 0; i < 3; ++i)
+            ms_cuda_sgemm_strided_batched_ctx((void*)ctx, (void*)stream,
+                (void*)dA, (void*)dB, (void*)dC, M, N, K,
+                strideA, strideB, strideC, batch);
+        cuCtxSynchronize();
+        std::vector<double> t;
+        for (int i = 0; i < iters; ++i) {
+            double t0 = now_ms();
+            ms_cuda_sgemm_strided_batched_ctx((void*)ctx, (void*)stream,
+                (void*)dA, (void*)dB, (void*)dC, M, N, K,
+                strideA, strideB, strideC, batch);
+            cuCtxSynchronize();
+            t.push_back(now_ms() - t0);
+        }
+        ms_out = median(t);
+        cuMemcpyDtoH(out.data(), dC, bytesC);
+    };
+
+    double ms_f = 0, ms_t = 0;
+    ms_cuda_set_tf32(0); run(Cf, ms_f);
+    ms_cuda_set_tf32(1); run(Ct, ms_t);
+    ms_cuda_set_tf32(0);
+
+    cuMemFree(dA); cuMemFree(dB); cuMemFree(dC);
+    CUcontext popped = nullptr;
+    DRV_CHECK(cuCtxPopCurrent(&popped), "pop (tf32 batched)");
+
+    double err_f = rel_l2_vs_double(Cf, Cref);
+    double err_t = rel_l2_vs_double(Ct, Cref);
+    double tf_f = (flops / (ms_f * 1e6)) / 1000.0;
+    double tf_t = (flops / (ms_t * 1e6)) / 1000.0;
+    double speedup = ms_f / ms_t;
+    bool ok_f = err_f < 1e-5, ok_t = err_t < 5e-3;
+    printf("  batched b=%d %dx%dx%d  fp32 %6.2f TFLOP/s (relL2=%.2e %s)  |  "
+           "TF32 %6.2f TFLOP/s (relL2=%.2e %s)  |  speedup %.2fx\n",
+           batch, M, N, K, tf_f, err_f, ok_f ? "ok" : "FAIL",
+           tf_t, err_t, ok_t ? "ok" : "FAIL", speedup);
+    return ok_f && ok_t;
+}
+
+static bool run_tf32_tests() {
+    printf("\n--- TF32 TENSOR CORE toggle: accuracy (vs double CPU ref) + "
+           "speed (fp32 vs TF32) ---\n");
+    printf("  default ms_cuda_get_tf32() = %d (expect 0)\n", ms_cuda_get_tf32());
+    bool ok = true;
+    ok &= tf32_square(1024, 5, 20);
+    ok &= tf32_square(2048, 4, 15);
+    ok &= tf32_square(4096, 3, 10);
+
+    // Attention-ish strided-batched case on an external driver context.
+    CUresult r = cuInit(0);
+    if (r == CUDA_SUCCESS) {
+        CUdevice dev = 0;
+        if (cuDeviceGet(&dev, 0) == CUDA_SUCCESS) {
+            CUcontext ctx = nullptr;
+            if (cuCtxCreate(&ctx, 0, dev) == CUDA_SUCCESS) {
+                CUstream stream = nullptr;
+                cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
+                CUcontext popped = nullptr;
+                cuCtxPopCurrent(&popped);
+                ms_cuda_bind_context((void*)ctx);
+                // batch=32 heads, 512x512x64 (attention-ish QK^T scale).
+                ok &= tf32_batched(ctx, stream, 512, 512, 64, 32, 20);
+                ms_cuda_release_context((void*)ctx);
+                cuCtxPushCurrent(ctx);
+                cuStreamDestroy(stream);
+                cuCtxPopCurrent(&popped);
+                cuCtxDestroy(ctx);
+            }
+        }
+    }
+    printf("TF32 TOGGLE: %s\n", ok ? "ALL PASS" : "FAILURE");
+    return ok;
+}
+
 int main() {
     printf("=== ModelSharp cuBLAS SGEMM test/bench ===\n");
     printf("ms_cuda_available() = %d\n", ms_cuda_available());
@@ -739,6 +948,10 @@ int main() {
     // Strided-batched context-aware path.
     bool batched_ok = run_batched_tests();
     ok &= batched_ok;
+
+    // TF32 Tensor Core toggle: accuracy + fp32-vs-TF32 speed.
+    bool tf32_ok = run_tf32_tests();
+    ok &= tf32_ok;
 
     ms_cuda_shutdown();
     printf("\n=== OVERALL: %s ===\n", ok ? "ALL PASS" : "FAILURE");

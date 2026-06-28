@@ -102,6 +102,58 @@ extern "C" {
 static cublasHandle_t g_handle = nullptr;
 static cudaStream_t   g_stream = nullptr;
 
+// ---------------------------------------------------------------------------
+// TF32 Tensor Core toggle (RTX 4090 / Ada, sm_89).
+// ---------------------------------------------------------------------------
+// When enabled, cuBLAS may run fp32 SGEMM on the Tensor Cores in TF32 mode:
+// inputs/outputs stay fp32, but the multiply uses a 19-bit TF32 operand with a
+// 10-bit mantissa (8-bit exponent). This is ~5-8x faster than the classic fp32
+// FMA path on Ada, at ~1e-3 relative accuracy — a deliberate, opt-in tradeoff.
+//
+// Default is OFF (CUBLAS_DEFAULT_MATH = strict IEEE fp32). The flag is global
+// and applied per-GEMM-call via cublasSetMathMode right before each cublasSgemm
+// / cublasSgemmStridedBatched, so it takes effect uniformly across the single,
+// resident, device, and strided-batched paths and regardless of which cached
+// handle (runtime-primary or per-driver-context) is used. We guard the flag
+// with a mutex so ms_cuda_set_tf32 / ms_cuda_get_tf32 are safe from any thread.
+static int        g_tf32 = 0;          // 0 = fp32 (default), 1 = TF32 tensor op
+static std::mutex g_tf32_mutex;
+
+// Read the current TF32 flag under the lock.
+static int ms_tf32_flag(void) {
+    std::lock_guard<std::mutex> lock(g_tf32_mutex);
+    return g_tf32;
+}
+
+// Apply the current TF32 flag to `handle` immediately before a GEMM. Cheap
+// (a single host-side cuBLAS state set), and it guarantees the math mode always
+// reflects ms_cuda_set_tf32 no matter which handle the call path uses. Failures
+// are non-fatal: we warn and let the GEMM proceed in whatever the handle's
+// previous mode was.
+static void ms_apply_math_mode(cublasHandle_t handle) {
+    cublasMath_t mode = ms_tf32_flag() ? CUBLAS_TF32_TENSOR_OP_MATH
+                                       : CUBLAS_DEFAULT_MATH;
+    cublasStatus_t s = cublasSetMathMode(handle, mode);
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] cublasSetMathMode failed: status %d\n",
+                (int)s);
+    }
+}
+
+// Enable (enable != 0) or disable TF32 Tensor Core math for all subsequent
+// GEMM calls. 0 => CUBLAS_DEFAULT_MATH (strict fp32); non-zero =>
+// CUBLAS_TF32_TENSOR_OP_MATH. Thread-safe. Default is disabled.
+void ms_cuda_set_tf32(int enable) {
+    std::lock_guard<std::mutex> lock(g_tf32_mutex);
+    g_tf32 = enable ? 1 : 0;
+}
+
+// Return 1 if TF32 Tensor Core math is currently enabled, else 0.
+int ms_cuda_get_tf32(void) {
+    std::lock_guard<std::mutex> lock(g_tf32_mutex);
+    return g_tf32;
+}
+
 static cublasHandle_t ms_get_handle(void) {
     if (g_handle == nullptr) {
         cublasStatus_t s = cublasCreate(&g_handle);
@@ -200,6 +252,9 @@ void ms_cuda_sgemm(const float* A, const float* B, float* C,
     MS_CUDA_CHECK(cudaMemcpyAsync(dB, B, bytesB, cudaMemcpyHostToDevice,
                                   g_stream), "H2D B");
 
+    // Apply the global TF32 toggle to this handle right before the GEMM.
+    ms_apply_math_mode(handle);
+
     // Column-major transpose trick (see file header). We compute, in
     // column-major terms, C_cm[N,M] = B_cm[N,K] * A_cm[K,M], which lands the
     // bytes exactly as our desired row-major C[M,N]. Both ops are OP_N.
@@ -273,6 +328,8 @@ void ms_cuda_sgemm_with_resident_b(const float* A, void* dB_void, float* C,
     MS_CUDA_CHECK(cudaMalloc((void**)&dC, bytesC), "cudaMalloc dC");
     MS_CUDA_CHECK(cudaMemcpyAsync(dA, A, bytesA, cudaMemcpyHostToDevice,
                                   g_stream), "H2D A");
+
+    ms_apply_math_mode(handle);
 
     MS_CUBLAS_CHECK(
         cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -375,6 +432,8 @@ int ms_cuda_sgemm_dev(void* dA_void, void* dB_void, void* dC_void,
     const float* dB = (const float*)dB_void;
     float*       dC = (float*)dC_void;
     const float alpha = 1.0f, beta = 0.0f;
+
+    ms_apply_math_mode(handle);
 
     cublasStatus_t s =
         cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -596,6 +655,8 @@ int ms_cuda_sgemm_ctx(void* cuContext, void* cuStream,
     float*       c = (float*)dC;
     const float alpha = 1.0f, beta = 0.0f;
 
+    ms_apply_math_mode(handle);
+
     // Column-major transpose trick (see file header): compute, in column-major
     // terms, C_cm[N,M] = B_cm[N,K] * A_cm[K,M], which lands the bytes as our
     // desired row-major C[M,N]. Both ops OP_N.
@@ -674,6 +735,8 @@ int ms_cuda_sgemm_strided_batched_ctx(void* cuContext, void* cuStream,
     const float* b = (const float*)dB;
     float*       c = (float*)dC;
     const float alpha = 1.0f, beta = 0.0f;
+
+    ms_apply_math_mode(handle);
 
     // Column-major transpose trick (see comment above). cuBLAS takes the strides
     // as `long long int`; pass them straight through.

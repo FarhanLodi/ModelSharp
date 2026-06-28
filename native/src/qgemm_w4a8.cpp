@@ -57,12 +57,23 @@
  *     via _mm_malloc/_mm_free wrapped in RAII (AlignedBuf) -> no leaks.
  */
 #include "../ms_kernels.h"
+#include "cpu_features.h"
 #include <immintrin.h>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
+
+/* All AVX-512/VNNI/VBMI helpers below carry target attributes so they compile
+ * into the portable-baseline .so but only execute on a capable host. The wide
+ * compute driver (run_vnni) is likewise target-attributed and called only when
+ * mscpu::has_vnni() is true; otherwise run_scalar (a correct per-column reduce)
+ * runs. MODELSHARP_FORCE_NOAVX512 forces the scalar path for verification. */
+
+#define MS_T512  __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+#define MS_TVNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")))
+#define MS_TVBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,avx512vbmi")))
 
 static inline int w4a8_unpack(const uint8_t* data, int base_byte, int index, int bits) {
     if (bits == 8) return data[base_byte + index];
@@ -71,12 +82,10 @@ static inline int w4a8_unpack(const uint8_t* data, int base_byte, int index, int
     return (data[byte_off] >> shift) & 0x0F;
 }
 
-#if defined(__AVX512VNNI__)
-
 /* Reduce 8 __m512i int32 accumulators to an 8-lane __m256i of horizontal sums.
  * Standard 8x8 reduce: pairwise hadd-style folding using shuffles. Each input
  * holds 16 int32 partial products; output lane j = sum of all 16 in acc[j]. */
-static inline __m256i w4a8_reduce8(const __m512i* acc) {
+MS_TVBMI static inline __m256i w4a8_reduce8(const __m512i* acc) {
     /* First fold each 512 -> 256 by adding high/low 256 halves. */
     __m256i r[8];
     for (int j = 0; j < 8; ++j) {
@@ -98,7 +107,7 @@ static inline __m256i w4a8_reduce8(const __m512i* acc) {
 }
 
 /* Horizontal sum of one __m256i (8 int32). */
-static inline int32_t w4a8_hsum256(__m256i v) {
+MS_TVBMI static inline int32_t w4a8_hsum256(__m256i v) {
     __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1,0,3,2)));
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2,3,0,1)));
@@ -106,7 +115,7 @@ static inline int32_t w4a8_hsum256(__m256i v) {
 }
 
 /* Horizontal-reduce 8 __m256i (each 8 int32) -> __m256i lane j = sum of col j. */
-static inline __m256i w4a8_hsum8x256(const __m256i* r) {
+MS_TVBMI static inline __m256i w4a8_hsum8x256(const __m256i* r) {
     __m256i a01 = _mm256_hadd_epi32(r[0], r[1]);
     __m256i a23 = _mm256_hadd_epi32(r[2], r[3]);
     __m256i a45 = _mm256_hadd_epi32(r[4], r[5]);
@@ -122,7 +131,7 @@ static inline __m256i w4a8_hsum8x256(const __m256i* r) {
  * block bk (-> *plo lane j), lanes 8-15 to block bk+1 (-> *phi lane j). The two
  * 256-bit halves are reduced separately (NOT summed), recovering both blocks'
  * dots from a single full-width vpdpbusd. */
-static inline void w4a8_reduce8_pair(const __m512i* acc, __m256i* plo, __m256i* phi) {
+MS_TVBMI static inline void w4a8_reduce8_pair(const __m512i* acc, __m256i* plo, __m256i* phi) {
     __m256i lo[8], hi[8];
     for (int j = 0; j < 8; ++j) {
         lo[j] = _mm512_castsi512_si256(acc[j]);
@@ -133,7 +142,7 @@ static inline void w4a8_reduce8_pair(const __m512i* acc, __m256i* plo, __m256i* 
 }
 
 /* Paired-block reduce of 4 accumulators -> two __m128i (4 lanes each). */
-static inline void w4a8_reduce4_pair(__m512i a0, __m512i a1, __m512i a2, __m512i a3,
+MS_TVBMI static inline void w4a8_reduce4_pair(__m512i a0, __m512i a1, __m512i a2, __m512i a3,
                                      __m128i* plo, __m128i* phi) {
     __m256i lo[8] = { _mm512_castsi512_si256(a0), _mm512_castsi512_si256(a1),
                       _mm512_castsi512_si256(a2), _mm512_castsi512_si256(a3),
@@ -148,7 +157,7 @@ static inline void w4a8_reduce4_pair(__m512i a0, __m512i a1, __m512i a2, __m512i
 }
 
 /* Reduce 4 __m512i int32 accumulators to a 4-lane __m128i of horizontal sums. */
-static inline __m128i w4a8_reduce4(__m512i a0, __m512i a1, __m512i a2, __m512i a3) {
+MS_TVBMI static inline __m128i w4a8_reduce4(__m512i a0, __m512i a1, __m512i a2, __m512i a3) {
     __m256i r0 = _mm256_add_epi32(_mm512_castsi512_si256(a0), _mm512_extracti64x4_epi64(a0, 1));
     __m256i r1 = _mm256_add_epi32(_mm512_castsi512_si256(a1), _mm512_extracti64x4_epi64(a1, 1));
     __m256i r2 = _mm256_add_epi32(_mm512_castsi512_si256(a2), _mm512_extracti64x4_epi64(a2, 1));
@@ -164,7 +173,7 @@ static inline __m128i w4a8_reduce4(__m512i a0, __m512i a1, __m512i a2, __m512i a
 /* Vectorized unpack of a contiguous run of 4-bit codes into signed int8
  * (wc = code - zp) in TRUE linear k order. nbytes packed -> 2*nbytes codes.
  * nbytes must be a multiple of 32. */
-static inline void w4a8_unpack4_lin(const uint8_t* src, int8_t* dst, int nbytes, int zp) {
+[[maybe_unused]] MS_TVBMI static inline void w4a8_unpack4_lin(const uint8_t* src, int8_t* dst, int nbytes, int zp) {
     const __m512i lo_mask = _mm512_set1_epi8(0x0F);
     const __m512i zpv     = _mm512_set1_epi8((char)zp);
     const __m512i perm = _mm512_set_epi8(
@@ -184,7 +193,7 @@ static inline void w4a8_unpack4_lin(const uint8_t* src, int8_t* dst, int nbytes,
     }
 }
 
-static inline int32_t w4a8_dpbusd(const uint8_t* au, const int8_t* wc, int len) {
+MS_TVBMI static inline int32_t w4a8_dpbusd(const uint8_t* au, const int8_t* wc, int len) {
     __m512i acc0 = _mm512_setzero_si512();
     __m512i acc1 = _mm512_setzero_si512();
     int k = 0;
@@ -203,13 +212,13 @@ static inline int32_t w4a8_dpbusd(const uint8_t* au, const int8_t* wc, int len) 
     for (; k < len; ++k) sum += (int32_t)au[k] * (int32_t)wc[k];
     return sum;
 }
-#else
-static inline int32_t w4a8_dpbusd(const uint8_t* au, const int8_t* wc, int len) {
+
+/* Scalar int dot used by the non-VNNI fallback driver. */
+static inline int32_t w4a8_dpbusd_scalar(const uint8_t* au, const int8_t* wc, int len) {
     int32_t sum = 0;
     for (int k = 0; k < len; ++k) sum += (int32_t)au[k] * (int32_t)wc[k];
     return sum;
 }
-#endif
 
 /* ---- aligned scratch helpers (no leaks) ---- */
 template <typename T>
@@ -222,6 +231,18 @@ struct AlignedBuf {
     AlignedBuf& operator=(const AlignedBuf&) = delete;
     T* get() { return p; }
 };
+
+/* Phase-2 drivers (defined below). */
+MS_TVBMI static void run_vnni(const uint8_t* au, const float* sa, const uint8_t* bq,
+                              const float* scales, const uint8_t* zero_points, float* y,
+                              int M, int N, int K, int bits, int block_size,
+                              int nbpr, int blob_size, int b_row_bytes, int zp_row_bytes,
+                              int default_zp, int padK);
+static void run_scalar(const uint8_t* au, const float* sa, const uint8_t* bq,
+                       const float* scales, const uint8_t* zero_points, float* y,
+                       int M, int N, int K, int bits, int block_size,
+                       int nbpr, int blob_size, int b_row_bytes, int zp_row_bytes,
+                       int default_zp, int padK);
 
 extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* scales,
                               const uint8_t* zero_points, float* y,
@@ -262,15 +283,29 @@ extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* sc
         }
     }
 
+    if (mscpu::has_vnni())
+        run_vnni(au, sa, bq, scales, zero_points, y, M, N, K, bits, block_size,
+                 nbpr, blob_size, b_row_bytes, zp_row_bytes, default_zp, padK);
+    else
+        run_scalar(au, sa, bq, scales, zero_points, y, M, N, K, bits, block_size,
+                   nbpr, blob_size, b_row_bytes, zp_row_bytes, default_zp, padK);
+}
+
+/* ---- Phase 2 (VNNI fast path) ----  target-attributed: compiled into the
+ * portable .so but only invoked when the host has AVX512-VNNI. The VBMI fused
+ * 4-bit unpack is further gated at runtime on mscpu::has_vbmi(). */
+MS_TVBMI
+static void run_vnni(const uint8_t* au, const float* sa, const uint8_t* bq,
+                     const float* scales, const uint8_t* zero_points, float* y,
+                     int M, int N, int K, int bits, int block_size,
+                     int nbpr, int blob_size, int b_row_bytes, int zp_row_bytes,
+                     int default_zp, int padK) {
     /* Register-block widths. NR weight columns per pack/microkernel tile. */
     const int NR = 8;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
-    const bool can_fast_unpack = (bits == 4) && (!zero_points)
+    const bool use_vbmi = mscpu::has_vbmi();
+    const bool can_fast_unpack = use_vbmi && (bits == 4) && (!zero_points)
                                  && ((K % 64) == 0) && ((K % block_size) == 0);
-#else
-    const bool can_fast_unpack = false;
-#endif
 
     /* ---- Phase 2: parallel over N tiles. Each thread packs NR weight columns
      * into a per-column K-contiguous int8 layout packB[j*padK + k] (one-time
@@ -304,7 +339,6 @@ extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* sc
                 const float* scol = scales + (size_t)n * nbpr;
                 for (int bk = 0; bk < nbpr; ++bk) packS[bk * NR + j] = scol[bk];
                 int8_t* dcol = packB + (size_t)j * padK;   /* K-contiguous column */
-#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
                 if (can_fast_unpack) {
                     /* Fused unpack + per-block sum_wc in ONE pass over the weights
                      * (avoids a second full read for the compensation term — the
@@ -355,7 +389,6 @@ extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* sc
                         }
                     }
                 } else
-#endif
                 {
                     for (int bk = 0; bk < nbpr; ++bk) {
                         int zp = zero_points ? w4a8_unpack(zero_points, zp_row_base, bk, bits)
@@ -384,7 +417,6 @@ extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* sc
                 }
             }
 
-#if defined(__AVX512VNNI__)
             const bool full = (nr_cnt == NR);
             /* ============ DECODE (M=1) and remainder rows: NR=8 columns ======= */
             /* ============ PREFILL: MR=4 x NR=8 register tile ================== */
@@ -561,10 +593,7 @@ extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* sc
                 _mm256_storeu_ps(y + (size_t)m * N + n0, yacc);
             }
             if (!full) {
-#else
-            {
-#endif
-                /* tail tile (<NR columns) or no-AVX512: per-column scalar reduce */
+                /* tail tile (<NR columns): per-column VNNI scalar-reduce */
                 for (int mm = 0; mm < M; ++mm) {
                     const uint8_t* aurow = au + (size_t)mm * padK;
                     const float*   sarow = sa + (size_t)mm * nbpr;
@@ -580,6 +609,69 @@ extern "C" void ms_qgemm_w4a8(const float* a, const uint8_t* bq, const float* sc
                         }
                         y[(size_t)mm * N + n] = acc;
                     }
+                }
+            }
+        }
+    }
+}
+
+/* ---- Phase 2 (scalar fallback) ----  correctness path for CPUs without
+ * AVX512-VNNI. Packs each weight column to int8 (with sum_wc compensation) and
+ * does an integer dot per (row, column, block) using a scalar reduce. Produces
+ * the same approximate W4A8 result as the VNNI driver. */
+static void run_scalar(const uint8_t* au, const float* sa, const uint8_t* bq,
+                       const float* scales, const uint8_t* zero_points, float* y,
+                       int M, int N, int K, int bits, int block_size,
+                       int nbpr, int blob_size, int b_row_bytes, int zp_row_bytes,
+                       int default_zp, int padK) {
+    const int NR = 8;
+    #pragma omp parallel
+    {
+        AlignedBuf<int8_t>  packB_buf((size_t)NR * padK);
+        AlignedBuf<int32_t> sumwc_buf((size_t)NR * nbpr);
+        int8_t*  packB = packB_buf.get();
+        int32_t* sumwc = sumwc_buf.get();
+
+        #pragma omp for schedule(static)
+        for (int n0 = 0; n0 < N; n0 += NR) {
+            const int nr_cnt = std::min(NR, N - n0);
+            for (int j = 0; j < nr_cnt; ++j) {
+                const int n = n0 + j;
+                const int b_row_base  = n * b_row_bytes;
+                const int zp_row_base = n * zp_row_bytes;
+                int8_t* dcol = packB + (size_t)j * padK;
+                for (int bk = 0; bk < nbpr; ++bk) {
+                    int zp = zero_points ? w4a8_unpack(zero_points, zp_row_base, bk, bits)
+                                         : default_zp;
+                    const int blob_base = b_row_base + bk * blob_size;
+                    const int k0 = bk * block_size;
+                    const int k1 = std::min(k0 + block_size, K);
+                    int s = 0, k = k0;
+                    for (; k < k1; ++k) {
+                        int v = w4a8_unpack(bq, blob_base, k - k0, bits) - zp;
+                        if (v > 127) v = 127; else if (v < -127) v = -127;
+                        dcol[k] = (int8_t)v;
+                        s += v;
+                    }
+                    for (; k < k0 + block_size; ++k) dcol[k] = 0;
+                    sumwc[bk * NR + j] = s;
+                }
+            }
+            for (int mm = 0; mm < M; ++mm) {
+                const uint8_t* aurow = au + (size_t)mm * padK;
+                const float*   sarow = sa + (size_t)mm * nbpr;
+                for (int j = 0; j < nr_cnt; ++j) {
+                    const int n = n0 + j;
+                    const int8_t* col = packB + (size_t)j * padK;
+                    float acc = 0.0f;
+                    for (int bk = 0; bk < nbpr; ++bk) {
+                        const int k0 = bk * block_size;
+                        const int len = std::min(block_size, K - k0);
+                        int32_t dot = w4a8_dpbusd_scalar(aurow + k0, col + k0, len);
+                        int32_t aqwc = dot - 128 * sumwc[bk * NR + j];
+                        acc += sarow[bk] * scales[n * nbpr + bk] * (float)aqwc;
+                    }
+                    y[(size_t)mm * N + n] = acc;
                 }
             }
         }

@@ -33,9 +33,20 @@ public static class NativeCuda
         {
             NativeLibrary.SetDllImportResolver(typeof(NativeCuda).Assembly, Resolve);
             _available = ms_cuda_available() == 1;
+            // Opt-in TF32 Tensor Cores for cuBLAS (fp32 in/out, ~5-8x on Ada, ~1e-3 accuracy).
+            if (_available &&
+                Environment.GetEnvironmentVariable("MODELSHARP_TF32") is "1" or "on" or "true" or "True" or "ON" or "TRUE")
+                ms_cuda_set_tf32(1);
         }
         catch { _available = false; }
     }
+
+    /// <summary>Enable/disable TF32 Tensor Core math for all cuBLAS GEMMs (single, resident, batched).
+    /// fp32 inputs/outputs, Tensor Core compute (~5-8x on Ada), ~1e-3 relative accuracy. Default off.</summary>
+    public static void SetTf32(bool enable) { if (_available) ms_cuda_set_tf32(enable ? 1 : 0); }
+
+    /// <summary>True when TF32 Tensor Core math is currently enabled.</summary>
+    public static bool Tf32Enabled => _available && ms_cuda_get_tf32() != 0;
 
     /// <summary>True when <c>libms_cuda.so</c> loaded and a CUDA device is present.</summary>
     public static bool Available => _available;
@@ -206,4 +217,6 @@ public static class NativeCuda
     [DllImport(Lib)] private static extern int ms_cuda_sync_stream(IntPtr cuStream);
     [DllImport(Lib)] private static extern int ms_cuda_sgemm_strided_batched_ctx(IntPtr cuContext, IntPtr cuStream, IntPtr dA, IntPtr dB, IntPtr dC, int M, int N, int K, long strideA, long strideB, long strideC, int batch);
     [DllImport(Lib)] private static extern void ms_cuda_release_context(IntPtr cuContext);
+    [DllImport(Lib)] private static extern void ms_cuda_set_tf32(int enable);
+    [DllImport(Lib)] private static extern int ms_cuda_get_tf32();
 }

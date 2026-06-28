@@ -14,6 +14,7 @@ internal static class Program
     private static void Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "probe") { EngineCublasProbe.Run(); return; }
+        if (args.Length > 0 && args[0] == "ort") { OrtCompare.Run(args); return; }
 
         // The "managed" column must be genuinely managed: disable the native seam that
         // BlockedGemm.Multiply now uses, so we measure managed vs native cleanly. The "native"

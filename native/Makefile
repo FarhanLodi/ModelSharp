@@ -5,11 +5,15 @@
 #   make run-tests -> build and run every self-test
 #   make clean
 #
-# -march=native targets this host's exact ISA (znver4 here => AVX-512 + VNNI).
-# For a portable build, replace with: -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mfma
+# PORTABLE baseline: -mavx2 -mfma -mf16c is supported on essentially every
+# x86-64 CPU since ~2015, so libms_kernels.so loads and runs anywhere without
+# SIGILL. The AVX-512 / AVX512-VNNI hot paths are still compiled in (each kernel
+# carries its own __attribute__((target(...))) ) and are selected at RUNTIME via
+# __builtin_cpu_supports (see src/cpu_features.h), preserving full AVX-512 perf on
+# hosts that have it (e.g. znver4) while staying safe on older CPUs.
 
 CXX      ?= g++
-CXXFLAGS ?= -O3 -march=native -mfma -fopenmp -fPIC -std=c++17 -Wall -funroll-loops -ffast-math
+CXXFLAGS ?= -O3 -mavx2 -mfma -mf16c -fopenmp -fPIC -std=c++17 -Wall -funroll-loops -ffast-math
 LDFLAGS  ?= -shared -fopenmp
 
 SRC      := $(wildcard src/*.cpp)
