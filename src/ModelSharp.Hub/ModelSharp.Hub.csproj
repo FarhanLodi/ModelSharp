@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>ModelSharp.Hub</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Authors>Farhan Lodi</Authors>
     <Description>Model acquisition for ModelSharp — download and cache ONNX / GGUF / safetensors models (and their external-data + tokenizer files) from Hugging Face Hub or any URL, then run them in one line via HubPipeline.Load. Pure-managed (HttpClient only); no third-party dependencies.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>

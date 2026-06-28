@@ -5,6 +5,34 @@ All notable changes to ModelSharp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-06-28
+
+### Added
+- **Optional native acceleration layer** (in `native/`, built separately; **not** shipped in the
+  NuGet packages, which stay pure-managed). When the shared library is present the engine routes
+  its hot paths through it and **falls back to the managed kernels otherwise**, so the
+  zero-native-dependency default and cross-platform portability are unchanged.
+  - **CPU** (`libms_kernels.so`): hand-tuned AVX-512 packed/blocked fp32 GEMM (used by `MatMul`
+    and `Conv`), AVX512-VNNI W4A8 quantized matmul, fused attention, and conv kernels.
+    ~2.5–3× over the managed `BlockedGemm` on GEMM-bound work; SGEMM runs at ~92 % of the host's
+    FMA roofline. Toggle with `MODELSHARP_NATIVE`.
+  - **Portable + safe build**: the library builds on a portable `-mavx2` baseline and selects
+    AVX-512 / AVX512-VNNI / AVX2 / scalar paths at **runtime** (`cpu_features.h`), so it never
+    executes an unsupported instruction on older x86. `ms_has_avx512` / `ms_has_vnni` are runtime
+    checks.
+  - **GPU** (`libms_cuda.so`, optional): cuBLAS fast path wired into the ILGPU engine, running
+    inside ILGPU's own CUDA context on the resident device buffers with **no extra copies** —
+    single and strided-batched `MatMul` (the latter covers decomposed-attention Q·Kᵀ / scores·V),
+    plus optional TF32 Tensor Cores. Enable with `MODELSHARP_CUBLAS` / `MODELSHARP_TF32`.
+- **Cross-`Run` weight residency** for the GPU engine: graph initializers (weights) stay resident
+  on the device across `Run()` calls instead of re-uploading every call
+  (`MODELSHARP_RESIDENT_WEIGHTS`, default on), removing the dominant per-call PCIe upload for
+  repeated inference.
+
+### Notes
+- The native layer accelerates ModelSharp's own hot paths and is opt-in; the managed engine
+  remains the portable, zero-dependency default.
+
 ## [1.0.1] - 2026-06-27
 
 ### Fixed

@@ -1,23 +1,23 @@
 <div align="center">
-  <img src="modelsharp_logo.png" alt="ModelSharp Logo" width="120" height="120" />
+  <img src="modelsharp_logo.png" alt="ModelSharp" width="120" height="120" />
 
   <h1>ModelSharp</h1>
 
-  <p><strong>Pure-managed, zero-native-dependency ONNX model inference for .NET.</strong></p>
+  <p><strong>Universal, manifest-driven model inference for .NET — pure-managed by default, with an optional native fast path.</strong></p>
 
   <p>
-    <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/v/ModelSharp.svg?label=nuget&color=blue" alt="NuGet" /></a>
-    <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/dt/ModelSharp.svg?label=downloads&color=blue" alt="NuGet downloads" /></a>
+    <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/v/ModelSharp.svg?label=nuget&color=512BD4" alt="NuGet" /></a>
+    <a href="https://www.nuget.org/packages/ModelSharp"><img src="https://img.shields.io/nuget/dt/ModelSharp.svg?label=downloads&color=512BD4" alt="NuGet downloads" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License: Apache-2.0" /></a>
     <img src="https://img.shields.io/badge/.NET-10.0-512BD4.svg" alt=".NET 10" />
-    <img src="https://img.shields.io/badge/dependencies-zero-brightgreen.svg" alt="Zero dependencies" />
-    <img src="https://img.shields.io/badge/tests-passing-brightgreen.svg" alt="Well tested" />
+    <img src="https://img.shields.io/badge/core%20dependencies-zero-brightgreen.svg" alt="Zero core dependencies" />
+    <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational.svg" alt="Cross-platform" />
   </p>
 </div>
 
 ---
 
-**ModelSharp** runs real machine-learning models — vision, text, and audio — entirely in managed .NET. No Python, no native DLLs, no per-model glue code. Point it at an ONNX, GGUF, or safetensors model and call one method: a small *manifest* describes how to feed and decode the model, so the same `Pipeline` API handles embeddings, image classification, object detection, speech recognition, and quantized LLM generation. The same build runs on Windows, Linux, and macOS, x64 and ARM64, on CPU — and on the GPU through an optional backend.
+**ModelSharp** runs real machine-learning models — vision, text, and audio — entirely in managed .NET. No Python, no native DLLs to ship, no per-model glue code. Point it at an ONNX, GGUF, or safetensors model and call one method: a small *manifest* describes how to feed and decode the model, so the same `Pipeline` API handles embeddings, image classification, object detection, speech recognition, and quantized LLM generation. A single build runs on Windows, Linux, and macOS, x64 and ARM64 — on CPU, and on the GPU through an optional backend.
 
 ```csharp
 using ModelSharp.Hub;
@@ -28,12 +28,28 @@ string answer = pipeline.Run<string>("The capital of France is");
 // → " Paris. It is the largest city in the world by population…"
 ```
 
+## Contents
+
+- [Why ModelSharp](#why-modelsharp)
+- [Features](#features)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Supported tasks & formats](#supported-tasks--formats)
+- [Performance & optional native acceleration](#performance--optional-native-acceleration)
+- [Verified on real models](#verified-on-real-models)
+- [Architecture](#architecture)
+- [Packages](#packages)
+- [Requirements](#requirements)
+- [License](#license)
+- [Contributing](#contributing)
+
 ## Why ModelSharp
 
 ONNX Runtime gives you `tensor in → tensor out`, but every model still needs its own pre/post-processing, and the native runtime can't run everywhere. ModelSharp closes both gaps:
 
 - **Self-describing models.** A small *manifest* — embedded ONNX metadata, a sidecar JSON, or a built-in registry — describes how to feed and decode a model. One `Pipeline` API runs any model: text in or image in, typed result out, no per-model glue code.
-- **Pure-managed engine.** Managed kernels (SIMD-friendly on CPU, GPU via ILGPU) mean a single build runs everywhere .NET runs, with **no native binaries to ship**. Even the ONNX parser is a hand-rolled protobuf reader — there isn't a `Google.Protobuf` dependency either.
+- **Pure-managed core.** Managed kernels mean a single build runs everywhere .NET runs, with **no native binaries to ship**. Even the ONNX parser is a hand-rolled protobuf reader — there is no `Google.Protobuf` dependency either.
+- **Optional native speed.** When you want more throughput, drop in the optional native kernel libraries (AVX-512 on CPU, cuBLAS on NVIDIA GPUs). The engine uses them when present and **transparently falls back to managed** otherwise — so you never trade away portability to get speed.
 - **Bit-verified.** Outputs are validated against ONNX Runtime on real models, down to exact next-token logits on quantized LLMs.
 
 ## Features
@@ -41,6 +57,7 @@ ONNX Runtime gives you `tensor in → tensor out`, but every model still needs i
 - 🧩 **One-line inference** — `Pipeline.Load("model.onnx").Run<T>(input)` for any supported task.
 - 📦 **Zero dependencies in the core package** — no native runtime, no Python, no protobuf library.
 - 🌍 **Runs everywhere .NET runs** — single managed build, x64 / ARM64, all OSes.
+- ⚡ **Optional native fast path** — opt-in AVX-512 / AVX512-VNNI CPU kernels and a cuBLAS GPU path, with automatic managed fallback. *(See [Performance](#performance--optional-native-acceleration).)*
 - 🔢 **Multi-dtype engine** — `float32` / `int64` / `int32` / `bool` flow through as their real types, so token ids, masks, and shape tensors all work natively.
 - 🧠 **Broad operator coverage** — CNNs, transformers, RNNs (LSTM/GRU), signal ops (DFT/STFT/MelWeightMatrix), control flow (If/Loop/Scan), sequence/optional ops, and quantized `QLinear*` / `MatMulNBits` ops.
 - 🧮 **Real quantized LLMs** — runs INT4 / INT8 / fp16 ONNX LLMs end to end, including a **7B** model (`MatMulNBits` INT4 + genai `GroupQueryAttention`) loaded from multi-gigabyte external-data files.
@@ -157,7 +174,40 @@ Tensor<float> hidden = outputs["last_hidden_state"].Tensor.AsFloat();
 | **Model formats** | ONNX (incl. external-data shards), GGUF (legacy, k-quant, and IQ quant types), safetensors |
 | **Quantization** | INT4 (`MatMulNBits`), INT8 (`QLinear*` / dynamic-quant), fp16 / bf16 initializers |
 | **Tasks** | Text embeddings, image classification, object detection, speech recognition (CTC + Whisper seq2seq), decoder-only LLM generation, encoder-decoder (T5 / BART / MarianMT) generation |
-| **Backends** | Managed CPU engine (core), optional ILGPU GPU engine (CUDA / OpenCL, CPU fallback) |
+| **Backends** | Managed CPU engine (core), optional ILGPU GPU engine (CUDA / OpenCL, CPU fallback), optional native CPU/GPU fast path |
+
+## Performance & optional native acceleration
+
+ModelSharp's default engine is **pure managed and SIMD-tuned**. Its register-tiled, multithreaded
+`BlockedGemm` (built on `System.Numerics.Vector<T>`) backs `MatMul`, `Gemm`, and `Conv`, and runs
+**~2–5× faster** than a naïve managed kernel — with zero native code and identical behavior on every
+platform.
+
+For maximum throughput on supported hardware, ModelSharp ships an **optional native kernel layer**
+(under [`native/`](native/), built separately — **it is not part of the NuGet packages**, which stay
+pure-managed). The engine loads it when present and **falls back to the managed kernels** when it is
+absent, the CPU lacks the required ISA, or the shape isn't supported — so enabling it never costs you
+portability or correctness.
+
+| Layer | What it accelerates | Notes |
+|-------|---------------------|-------|
+| **CPU** (`libms_kernels.so`) | Packed AVX-512 fp32 GEMM (`MatMul`/`Conv`), AVX512-VNNI W4A8 quant, fused attention | ~2.5–3× over the managed kernel on GEMM-bound work; SGEMM reaches ~92 % of the host's FMA roofline |
+| **GPU** (`libms_cuda.so`) | cuBLAS single & strided-batched `MatMul` (incl. decomposed-attention Q·Kᵀ / scores·V), optional TF32 Tensor Cores | Runs inside ILGPU's CUDA context on resident device buffers — no extra copies |
+
+Highlights of the native layer:
+
+- **Portable and safe.** The CPU library is built on a portable `-mavx2` baseline and chooses
+  AVX-512 / AVX512-VNNI / AVX2 / scalar paths **at runtime**, so it never executes an unsupported
+  instruction on older x86.
+- **Resident weights on GPU.** Model weights stay on the device across `Run()` calls instead of being
+  re-uploaded each time, removing the dominant per-call PCIe cost for repeated inference.
+- **Opt-in via environment flags.** `MODELSHARP_NATIVE`, `MODELSHARP_CUBLAS`, `MODELSHARP_TF32`,
+  `MODELSHARP_RESIDENT_WEIGHTS`. See [`native/README.md`](native/README.md) and
+  [`native/GPU.md`](native/GPU.md) for build and tuning details.
+
+> **Scope.** The native layer accelerates ModelSharp's own hot paths and is verified against the
+> managed engine. The managed engine remains the default; the native libraries are an opt-in build
+> for users who want extra throughput on AVX-512 CPUs or NVIDIA GPUs.
 
 ## Verified on real models
 
@@ -175,9 +225,8 @@ Every supported task is validated **end to end on real, exported models** — wi
 | **INT4 LLM (7B)** | **Mistral-7B-Instruct v0.3** (genai INT4) | a **5 GB external-data** model runs a full forward pass in **~16 s** on an RTX 4090; next-token logits **match ONNX Runtime exactly**, bit-verifying the `MatMulNBits` + `GroupQueryAttention` path |
 | Quantized LLM on GPU | INT8 gpt2 (dynamic-quant) | the whole quantized graph runs on the GPU engine and greedy-decodes with the **same argmax as CPU** at every step |
 | GPU LLM path | distilgpt2 on CUDA | the **full graph runs end-to-end on the GPU** (no CPU fallback), matching CPU logits (Δ ≤ 1.8e-4) and exact greedy argmax, with an on-device KV-cache |
-| GPU acceleration | RTX 4090 (CUDA) | GPU outputs match the CPU engine; large MatMul **~556×** and Conv2D **~109×** faster than the managed CPU engine |
 
-## How it works
+## Architecture
 
 ModelSharp is built around a single seam: a manifest-driven `Pipeline` on top of a swappable execution engine.
 
@@ -189,13 +238,13 @@ ModelSharp is built around a single seam: a manifest-driven `Pipeline` on top of
                           |
                           v
                  IExecutionEngine               <-- swappable backend
-                    +-- ManagedCpuEngine  (ModelSharp core) -- pure-managed kernels
-                    +-- IlgpuEngine       (ModelSharp.Gpu)  -- C# kernels -> CUDA / OpenCL / CPU
+                    +-- ManagedCpuEngine  (ModelSharp core)  -- pure-managed kernels (+ optional native fast path)
+                    +-- IlgpuEngine       (ModelSharp.Gpu)   -- C# kernels -> CUDA / OpenCL / CPU (+ optional cuBLAS)
 ```
 
 - **Manifest-driven pipeline.** A manifest resolves automatically — sidecar JSON next to the model, then embedded ONNX `metadata_props`, then a built-in registry of filename heuristics — or you pass one explicitly. It selects the right pre/post-processors so one API serves every task.
-- **Pure-managed, multi-dtype engine.** Tensors carry their real dtype end to end. Kernels are written in plain managed C# and are SIMD-friendly, with no native code anywhere in the core.
-- **Swappable backends.** The public API and all processing are fixed behind `IExecutionEngine`; the CPU and GPU engines plug in underneath without changing caller code.
+- **Pure-managed, multi-dtype engine.** Tensors carry their real dtype end to end. Kernels are written in plain managed C# and are SIMD-friendly, with no native code in the core.
+- **Swappable backends.** The public API and all processing are fixed behind `IExecutionEngine`; the CPU and GPU engines plug in underneath without changing caller code, and the optional native libraries plug in beneath them with automatic managed fallback.
 - **Hand-rolled ONNX reader.** The loader is a custom protobuf parser, which is why the core package pulls in nothing — no `Google.Protobuf`, no native runtime.
 
 Need a task ModelSharp doesn't ship? Register your own pre/post-processors with `ProcessorRegistry.RegisterPreprocessor` / `RegisterPostprocessor` — exactly how the ImageSharp package plugs itself in.
@@ -211,10 +260,14 @@ Packaging is split by **dependency**, not by feature — so the common case is a
 | `ModelSharp.Gpu` *(optional)* | ILGPU backend (C# kernels → CUDA / OpenCL, CPU fallback). | ILGPU (1.5.x) |
 | `ModelSharp.Hub` *(optional)* | Model download + resolution from Hugging Face / GGUF / safetensors / URLs, with a local cache. | **none** (`HttpClient` only) |
 
+> The optional **native acceleration layer** (`native/`) is a separate, opt-in build and is **not**
+> distributed through any NuGet package — the published packages remain pure-managed.
+
 ## Requirements
 
 - **.NET 10** or later.
 - The core `ModelSharp` package has no external or native dependencies. Optional packages add only the managed dependencies listed above.
+- The optional native layer requires a C++17 compiler (and the CUDA toolkit for the GPU library); see [`native/`](native/).
 
 ## License
 
