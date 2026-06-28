@@ -70,6 +70,20 @@ public sealed class IlgpuEngine : IExecutionEngine
     public bool UseCublas { get; set; } =
         Environment.GetEnvironmentVariable("MODELSHARP_CUBLAS") is "1" or "on" or "true" or "True" or "ON" or "TRUE";
 
+    /// <summary>
+    /// Keep graph initializers (weights) resident on the device across <see cref="Run"/> calls instead of
+    /// re-uploading them from host every call. Initializers are immutable, so this is a pure win for repeated
+    /// inference (decode loops, batched serving): the per-Run cost drops to just activations, and the resident
+    /// weight buffers are exactly what the cuBLAS context path consumes with zero copies. The cache is owned by
+    /// the engine and freed in <see cref="Dispose"/>. Default on; set <c>MODELSHARP_RESIDENT_WEIGHTS=0</c> to
+    /// restore the upload-every-Run behavior.
+    /// </summary>
+    public bool CacheWeights { get; set; } =
+        Environment.GetEnvironmentVariable("MODELSHARP_RESIDENT_WEIGHTS") is not ("0" or "off" or "false" or "OFF" or "FALSE");
+
+    /// <summary>Device-resident initializer buffers, keyed by initializer name (see <see cref="CacheWeights"/>).</summary>
+    private readonly Dictionary<string, DeviceValue> _weightCache = new();
+
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _add;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _sub;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _mul;
@@ -305,7 +319,17 @@ public sealed class IlgpuEngine : IExecutionEngine
         try
         {
             foreach (KeyValuePair<string, Tensor> init in _graph.Initializers)
-                values[init.Key] = Load(init.Value);
+            {
+                if (CacheWeights)
+                {
+                    // Upload once, reuse on every subsequent Run. Initializers are immutable, so the cached
+                    // device buffer stays valid; it is protected from the per-Run dispose below and freed in Dispose.
+                    if (!_weightCache.TryGetValue(init.Key, out var cached))
+                        _weightCache[init.Key] = cached = Load(init.Value);
+                    values[init.Key] = cached;
+                }
+                else values[init.Key] = Load(init.Value);
+            }
             foreach (string input in _graph.Inputs)
             {
                 if (!feeds.TryGetValue(input, out NamedTensor? nt))
@@ -417,6 +441,10 @@ public sealed class IlgpuEngine : IExecutionEngine
             // a NullReferenceException when the accelerator itself is later disposed. Deduping by reference makes
             // cleanup robust even when Run unwinds mid-graph (e.g. on an unsupported op).
             var seen = new HashSet<MemoryBuffer>(ReferenceEqualityComparer.Instance);
+            // Pre-seed with the resident weight buffers so they are NOT disposed here (they persist across Runs,
+            // and an alias such as a Reshape of an initializer can also reach them via `values`).
+            foreach (DeviceValue w in _weightCache.Values)
+                if (w.FloatBuf is not null) seen.Add(w.FloatBuf);
             foreach (DeviceValue v in values.Values)
                 if (v.FloatBuf is not null && seen.Add(v.FloatBuf)) v.FloatBuf.Dispose();
             foreach (MemoryBuffer buf in temps)
@@ -3747,6 +3775,10 @@ public sealed class IlgpuEngine : IExecutionEngine
     /// <inheritdoc />
     public void Dispose()
     {
+        // Free the resident weight buffers before the accelerator that owns them.
+        foreach (DeviceValue w in _weightCache.Values)
+            w.FloatBuf?.Dispose();
+        _weightCache.Clear();
         _accelerator.Dispose();
         _context.Dispose();
     }

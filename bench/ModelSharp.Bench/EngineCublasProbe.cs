@@ -1,9 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
 using ModelSharp.Gpu;
+using ModelSharp.Graph;
+using ModelSharp.Tensors;
 
 namespace ModelSharp.Bench;
 
@@ -16,6 +19,12 @@ namespace ModelSharp.Bench;
 internal static class EngineCublasProbe
 {
     public static void Run()
+    {
+        RunPrimitiveProbe();
+        RunResidencyBenchmark();
+    }
+
+    private static void RunPrimitiveProbe()
     {
         Console.WriteLine();
         Console.WriteLine("=== ILGPU+cuBLAS resident-context probe ===");
@@ -66,6 +75,63 @@ internal static class EngineCublasProbe
         Console.WriteLine(rc == 0 && maxRel < 1e-2
             ? "=> cuBLAS runs IN ILGPU's context on resident buffers ✓"
             : "=> FAILED (status nonzero or wrong result)");
+    }
+
+    // End-to-end engine benchmark: a [K,N] weight as a graph INITIALIZER, repeated Run() with varying
+    // [M,K] activations (decode/serving pattern). Compares re-upload-every-Run vs resident weight, and
+    // the ILGPU kernel vs the cuBLAS context path — i.e. whether the GPU win actually lands end-to-end.
+    private static void RunResidencyBenchmark()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== engine weight-residency benchmark (weight = initializer) ===");
+        if (!NativeCuda.Available) { Console.WriteLine("NativeCuda unavailable — skip."); return; }
+
+        const int M = 8, K = 4096, N = 4096;   // small-batch decode/prefill against a 64 MB resident weight
+        var rng = new Random(5);
+        var w = new float[K * N];
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var graph = new ModelGraph
+        {
+            Inputs = new[] { "x" },
+            Outputs = new[] { "y" },
+            Nodes = new[] { new GraphNode("MatMul", "mm", new[] { "x", "w" }, new[] { "y" }) },
+            Initializers = new Dictionary<string, Tensor> { ["w"] = new Tensor<float>(new TensorShape(new[] { K, N }), w) },
+        };
+
+        var x = new float[M * K];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        Dictionary<string, NamedTensor> Feeds() => new()
+        {
+            ["x"] = new NamedTensor("x", new Tensor<float>(new TensorShape(new[] { M, K }), (float[])x.Clone())),
+        };
+
+        Measure("re-upload weight + ILGPU kernel", cache: false, cublas: false, graph, Feeds);
+        Measure("re-upload weight + cuBLAS      ", cache: false, cublas: true,  graph, Feeds);
+        Measure("resident weight  + ILGPU kernel", cache: true,  cublas: false, graph, Feeds);
+        Measure("resident weight  + cuBLAS      ", cache: true,  cublas: true,  graph, Feeds);
+    }
+
+    private static void Measure(string label, bool cache, bool cublas, ModelGraph graph,
+                                Func<Dictionary<string, NamedTensor>> feeds)
+    {
+        using var gpu = new IlgpuEngine(graph, preferCpu: false);
+        if (!gpu.IsHardwareGpu) { Console.WriteLine($"  {label}: not hardware GPU — skip."); return; }
+        gpu.CacheWeights = cache;
+        gpu.UseCublas = cublas;
+
+        for (int i = 0; i < 5; i++) gpu.Run(feeds());   // warmup (JIT, first weight upload)
+        const int reps = 30;
+        var samples = new double[reps];
+        for (int r = 0; r < reps; r++)
+        {
+            var sw = Stopwatch.StartNew();
+            gpu.Run(feeds());
+            sw.Stop();
+            samples[r] = sw.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(samples);
+        Console.WriteLine($"  {label} : {samples[reps / 2]:0.000} ms/Run (median)");
     }
 
     private static double ReferenceCheck(float[] a, float[] b, float[] y, int M, int N, int K)
