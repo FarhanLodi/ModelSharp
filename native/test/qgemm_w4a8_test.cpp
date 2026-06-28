@@ -241,6 +241,25 @@ int main(int argc, char** argv) {
                     for (int bs : bss)
                         run_case(M, N, K, cfg.bits, bs, cfg.asym, rng);
 
+    // Edge cases: N not a multiple of NR=8 (exercises the tail-tile column path),
+    // odd M (exercises the M%4 remainder/decode path on a non-1 M), small ragged
+    // shapes, and a K not a multiple of block_size at bs=128 (ragged last block).
+    printf("EDGE CASES (tail tiles, odd M, ragged K):\n");
+    // (N>=7 so the relative-L2 metric is over a vector, not a single near-zero
+    // scalar whose relative error is meaningless; N=7,9 still hit the tail path.)
+    int eM[]  = {1, 3, 5, 7, 13};
+    int eN[]  = {7, 9, 65, 130, 257};
+    for (auto cfg : cfgs)
+        for (int M : eM)
+            for (int N : eN) {
+                run_case(M, N, 128,  cfg.bits, 32,  cfg.asym, rng);
+                run_case(M, N, 4096, cfg.bits, 128, cfg.asym, rng);
+            }
+    // ragged K (last block shorter than block_size)
+    run_case(1,  16,  4000, 4, 128, false, rng);
+    run_case(8,  9,   320,  4, 128, true,  rng);
+    run_case(32, 130, 200,  8, 128, false, rng);
+
     printf("\nBENCHMARK (effective GFLOP/s = 2*M*N*K/s), bits=4 bs=32, N=K=4096:\n");
     // 7800X3D = 8 physical cores + SMT. Report 1T, the per-physical-core peak
     // (8T), and full SMT (max_threads): SMT often regresses on int-port-bound code.

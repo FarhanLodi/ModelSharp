@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ModelSharp\ModelSharp.csproj" />
+    <ProjectReference Include="..\..\src\ModelSharp.Gpu\ModelSharp.Gpu.csproj" />
   </ItemGroup>
 
 </Project>

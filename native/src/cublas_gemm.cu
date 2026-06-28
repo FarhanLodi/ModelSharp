@@ -88,7 +88,15 @@ extern "C" {
 // Not thread-safe for concurrent first-time init; ModelSharp drives GEMM from
 // a single worker for the hot path. A real multithreaded host should guard
 // this or create one handle per thread.
+//
+// We also create and bind a dedicated non-blocking CUDA stream to the handle.
+// Binding the same stream means all cuBLAS calls and any explicit copies issued
+// on g_stream are ordered with respect to each other on the device, while a
+// single cudaStreamSynchronize(g_stream) (instead of cudaDeviceSynchronize())
+// is enough to wait for results — this matters for the chained device-resident
+// path where we want to issue many GEMMs back-to-back and sync only once.
 static cublasHandle_t g_handle = nullptr;
+static cudaStream_t   g_stream = nullptr;
 
 static cublasHandle_t ms_get_handle(void) {
     if (g_handle == nullptr) {
@@ -97,9 +105,29 @@ static cublasHandle_t ms_get_handle(void) {
             fprintf(stderr, "[ms_cuda] cublasCreate failed: status %d\n",
                     (int)s);
             g_handle = nullptr;
+            return nullptr;
+        }
+        cudaError_t e = cudaStreamCreateWithFlags(&g_stream,
+                                                  cudaStreamNonBlocking);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[ms_cuda] cudaStreamCreate failed: %s\n",
+                    cudaGetErrorString(e));
+            g_stream = nullptr;  // fall back to the default stream
+        } else {
+            cublasStatus_t ss = cublasSetStream(g_handle, g_stream);
+            if (ss != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[ms_cuda] cublasSetStream failed: status %d\n",
+                        (int)ss);
+            }
         }
     }
     return g_handle;
+}
+
+// Wait for all work on our stream (or the whole device if no stream).
+static cudaError_t ms_sync(void) {
+    return g_stream ? cudaStreamSynchronize(g_stream)
+                    : cudaDeviceSynchronize();
 }
 
 // Returns 1 if at least one CUDA device is visible, else 0. Safe to call even
@@ -163,10 +191,10 @@ void ms_cuda_sgemm(const float* A, const float* B, float* C,
     MS_CUDA_CHECK(cudaMalloc((void**)&dB, bytesB), "cudaMalloc dB");
     MS_CUDA_CHECK(cudaMalloc((void**)&dC, bytesC), "cudaMalloc dC");
 
-    MS_CUDA_CHECK(cudaMemcpy(dA, A, bytesA, cudaMemcpyHostToDevice),
-                  "H2D A");
-    MS_CUDA_CHECK(cudaMemcpy(dB, B, bytesB, cudaMemcpyHostToDevice),
-                  "H2D B");
+    MS_CUDA_CHECK(cudaMemcpyAsync(dA, A, bytesA, cudaMemcpyHostToDevice,
+                                  g_stream), "H2D A");
+    MS_CUDA_CHECK(cudaMemcpyAsync(dB, B, bytesB, cudaMemcpyHostToDevice,
+                                  g_stream), "H2D B");
 
     // Column-major transpose trick (see file header). We compute, in
     // column-major terms, C_cm[N,M] = B_cm[N,K] * A_cm[K,M], which lands the
@@ -182,8 +210,9 @@ void ms_cuda_sgemm(const float* A, const float* B, float* C,
                     dC, N),         // output: C, ldc = N
         "cublasSgemm");
 
-    MS_CUDA_CHECK(cudaMemcpy(C, dC, bytesC, cudaMemcpyDeviceToHost),
-                  "D2H C");
+    MS_CUDA_CHECK(cudaMemcpyAsync(C, dC, bytesC, cudaMemcpyDeviceToHost,
+                                  g_stream), "D2H C");
+    MS_CUDA_CHECK(ms_sync(), "stream sync");
 
 cleanup:
     if (dA) cudaFree(dA);
@@ -200,9 +229,12 @@ cleanup:
 void* ms_cuda_upload(const float* host, int rows, int cols) {
     if (!host || rows <= 0 || cols <= 0) return nullptr;
     const size_t bytes = (size_t)rows * (size_t)cols * sizeof(float);
+    ms_get_handle();  // ensure g_stream exists
     void* dev = nullptr;
     if (cudaMalloc(&dev, bytes) != cudaSuccess) return nullptr;
-    if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice,
+                        g_stream) != cudaSuccess ||
+        ms_sync() != cudaSuccess) {
         cudaFree(dev);
         return nullptr;
     }
@@ -235,7 +267,8 @@ void ms_cuda_sgemm_with_resident_b(const float* A, void* dB_void, float* C,
 
     MS_CUDA_CHECK(cudaMalloc((void**)&dA, bytesA), "cudaMalloc dA");
     MS_CUDA_CHECK(cudaMalloc((void**)&dC, bytesC), "cudaMalloc dC");
-    MS_CUDA_CHECK(cudaMemcpy(dA, A, bytesA, cudaMemcpyHostToDevice), "H2D A");
+    MS_CUDA_CHECK(cudaMemcpyAsync(dA, A, bytesA, cudaMemcpyHostToDevice,
+                                  g_stream), "H2D A");
 
     MS_CUBLAS_CHECK(
         cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -246,11 +279,120 @@ void ms_cuda_sgemm_with_resident_b(const float* A, void* dB_void, float* C,
                     dC, N),
         "cublasSgemm");
 
-    MS_CUDA_CHECK(cudaMemcpy(C, dC, bytesC, cudaMemcpyDeviceToHost), "D2H C");
+    MS_CUDA_CHECK(cudaMemcpyAsync(C, dC, bytesC, cudaMemcpyDeviceToHost,
+                                  g_stream), "D2H C");
+    MS_CUDA_CHECK(ms_sync(), "stream sync");
 
 cleanup:
     if (dA) cudaFree(dA);
     if (dC) cudaFree(dC);
+}
+
+// ===========================================================================
+// Fully device-resident API
+// ===========================================================================
+// The functions below operate on raw device pointers and never implicitly
+// transfer to/from the host. This is the path that matters for LLM inference:
+// upload a weight matrix ONCE (ms_cuda_upload), keep activations and outputs on
+// the device (ms_cuda_alloc / ms_cuda_upload_into), and chain many GEMMs
+// (ms_cuda_sgemm_dev) without any per-call cudaMalloc/cudaFree or PCIe copies.
+// Only the final result is brought back with ms_cuda_download. All device
+// pointers must be freed with ms_cuda_free.
+
+// Allocate an UNINITIALISED device buffer of `n` floats. Returns NULL on error.
+// Use for activation / output buffers that will be written by a GEMM.
+void* ms_cuda_alloc(size_t n) {
+    if (n == 0) return nullptr;
+    void* dev = nullptr;
+    cudaError_t e = cudaMalloc(&dev, n * sizeof(float));
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_alloc(%zu) failed: %s\n", n,
+                cudaGetErrorString(e));
+        return nullptr;
+    }
+    return dev;
+}
+
+// Copy `n` host floats into an existing device buffer `dev`. Returns 0 on
+// success, non-zero on failure. Use to refresh a resident activation buffer
+// in place without reallocating.
+int ms_cuda_upload_into(void* dev, const float* host, size_t n) {
+    if (!dev || !host || n == 0) return -1;
+    ms_get_handle();  // ensure g_stream exists
+    cudaError_t e = cudaMemcpyAsync(dev, host, n * sizeof(float),
+                                    cudaMemcpyHostToDevice, g_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_upload_into failed: %s\n",
+                cudaGetErrorString(e));
+        return (int)e;
+    }
+    e = ms_sync();
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+// Copy `n` floats from device buffer `dev` back to the host. Returns 0 on
+// success. This is the ONLY host transfer in a chained sequence — call it once
+// on the final output.
+int ms_cuda_download(void* dev, float* host, size_t n) {
+    if (!dev || !host || n == 0) return -1;
+    ms_get_handle();
+    cudaError_t e = cudaMemcpyAsync(host, dev, n * sizeof(float),
+                                    cudaMemcpyDeviceToHost, g_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_download failed: %s\n",
+                cudaGetErrorString(e));
+        return (int)e;
+    }
+    e = ms_sync();
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+// Fully device-resident SGEMM: C[M,N] = A[M,K] * B[K,N], all row-major, where
+// dA, dB, dC are device pointers (dA = activations [M,K], dB = weights [K,N],
+// dC = output [M,N]). NO host transfers and NO cudaMalloc/free occur here — the
+// GEMM is simply enqueued on g_stream. The caller decides when to synchronise
+// (ms_cuda_sync) or download. This is what lets a chain of layers run with the
+// copy-free on-device throughput.
+//
+// Uses the identical column-major transpose trick as ms_cuda_sgemm: we compute
+// (column-major) C_cm[N,M] = B_cm[N,K] * A_cm[K,M] with both ops OP_N, which
+// lands the bytes as row-major C[M,N]. Returns 0 on success.
+int ms_cuda_sgemm_dev(void* dA_void, void* dB_void, void* dC_void,
+                      int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0 || !dA_void || !dB_void || !dC_void) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sgemm_dev: bad args "
+                        "(M=%d N=%d K=%d)\n", M, N, K);
+        return -1;
+    }
+    cublasHandle_t handle = ms_get_handle();
+    if (!handle) return -2;
+
+    const float* dA = (const float*)dA_void;
+    const float* dB = (const float*)dB_void;
+    float*       dC = (float*)dC_void;
+    const float alpha = 1.0f, beta = 0.0f;
+
+    cublasStatus_t s =
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    N, M, K, &alpha,
+                    dB, N,      // first operand = our B (weights), lda = N
+                    dA, K,      // second operand = our A (acts),    ldb = K
+                    &beta,
+                    dC, N);     // output = our C,                   ldc = N
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[ms_cuda] ms_cuda_sgemm_dev: cublas status %d\n",
+                (int)s);
+        return (int)s;
+    }
+    return 0;
+}
+
+// Block until all enqueued device work on our stream has completed. Returns 0
+// on success. Use after a batch of ms_cuda_sgemm_dev calls before timing or
+// before reading results another way.
+int ms_cuda_sync(void) {
+    cudaError_t e = ms_sync();
+    return (e == cudaSuccess) ? 0 : (int)e;
 }
 
 // Optional: release the cached handle (e.g. on shutdown). Idempotent.
@@ -258,6 +400,10 @@ void ms_cuda_shutdown(void) {
     if (g_handle) {
         cublasDestroy(g_handle);
         g_handle = nullptr;
+    }
+    if (g_stream) {
+        cudaStreamDestroy(g_stream);
+        g_stream = nullptr;
     }
 }
 

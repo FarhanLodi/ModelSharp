@@ -45,6 +45,8 @@ internal static class Program
         Console.WriteLine("(GFLOP/s = 2*M*N*K / median-time. Both paths multi-threaded; set OMP_NUM_THREADS to vary native.)");
 
         VerifyWiring();
+
+        CudaBench.Run();
     }
 
     // Proves the engine seam routes to native: with NativeGemm.Enabled, BlockedGemm.Multiply

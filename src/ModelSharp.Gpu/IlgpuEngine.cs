@@ -1776,6 +1776,18 @@ public sealed class IlgpuEngine : IExecutionEngine
 
         // K==0 (a contraction over an empty past) still produces a well-defined all-zero output: the kernel
         // runs (total>0) and its inner k-loop executes zero times, so every output element is written as 0.
+        //
+        // cuBLAS seam (DEFERRED — see NativeCuda integration note below). We tried routing the single
+        // un-batched MatMul through NativeCuda.Sgemm (host copy-in/out) under MODELSHARP_CUBLAS=1. Small
+        // shapes matched, but a 1024x1024x1024 MatMul came back with a DETERMINISTIC zero region
+        // (e.g. y[468031]=0 vs cpu 2.617). Root cause: this engine's ILGPU accelerator owns a driver-API
+        // CUDA context that is current on the calling thread, while libms_cuda.so / cuBLAS use the
+        // runtime-API primary context; cuBLAS's internal device staging allocations land in the wrong
+        // context, so the host copy-in/out is NOT context-safe while an ILGPU context is live. The binding
+        // is proven correct standalone (bench: 9.5e-7 rel err, up to 8.2 TFLOP/s copy-in/out, 54.8 TFLOP/s
+        // resident prefill). Safe integration requires pushing the cuBLAS primary context current (and
+        // popping ILGPU's) around the call, or keeping the operand resident on the cuBLAS side end-to-end.
+        // Until that is implemented and verified, the ILGPU dot-product kernel stays the only MatMul path.
         if (total > 0) _matmul(total, a.View, b.View, y.View, vAOff, vBOff, M, K, N);
         values[node.Outputs[0]] = DeviceValue.Device(y, new TensorShape(outDims.ToArray()));
     }

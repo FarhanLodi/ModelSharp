@@ -9,8 +9,10 @@ A cuBLAS-backed SGEMM for ModelSharp's GEMM hot path, targeting the
 > - `build/libms_cuda.so` builds cleanly with `make -f Makefile.cuda`.
 > - Correctness verified vs a CPU triple-loop reference for 64³, 256×384×500,
 >   and 1024³ (relative error ≤ 4.1e-7, threshold 1e-3) — **all PASS**.
-> - Benchmarked for 1024³ / 2048³ / 4096³, copy-inclusive and compute-only —
->   see the table in §7. Peak compute-only ≈ **60 TFLOP/s** (fp32).
+> - Benchmarked for 1024³ / 2048³ / 4096³ (copy-inclusive + compute-only) and
+>   for the device-resident DECODE / PREFILL / chained paths — see §7. Peak
+>   ≈ **61 TFLOP/s** (fp32); resident prefill **55.7 TFLOP/s**; per-token decode
+>   **0.070 ms/GEMM** (≈56× faster than copy-in/out).
 >
 > Standalone harness: `test/cublas_test.cu`.
 
@@ -144,18 +146,39 @@ const char* ms_cuda_device_name(void);            // e.g. "NVIDIA GeForce RTX 40
 void        ms_cuda_sgemm(const float* A, const float* B, float* C,
                           int M, int N, int K);    // row-major C=A*B (copy in/out)
 
-// Optional resident-B helpers (avoid re-uploading a reused weight matrix):
-void*       ms_cuda_upload(const float* host, int rows, int cols);
+// Resident-B helper (avoid re-uploading a reused weight matrix; A in / C out):
+void*       ms_cuda_upload(const float* host, int rows, int cols); // -> dev buf
 void        ms_cuda_free(void* dev);
 void        ms_cuda_sgemm_with_resident_b(const float* A, void* dB, float* C,
                                           int M, int N, int K);
-void        ms_cuda_shutdown(void);               // release cached handle
+void        ms_cuda_shutdown(void);               // release handle + stream
+
+// Fully device-resident API (the LLM weight-reuse path — NO implicit copies):
+void*       ms_cuda_alloc(size_t n);              // uninit device buffer of n floats
+int         ms_cuda_upload_into(void* dev, const float* host, size_t n); // refresh in place
+int         ms_cuda_download(void* dev, float* host, size_t n);          // dev -> host
+int         ms_cuda_sgemm_dev(void* dA, void* dB, void* dC,
+                              int M, int N, int K); // C=A*B, all device ptrs, enqueue only
+int         ms_cuda_sync(void);                   // wait for the stream
 ```
 
-The cuBLAS handle is created once and cached. The simple `ms_cuda_sgemm`
-allocates device buffers, copies A/B host→device, runs the GEMM, copies C
-device→host, and frees — the must-have path. CUDA and cuBLAS status codes are
-checked; failures print to `stderr` and clean up.
+The cuBLAS handle is created once and cached, and a dedicated non-blocking CUDA
+stream is bound to it; all copies and GEMMs run on that stream and a single
+`ms_cuda_sync()` waits for a whole batch. The simple `ms_cuda_sgemm` allocates
+device buffers, copies A/B host→device, runs the GEMM, copies C device→host,
+and frees — the must-have path.
+
+**Device-resident pattern (what LLM inference should use):** upload each weight
+**once** with `ms_cuda_upload`, allocate activation/output buffers once with
+`ms_cuda_alloc`, then call `ms_cuda_sgemm_dev` (raw device pointers, no
+`cudaMalloc`/`cudaFree`, no PCIe copies — it just enqueues the kernel on the
+stream). Chain many GEMMs/layers this way and `ms_cuda_sync()` / `ms_cuda_download`
+only at the end. The same column-major `Cᵀ=Bᵀ·Aᵀ` trick is used, so `dA` is the
+row-major activation `[M,K]`, `dB` the weight `[K,N]`, `dC` the output `[M,N]`.
+
+CUDA and cuBLAS status codes are checked everywhere; failures print to `stderr`,
+clean up, and return non-zero (device-resident calls) or leave `C` untouched.
+`ms_cuda_shutdown` destroys both the handle and the stream (no leaks).
 
 ---
 
@@ -232,28 +255,61 @@ Square `N×N×N` SGEMM, FLOPs = `2·N³`:
 
 | Shape   | Copy-inclusive (H2D+GEMM+D2H) | Compute-only (A/B/C resident, kernel only) |
 |---------|-------------------------------|--------------------------------------------|
-| 1024³   | ~1.8–1.9 TFLOP/s (~1.1 ms)    | ~38 TFLOP/s (~0.06 ms)                      |
-| 2048³   | ~2.5–4.6 TFLOP/s (~3.8–6.9 ms)| ~60 TFLOP/s (~0.29 ms)  ← peak             |
-| 4096³   | ~7.6–8.1 TFLOP/s (~17 ms)     | ~50–56 TFLOP/s (~2.5 ms)                    |
+| 1024³   | 2.0 TFLOP/s (1.07 ms)         | 38 TFLOP/s (0.06 ms)                        |
+| 2048³   | 4.6 TFLOP/s (3.71 ms)         | 60 TFLOP/s (0.29 ms)  ← peak               |
+| 4096³   | 7.9 TFLOP/s (17.4 ms)         | 56 TFLOP/s (2.46 ms)                        |
 
-Correctness: relative error vs CPU reference ≤ **4.1e-7** for all tested shapes
-(threshold 1e-3) — all PASS.
+### Device-resident path (the numbers that matter for LLM inference)
+
+Weight `[K,N]=[4096,4096]` uploaded **once**, activations + output kept on
+device, only the final result downloaded — via the new `ms_cuda_alloc` /
+`ms_cuda_upload` / `ms_cuda_sgemm_dev` / `ms_cuda_sync` / `ms_cuda_download` API.
+
+| Scenario                         | Shape (M×K×N)   | Latency / GEMM | Throughput   |
+|----------------------------------|-----------------|----------------|--------------|
+| **DECODE** (greedy, M=1)         | 1×4096×4096     | **0.070 ms**   | 0.48 TFLOP/s |
+| **DECODE** (small batch, M=8)    | 8×4096×4096     | **0.045 ms**   | 5.95 TFLOP/s |
+| **PREFILL** (M=512)              | 512×4096×4096   | **0.309 ms**   | 55.7 TFLOP/s |
+
+Fully-device chained GEMM (no H2D/D2H at all — the copy-free ceiling):
+
+| Shape   | chain | Latency / GEMM | Throughput      |
+|---------|-------|----------------|-----------------|
+| 1024³   | 16    | 0.066 ms       | 32.3 TFLOP/s    |
+| 2048³   | 8     | 0.282 ms       | 61.0 TFLOP/s    |
+| 4096³   | 8     | 2.831 ms       | 48.6 TFLOP/s    |
+
+Correctness: relative error vs CPU reference ≤ **4.1e-7** for all tested shapes,
+including the new device-pointer path (`ms_cuda_sgemm_dev`) at M=1/8/512
+(threshold 1e-3) — **all PASS**.
+
+### Realistic LLM weight-reuse speedup
+
+For per-token decode the copy-in/out path re-uploads the 64 MB weight on every
+call (~3.96 ms/GEMM, PCIe-bound); the resident path runs at **0.070 ms/GEMM**:
+
+> **≈ 56× faster per decode step** with resident weights vs. copy-in/out, and
+> **≈ 64× faster than the ~1.1 TFLOP/s CPU kernel** at the M=512 prefill GEMM
+> (55.7 vs ~1.1 TFLOP/s). Decode is latency- (kernel-launch-) bound by the tiny
+> M=1 GEMM, not bandwidth, so the win there is the eliminated PCIe transfer.
 
 Notes:
 
-- The **compute-only** numbers are the real cuBLAS kernel ceiling (~60 TFLOP/s
-  fp32 peak at 2048³, settling to ~50–56 TFLOP/s at 4096³ — typical cuBLAS fp32
-  on Ada; TF32 mode would be far higher again).
+- The **compute-only** / **chain-dev** numbers are the real cuBLAS kernel
+  ceiling (~60 TFLOP/s fp32 peak at 2048³, ~48–56 TFLOP/s at 4096³ — typical
+  cuBLAS fp32 on Ada; TF32 mode would be far higher again). The chained
+  device-pointer path (`ms_cuda_sgemm_dev`, single sync, zero copies) realises
+  this ceiling, confirming the resident API has no per-call overhead beyond the
+  kernel itself.
 - The **copy-inclusive** `ms_cuda_sgemm` pays PCIe transfer **plus a per-call
   `cudaMalloc`/`cudaFree`** of all three buffers every invocation, which
-  dominates and makes these numbers noisy run-to-run (e.g. 2048³ varied
-  3.8–6.9 ms). For reused weights use `ms_cuda_upload` +
-  `ms_cuda_sgemm_with_resident_b`, or add a persistent buffer pool / streams to
-  approach the compute-only ceiling.
+  dominates. For reused weights use the device-resident API (upload once,
+  `ms_cuda_sgemm_dev`, download once); it reaches the prefill throughput above
+  and the decode latency above.
 - **vs the CPU native kernel** (`libms_kernels.so` `ms_sgemm_f32`, ~1.1
-  TFLOP/s): the compute-only cuBLAS path is **~35–55× faster** (≈54× at the
-  2048³ peak); even the naive copy-inclusive path is **~1.6–7×** faster, with
-  the gap widening as the matrix grows and PCIe/alloc overhead amortizes.
+  TFLOP/s): the resident prefill path is **~50× faster**, the compute-only/
+  chained ceiling **~35–55× faster**; even the naive copy-inclusive path is
+  **~1.6–7×** faster, with the gap widening as the matrix grows.
 - **vs the ILGPU path** (`src/ModelSharp.Gpu`, which JIT-compiles generic C#
   kernels at runtime): cuBLAS is vendor-tuned hand-optimized SGEMM and is
   expected to be far faster than an ILGPU-generated GEMM kernel for raw
