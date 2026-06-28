@@ -78,6 +78,18 @@ public sealed class MatMulKernel : IKernel
         float[] bArr = KernelSimd.Array(b);
         float[] yArr = KernelSimd.Array(y);
 
+        // Single-matrix case (the hot LLM projection/MLP GEMM): try the native AVX-512 kernel,
+        // which threads internally. Batched cases keep the managed tiled path (it parallelizes
+        // across batch×tiles, and per-batch attention matrices are small). Falls back when native
+        // is unavailable/disabled.
+        if (totalBatch == 1 &&
+            Native.NativeGemm.TryMultiply(aArr, aOffOf[0] * aMat, K, bArr, bOffOf[0] * bMat, N,
+                                          yArr, 0, N, M, N, K))
+        {
+            ctx.Set(node.Outputs[0], y);
+            return;
+        }
+
         // Parallelize over the flattened (batch × MR-row-tile × NR-col-tile) grid of disjoint
         // output tiles; each tile streams A[mr,K] / B[K,ncols] and writes Y[mr,ncols].
         int nr = BlockedGemm.NR;

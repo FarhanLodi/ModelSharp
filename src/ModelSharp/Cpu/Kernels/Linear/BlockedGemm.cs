@@ -52,6 +52,13 @@ internal static class BlockedGemm
         int M, int N, int K)
     {
         if (M <= 0 || N <= 0) return;
+
+        // Optional native AVX-512 fast path (libms_kernels.so). Falls through to the managed
+        // kernel below when unavailable/disabled, strided, or too small. Used by the conv 1×1 /
+        // im2col GEMM and any other full-matrix caller.
+        if (Native.NativeGemm.TryMultiply(a, aOff, lda, b, bOff, ldb, y, yOff, ldc, M, N, K))
+            return;
+
         int nr = NR;
         int nTiles = (N + nr - 1) / nr;
         int mTiles = (M + MR - 1) / MR;

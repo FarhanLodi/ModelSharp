@@ -20,6 +20,11 @@ coverage*.xml
 artifacts/
 *.nupkg
 
+## Native kernel build output (object files + shared libs)
+native/build/
+*.o
+*.so
+
 ## Large model fixtures (opt-in integration tests download these)
 tests/ModelSharp.Tests/assets/models/
 

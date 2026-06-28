@@ -1,0 +1,35 @@
+# ModelSharp CUDA / cuBLAS GEMM build.
+#
+#   make -f Makefile.cuda          -> build/libms_cuda.so  (the GPU GEMM .so)
+#   make -f Makefile.cuda clean
+#
+# ============================== UNTESTED ====================================
+# This has NOT been built. The build host has the NVIDIA driver only; the CUDA
+# toolkit (nvcc, cuBLAS) is NOT installed, so `make -f Makefile.cuda` will fail
+# here with "nvcc: command not found". Install the CUDA toolkit first — see
+# GPU.md — then run this on a CUDA-enabled machine.
+# ============================================================================
+#
+# -arch=sm_89 targets Ada Lovelace (RTX 4090). Adjust for other GPUs:
+#   sm_80 = A100, sm_86 = RTX 30xx, sm_90 = H100.
+
+NVCC     ?= nvcc
+ARCH     ?= sm_89
+NVCCFLAGS?= -O3 -arch=$(ARCH) -Xcompiler -fPIC
+LDLIBS   ?= -lcublas -lcudart
+
+SRC      := src/cublas_gemm.cu
+LIB      := build/libms_cuda.so
+
+.PHONY: all clean
+all: $(LIB)
+
+$(LIB): $(SRC) | build
+	$(NVCC) $(NVCCFLAGS) --shared -o $@ $(SRC) $(LDLIBS)
+	@echo "built $@"
+
+build:
+	@mkdir -p build
+
+clean:
+	rm -f $(LIB)
