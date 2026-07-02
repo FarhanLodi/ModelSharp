@@ -84,6 +84,22 @@ public sealed class IlgpuEngine : IExecutionEngine
     /// <summary>Device-resident initializer buffers, keyed by initializer name (see <see cref="CacheWeights"/>).</summary>
     private readonly Dictionary<string, DeviceValue> _weightCache = new();
 
+    /// <summary>
+    /// Device-resident buffers for the <em>quantized</em> weight operands (packed INT4/INT8 <c>B</c>, its
+    /// per-block <c>scales</c>, packed/folded <c>zero_points</c>) that <see cref="RunMatMulNBits"/> and
+    /// <see cref="RunMatMulInteger"/> would otherwise re-widen and re-upload on <b>every</b> Run/decode step.
+    /// These operands are graph <b>initializers</b> (immutable), so — exactly like the float32 <see cref="_weightCache"/> —
+    /// they are uploaded once and reused across Runs, protected from the per-Run dispose and freed in <see cref="Dispose"/>.
+    /// The key is derived from the initializer name plus a role suffix (a single initializer can back both a
+    /// widened-int32 and a folded-B′ buffer). Runtime-produced activations (e.g. a
+    /// <c>DynamicQuantizeLinear</c>→<c>MatMulInteger</c> operand) are NOT initializers, so they are never cached here
+    /// and still upload per-Run. Gated by <see cref="CacheWeights"/>.
+    /// </summary>
+    private readonly Dictionary<string, MemoryBuffer> _quantWeightCache = new();
+
+    /// <summary>Names of the graph initializers (immutable weights) — the only tensors eligible for residency.</summary>
+    private readonly HashSet<string> _initializerNames;
+
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _add;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _sub;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>> _mul;
@@ -188,6 +204,7 @@ public sealed class IlgpuEngine : IExecutionEngine
     public IlgpuEngine(ModelGraph graph, bool preferCpu = false)
     {
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
+        _initializerNames = new HashSet<string>(graph.Initializers.Keys, StringComparer.Ordinal);
         // EnableAlgorithms() registers ILGPU.Algorithms' intrinsic implementations (ExpF/TanhF/SqrtF/…)
         // for the *hardware* backends. Without it the PTX/CUDA backend has no intrinsic for these
         // transcendental MathF calls and throws at JIT time ("'ExpF' does not have an intrinsic
@@ -1878,11 +1895,17 @@ public sealed class IlgpuEngine : IExecutionEngine
         Dictionary<string, DeviceValue> values,
         List<MemoryBuffer> temps)
     {
-        Tensor aT = values[node.Inputs[0]].ToHost();
-        Tensor bT = values[node.Inputs[1]].ToHost();
+        string aName = node.Inputs[0];
+        string bName = node.Inputs[1];
+        Tensor aT = values[aName].ToHost();
+        Tensor bT = values[bName].ToHost();
 
-        int[] a = ReadQuantAsInts(aT);
-        int[] b = ReadQuantAsInts(bT);
+        // Widen lazily: B (and, when it is an initializer, A) are made device-resident across Runs, so the packed→int32
+        // widening is done only on a cache miss (see the ResidentOrTempInt calls below). We still need widened host
+        // copies for the host-side zero-point fold on the tiled path; those are materialized just-in-time there.
+        int[]? aCache = null, bCache = null;
+        int[] AWidened() => aCache ??= ReadQuantAsInts(aT);
+        int[] BWidened() => bCache ??= ReadQuantAsInts(bT);
 
         int[] adims = aT.Shape.Dimensions.ToArray();
         int[] bdims = bT.Shape.Dimensions.ToArray();
@@ -1960,14 +1983,15 @@ public sealed class IlgpuEngine : IExecutionEngine
             int bZpStride = bZpPerCol ? 1 : 0;
             int[] aZpBuf = aZpStride == 1 ? aZp : new[] { aZpScalar };
             int[] bZpBuf = bZpStride == 1 ? bZp : new[] { bZpScalar };
-            MemoryBuffer1D<int, Stride1D.Dense> aRaw = _accelerator.Allocate1D(a.Length == 0 ? new[] { 0 } : a);
-            MemoryBuffer1D<int, Stride1D.Dense> bRaw = _accelerator.Allocate1D(b.Length == 0 ? new[] { 0 } : b);
-            temps.Add(aRaw); temps.Add(bRaw);
+            // Raw operands: the packed weight B (and A, if it is an initializer) stay device-resident across Runs; the
+            // zero points are subtracted inside the kernel, so the raw buffer is stable regardless of zero-point origin.
+            ArrayView<int> aRaw = ResidentOrTempInt(aName, "matint.raw", AWidened, temps);
+            ArrayView<int> bRaw = ResidentOrTempInt(bName, "matint.raw", BWidened, temps);
             ArrayView<int> vAOffN = Upload(aOffArr, temps);
             ArrayView<int> vBOffN = Upload(bOffArr, temps);
             ArrayView<int> vAZp = Upload(aZpBuf, temps);
             ArrayView<int> vBZp = Upload(bZpBuf, temps);
-            _matmulInteger(total, aRaw.View, bRaw.View, yBuf.View, vAOffN, vBOffN, vAZp, vBZp,
+            _matmulInteger(total, aRaw, bRaw, yBuf.View, vAOffN, vBOffN, vAZp, vBZp,
                 aZpStride, bZpStride, M, K, N);
             _accelerator.Synchronize();
             int[] yNaive = yBuf.GetAsArray1D();
@@ -1979,33 +2003,55 @@ public sealed class IlgpuEngine : IExecutionEngine
         // GEMM then multiplies/accumulates plain int32 — bit-identical to the naïve kernel's (A−az)·(B−bz) int32 fold
         // (and to the CPU reference for in-range models), but with shared-memory blocking. Per-row A / per-column B
         // zero points fold in here (a_zp indexes the A row m; b_zp indexes the B column n).
-        var aPrime = new int[a.Length == 0 ? 1 : a.Length];
-        for (int bi = 0; bi < totalBatch; bi++)
+        //
+        // The folded A′/B′ can be kept device-resident across Runs ONLY when the operand and its zero point are both
+        // stable graph initializers (so the fold result is identical every Run). B (the weight) with a stable/absent
+        // b_zp is the common quantized-LLM case; A is usually a runtime DynamicQuantizeLinear activation, so its fold
+        // stays per-Run. ResidentOrTempInt gates on the operand name; we additionally require the zero point to be
+        // stable before treating the fold as cacheable.
+        bool aZpStable = ZeroPointStable(node, 2);
+        bool bZpStable = ZeroPointStable(node, 3);
+        // If the zero point is NOT a stable initializer we must not cache the fold under the operand's name; pass a
+        // null name so ResidentOrTempInt uploads a fresh per-Run buffer instead.
+        string? aFoldName = aZpStable ? aName : null;
+        string? bFoldName = bZpStable ? bName : null;
+
+        int[] AFold()
         {
-            int aBase = aOffArr[bi];
-            for (int m = 0; m < M; m++)
+            int[] a = AWidened();
+            var aPrime = new int[a.Length == 0 ? 1 : a.Length];
+            for (int bi = 0; bi < totalBatch; bi++)
             {
-                int az = aZpPerRow ? aZp[m] : aZpScalar;
-                int row = aBase + m * K;
-                for (int kk = 0; kk < K; kk++) aPrime[row + kk] = a[row + kk] - az;
+                int aBase = aOffArr[bi];
+                for (int m = 0; m < M; m++)
+                {
+                    int az = aZpPerRow ? aZp[m] : aZpScalar;
+                    int row = aBase + m * K;
+                    for (int kk = 0; kk < K; kk++) aPrime[row + kk] = a[row + kk] - az;
+                }
             }
+            return aPrime;
         }
-        var bPrime = new int[b.Length == 0 ? 1 : b.Length];
-        for (int bi = 0; bi < totalBatch; bi++)
+        int[] BFold()
         {
-            int bBase = bOffArr[bi];
-            for (int kk = 0; kk < K; kk++)
-            for (int nn = 0; nn < N; nn++)
+            int[] b = BWidened();
+            var bPrime = new int[b.Length == 0 ? 1 : b.Length];
+            for (int bi = 0; bi < totalBatch; bi++)
             {
-                int bz = bZpPerCol ? bZp[nn] : bZpScalar;
-                int pos = bBase + kk * N + nn;
-                bPrime[pos] = b[pos] - bz;
+                int bBase = bOffArr[bi];
+                for (int kk = 0; kk < K; kk++)
+                for (int nn = 0; nn < N; nn++)
+                {
+                    int bz = bZpPerCol ? bZp[nn] : bZpScalar;
+                    int pos = bBase + kk * N + nn;
+                    bPrime[pos] = b[pos] - bz;
+                }
             }
+            return bPrime;
         }
 
-        MemoryBuffer1D<int, Stride1D.Dense> aBuf = _accelerator.Allocate1D(aPrime);
-        MemoryBuffer1D<int, Stride1D.Dense> bBuf = _accelerator.Allocate1D(bPrime);
-        temps.Add(aBuf); temps.Add(bBuf);
+        ArrayView<int> aBuf = ResidentOrTempInt(aFoldName, "matint.prime", AFold, temps);
+        ArrayView<int> bBuf = ResidentOrTempInt(bFoldName, "matint.prime", BFold, temps);
 
         // One grouped launch per (broadcast-resolved) batch: a 2-D grid of IntTile×IntTile thread groups, one group
         // per M×N output tile. Each batch's operand/result base offsets (element units) are passed as scalars.
@@ -2014,7 +2060,7 @@ public sealed class IlgpuEngine : IExecutionEngine
         int gridY = (M + tile - 1) / tile;
         var config = new KernelConfig(new Index2D(gridX, gridY), new Index2D(tile, tile));
         for (int bi = 0; bi < totalBatch; bi++)
-            _matmulIntegerTiled(config, aBuf.View, bBuf.View, yBuf.View, aOffArr[bi], bOffArr[bi], bi * oMat, M, K, N);
+            _matmulIntegerTiled(config, aBuf, bBuf, yBuf.View, aOffArr[bi], bOffArr[bi], bi * oMat, M, K, N);
         _accelerator.Synchronize();
 
         int[] yHost = yBuf.GetAsArray1D();
@@ -2104,46 +2150,50 @@ public sealed class IlgpuEngine : IExecutionEngine
         int M = 1;
         for (int i = 0; i < aDims.Length - 1; i++) M *= aDims[i];
 
-        // Packed quantized B (uint8/int8/int32 host tensor) widened to one int per byte for the device.
-        int[] b = ReadQuantAsInts(values[node.Inputs[1]].ToHost());
+        // B, scales and zero_points are graph INITIALIZERS (immutable). Rather than re-widen and re-upload the packed
+        // B (4× inflated to int32) plus scales/zero-points on every decode step, we keep them device-resident across
+        // Runs via ResidentOrTempInt/Float keyed by initializer name (see _quantWeightCache). The widen factory runs
+        // only on a cache miss; validation below uses the host tensors' element counts, so it stays a per-Run check
+        // (cheap, no widening) even when the device buffer is already resident.
+        string bName = node.Inputs[1];
+        Tensor bT = values[bName].ToHost();
         long expectedB = (long)N * nBlocksPerRow * blobSize;
-        if (b.LongLength != expectedB)
+        if (bT.Length != expectedB)
             throw new ModelSharpException(
-                $"MatMulNBits B has {b.LongLength} elements; expected {expectedB} "
+                $"MatMulNBits B has {bT.Length} elements; expected {expectedB} "
                 + $"(N={N} × n_blocks_per_row={nBlocksPerRow} × blob_size={blobSize}).");
 
         // scales: float [N · nBlocksPerRow], on the device.
-        Tensor scalesT = values[node.Inputs[2]].ToHost();
-        float[] scales = scalesT.AsFloat().Span.ToArray();
+        string scName = node.Inputs[2];
+        Tensor scalesT = values[scName].ToHost();
         long expectedScales = (long)N * nBlocksPerRow;
-        if (scales.LongLength != expectedScales)
+        if (scalesT.Length != expectedScales)
             throw new ModelSharpException(
-                $"MatMulNBits scales has {scales.LongLength} elements; expected {expectedScales}.");
+                $"MatMulNBits scales has {scalesT.Length} elements; expected {expectedScales}.");
 
         // zero_points (optional): float per-(row,block), packed n-bit, or absent (default symmetric).
         int zpMode = 0;                       // 0=default, 1=float, 2=packed
-        float[] zpFloat = { 0f };             // sentinel 1-element buffers when unused.
-        int[] zpPacked = { 0 };
+        string? zpName = null;
+        Tensor? zpT = null;
         bool hasZp = node.Inputs.Count > 3 && !string.IsNullOrEmpty(node.Inputs[3])
                      && values.ContainsKey(node.Inputs[3]);
         if (hasZp)
         {
-            Tensor zpT = values[node.Inputs[3]].ToHost();
+            zpName = node.Inputs[3];
+            zpT = values[zpName].ToHost();
             if (zpT.Dtype == ElementType.Float32)
             {
-                zpFloat = zpT.AsFloat().Span.ToArray();
-                if (zpFloat.LongLength != expectedScales)
+                if (zpT.Length != expectedScales)
                     throw new ModelSharpException(
-                        $"MatMulNBits float zero_points has {zpFloat.LongLength} elements; expected {expectedScales}.");
+                        $"MatMulNBits float zero_points has {zpT.Length} elements; expected {expectedScales}.");
                 zpMode = 1;
             }
             else
             {
-                zpPacked = ReadQuantAsInts(zpT);
                 long expectedZp = (long)N * zpRowBytes;
-                if (zpPacked.LongLength != expectedZp)
+                if (zpT.Length != expectedZp)
                     throw new ModelSharpException(
-                        $"MatMulNBits packed zero_points has {zpPacked.LongLength} bytes; "
+                        $"MatMulNBits packed zero_points has {zpT.Length} bytes; "
                         + $"expected {expectedZp} (N={N} × {zpRowBytes}).");
                 zpMode = 2;
             }
@@ -2168,13 +2218,17 @@ public sealed class IlgpuEngine : IExecutionEngine
         MemoryBuffer1D<float, Stride1D.Dense> y = AllocFloat(total);
         if (total > 0)
         {
-            MemoryBuffer1D<int, Stride1D.Dense> bDev = _accelerator.Allocate1D(b.Length == 0 ? new[] { 0 } : b);
-            MemoryBuffer1D<float, Stride1D.Dense> scDev = _accelerator.Allocate1D(scales);
-            MemoryBuffer1D<float, Stride1D.Dense> zpfDev = _accelerator.Allocate1D(zpFloat);
-            MemoryBuffer1D<int, Stride1D.Dense> zppDev = _accelerator.Allocate1D(zpPacked);
-            temps.Add(bDev); temps.Add(scDev); temps.Add(zpfDev); temps.Add(zppDev);
+            // Packed B widened to one int per byte; scales/zero-points as-is. Resident when they are initializers.
+            ArrayView<int> bDev = ResidentOrTempInt(bName, "nbits.b", () => ReadQuantAsInts(bT), temps);
+            ArrayView<float> scDev = ResidentOrTempFloat(scName, "nbits.scales", () => scalesT.AsFloat().Span.ToArray(), temps);
+            ArrayView<float> zpfDev = zpMode == 1
+                ? ResidentOrTempFloat(zpName, "nbits.zpf", () => zpT!.AsFloat().Span.ToArray(), temps)
+                : ResidentOrTempFloat(null, "nbits.zpf", () => new[] { 0f }, temps);
+            ArrayView<int> zppDev = zpMode == 2
+                ? ResidentOrTempInt(zpName, "nbits.zpp", () => ReadQuantAsInts(zpT!), temps)
+                : ResidentOrTempInt(null, "nbits.zpp", () => new[] { 0 }, temps);
             var p = new MatMulNBitsParams(M, K, N, bits, blockSize, nBlocksPerRow, blobSize, zpRowBytes, zpMode);
-            _matmulNBits(total, aBuf.View, bDev.View, scDev.View, zpfDev.View, zppDev.View, y.View, p);
+            _matmulNBits(total, aBuf.View, bDev, scDev, zpfDev, zppDev, y.View, p);
         }
         values[node.Outputs[0]] = DeviceValue.Device(y, outShape);
     }
@@ -3311,6 +3365,69 @@ public sealed class IlgpuEngine : IExecutionEngine
         return buf.View;
     }
 
+    /// <summary>Whether <paramref name="name"/> names a stable graph initializer eligible for cross-Run residency.</summary>
+    private bool CanCacheQuant(string name)
+        => CacheWeights && !string.IsNullOrEmpty(name) && _initializerNames.Contains(name);
+
+    /// <summary>
+    /// Whether the optional zero-point at <paramref name="inputIndex"/> is stable across Runs: absent/omitted, or a
+    /// graph initializer. A runtime-produced zero point (e.g. from <c>DynamicQuantizeLinear</c>) is NOT stable, so a
+    /// zero-point-folded operand built from it must not be cached under the operand's initializer name.
+    /// </summary>
+    private bool ZeroPointStable(GraphNode node, int inputIndex)
+    {
+        if (node.Inputs.Count <= inputIndex) return true;             // absent → constant (0) fold, stable.
+        string name = node.Inputs[inputIndex];
+        if (string.IsNullOrEmpty(name)) return true;                  // omitted slot → stable.
+        return _initializerNames.Contains(name);
+    }
+
+    /// <summary>
+    /// Returns a device <c>int</c> buffer for a quantized weight operand, uploading <paramref name="data"/> once and
+    /// keeping it resident across Runs when <paramref name="name"/> is a stable initializer (keyed by
+    /// <paramref name="name"/>+<paramref name="role"/> in <see cref="_quantWeightCache"/>, freed only in
+    /// <see cref="Dispose"/>). Otherwise it uploads into <paramref name="temps"/> as a per-Run buffer. The
+    /// <paramref name="data"/> factory is invoked only on a cache miss, so a resident weight never re-widens per Run.
+    /// </summary>
+    private ArrayView<int> ResidentOrTempInt(string? name, string role, Func<int[]> data, List<MemoryBuffer> temps)
+    {
+        if (name is not null && CanCacheQuant(name))
+        {
+            string key = name + " " + role;
+            if (!_quantWeightCache.TryGetValue(key, out MemoryBuffer? buf))
+            {
+                int[] arr = data();
+                buf = _accelerator.Allocate1D(arr.Length == 0 ? new[] { 0 } : arr);
+                _quantWeightCache[key] = buf;
+            }
+            return ((MemoryBuffer1D<int, Stride1D.Dense>)buf).View;
+        }
+        int[] hostArr = data();
+        var t = _accelerator.Allocate1D(hostArr.Length == 0 ? new[] { 0 } : hostArr);
+        temps.Add(t);
+        return t.View;
+    }
+
+    /// <summary>Float sibling of <see cref="ResidentOrTempInt"/>: resident device float buffer for a stable initializer, else per-Run.</summary>
+    private ArrayView<float> ResidentOrTempFloat(string? name, string role, Func<float[]> data, List<MemoryBuffer> temps)
+    {
+        if (name is not null && CanCacheQuant(name))
+        {
+            string key = name + " " + role;
+            if (!_quantWeightCache.TryGetValue(key, out MemoryBuffer? buf))
+            {
+                float[] arr = data();
+                buf = _accelerator.Allocate1D(arr.Length == 0 ? new[] { 0f } : arr);
+                _quantWeightCache[key] = buf;
+            }
+            return ((MemoryBuffer1D<float, Stride1D.Dense>)buf).View;
+        }
+        float[] hostArr = data();
+        var t = _accelerator.Allocate1D(hostArr.Length == 0 ? new[] { 0f } : hostArr);
+        temps.Add(t);
+        return t.View;
+    }
+
     // --- Host-side row-major shape/stride and broadcasting math (mirrors the CPU Nd helpers) ---
 
     /// <summary>Row-major strides for a shape.</summary>
@@ -3452,6 +3569,9 @@ public sealed class IlgpuEngine : IExecutionEngine
         // We assemble a contiguous Kᵀ per head on the device via Transpose, then MatMul, Softmax, MatMul with V.
         var ctxHost = new float[(long)H * stepLen * D];
         var temps = new List<MemoryBuffer>();
+        // Per-head context buffers, kept resident until a single post-loop Synchronize so we sync ONCE for all H heads
+        // (was H syncs + H piecemeal downloads). Same math, same result — just one device→host boundary crossing.
+        var ctxBufs = new MemoryBuffer1D<float, Stride1D.Dense>[H];
         try
         {
             for (int h = 0; h < H; h++)
@@ -3503,9 +3623,14 @@ public sealed class IlgpuEngine : IExecutionEngine
                 MemoryBuffer1D<float, Stride1D.Dense> ctx = _accelerator.Allocate1D<float>((long)stepLen * D);
                 temps.Add(ctx);
                 _matmul(stepLen * D, attn.View, vH, ctx.View, z0, z0, stepLen, total, D);
+                ctxBufs[h] = ctx;   // download after the loop, past a single Synchronize.
+            }
 
-                _accelerator.Synchronize();
-                float[] ctxArr = ctx.GetAsArray1D();
+            // Single sync for the whole head loop, then download each head's context.
+            _accelerator.Synchronize();
+            for (int h = 0; h < H; h++)
+            {
+                float[] ctxArr = ctxBufs[h].GetAsArray1D();
                 Array.Copy(ctxArr, 0, ctxHost, (long)h * stepLen * D, (long)stepLen * D);
             }
         }
@@ -3804,6 +3929,10 @@ public sealed class IlgpuEngine : IExecutionEngine
         foreach (DeviceValue w in _weightCache.Values)
             w.FloatBuf?.Dispose();
         _weightCache.Clear();
+        // Same for the resident quantized-weight buffers (packed B / scales / zero-points / folded B′).
+        foreach (MemoryBuffer q in _quantWeightCache.Values)
+            q.Dispose();
+        _quantWeightCache.Clear();
         // Drop the cuBLAS handle cached for this accelerator's CUDA context BEFORE the context is destroyed,
         // so a later accelerator that reuses the same context pointer can't pick up a stale handle.
         if (IsHardwareGpu && NativeCuda.Available)
