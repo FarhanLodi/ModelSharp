@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Cpu.Kernels.Linear;
+using ModelSharp.Cpu.Kernels.Llm;
 using ModelSharp.Graph;
 using ModelSharp.Native;
 using ModelSharp.Tensors;
@@ -38,13 +39,40 @@ namespace ModelSharp.Cpu.Kernels.Quantize;
 /// </list>
 /// <para><b>Dequantization.</b> For output row <c>n</c> and input column <c>k</c>, the block is
 /// <c>b = k / block_size</c>, the n-bit code is <c>q = unpack(B[n], k)</c>, and
-/// <c>W[n, k] = (q − zero_point[n, b]) · scale[n, b]</c>. We dequantize each weight row to a
-/// scratch float vector of length <c>K</c> on the fly and accumulate the dot product against
-/// every A row, so memory stays O(K) per output column.</para>
+/// <c>W[n, k] = (q − zero_point[n, b]) · scale[n, b]</c>.</para>
+/// <para><b>Fused block kernel (default).</b> Per output column we read the packed weight row ONCE
+/// and process it a quant block at a time: the block's nibbles are unpacked with SIMD mask/shift
+/// (<see cref="MatMulNBitsSimd.DequantBlock4"/>), turned into <c>(q − zp)·scale</c> floats in a
+/// small block-sized scratch, and FMA-accumulated (<see cref="MatMulNBitsSimd.FmaAccumulate"/>)
+/// against the matching activation slice of every A row. We never materialize a full K-length fp32
+/// weight vector, so the packed 0.5-byte codes — not 4-byte fp32 — dominate the memory traffic. The
+/// fp32 dequant math is identical to a scalar dequant-then-dot; only the summation order changes (a
+/// few ULP), which stays inside the parity tolerance.</para>
+/// <para><b>Opt-in W4A8 (<c>MODELSHARP_W4A8</c>, OFF by default).</b> When enabled for 4-bit
+/// weights, the activation block is dynamically quantized to int8 and dotted against the packed int4
+/// codes with an int32 SIMD dot (AVX-VNNI <c>vpdpbusd</c> or AVX2 <c>vpmaddubsw</c>), rescaling and
+/// applying zero-point compensation after. Lower precision, far less traffic; disabled by default so
+/// the tight parity tests are unaffected.</para>
 /// </remarks>
 public sealed class MatMulNBitsKernel : IKernel
 {
     public string OpType => "MatMulNBits";
+
+    /// <summary>
+    /// Opt-in flag for the fast, lower-precision W4A8 path (int8 activations × int4 weights via
+    /// VNNI/maddubs). OFF by default, mirroring the <c>MODELSHARP_</c> env-flag convention used for
+    /// the native quant paths; set <c>MODELSHARP_W4A8=1</c> (or <c>true</c>/<c>on</c>) to enable.
+    /// When off, the kernel takes the exact fp32-preserving default path (byte-for-byte the prior
+    /// behaviour up to SIMD accumulation order), so the tight parity tests stay green.
+    /// </summary>
+    private static readonly bool W4A8Enabled = ReadW4A8Flag();
+
+    private static bool ReadW4A8Flag()
+    {
+        string? v = Environment.GetEnvironmentVariable("MODELSHARP_W4A8");
+        if (string.IsNullOrEmpty(v)) return false;
+        return v is "1" or "true" or "TRUE" or "True" or "on" or "ON" or "yes" or "YES";
+    }
 
     public void Execute(GraphNode node, GraphContext ctx)
     {
@@ -165,37 +193,49 @@ public sealed class MatMulNBitsKernel : IKernel
         int bRowBytes = nBlocksPerRow * blobSize;
         byte mask = (byte)((1 << bits) - 1);
 
-        // Capture backing buffers so the per-column parallel lambdas can re-acquire spans
-        // (Span<T> is a ref struct and cannot be hoisted into a closure). The weight scratch is
-        // allocated per column iteration (thread-local) so columns never share state.
-        Memory<float> ma = a.Buffer, my = y.Buffer, mScales = scales.Buffer;
-        Memory<byte> mb = b.Buffer;
+        // Dense array backing so the per-column parallel lambdas can index from inside Parallel.For
+        // (Span<T> is a ref struct and cannot be hoisted into a closure). KernelSimd.Array returns
+        // the tensor's own zero-offset array or, for a sub-view, a dense copy — so element i always
+        // equals the logical value at i.
+        float[] aArr = KernelSimd.Array(a);
+        float[] yArr = KernelSimd.Array(y);
+        float[] scaleArr = KernelSimd.Array(scales);
+        byte[] bArr = DenseByteArray(b);
         float[]? zpFloatLocal = zpFloat;
         byte[]? zpPackedLocal = zpPacked;
         int bitsLocal = bits, blockSizeLocal = blockSize, nBlocksLocal = nBlocksPerRow;
         int blobSizeLocal = blobSize, zpRowBytesLocal = zpRowBytes, KLocal = K, NLocal = N, MLocal = M;
         float defaultZpLocal = defaultZp;
+        bool useW4A8 = W4A8Enabled && bits == 4 && MatMulNBitsSimd.W4A8Available;
 
-        // Parallelise over the N output columns: each column dequantizes one weight row into a
-        // thread-local scratch vector and dots it against every activation row with SIMD. Distinct
-        // columns write distinct output positions (stride N), so there is no contention.
+        // Parallelise over the N output columns. Distinct columns write distinct output positions
+        // (stride N), so there is no contention. Each column reads its packed weight row ONCE,
+        // dequantizes a block at a time into a small (block-sized) scratch, and FMA-accumulates that
+        // block against every activation row — so we never materialize a full K-length fp32 weight
+        // vector and the packed weights dominate the traffic (not 8× fp32).
         MatMulParallel.For(N, (long)KLocal * (MLocal + 1), n =>
         {
-            ReadOnlySpan<float> sa = ma.Span;
-            Span<float> sy = my.Span;
-            ReadOnlySpan<float> sScales = mScales.Span;
-            ReadOnlySpan<byte> sb = mb.Span;
-
-            Span<float> w = KLocal <= 4096 ? stackalloc float[KLocal] : new float[KLocal];
-
             int bRowBase = n * bRowBytes;
             int scaleRowBase = n * nBlocksLocal;
             int zpRowBase = n * zpRowBytesLocal;
 
+            if (useW4A8)
+            {
+                ExecuteColumnW4A8(
+                    n, aArr, yArr, scaleArr, bArr, zpFloatLocal, zpPackedLocal,
+                    bRowBase, scaleRowBase, zpRowBase, blockSizeLocal, nBlocksLocal,
+                    blobSizeLocal, KLocal, NLocal, MLocal, defaultZpLocal, mask, bitsLocal);
+                return;
+            }
+
+            // ---- DEFAULT exact-preserving path: fused block dequant + FMA accumulate --------------
+            // Thread-local block scratch (only block-sized, not K) and per-row dot accumulators.
+            var wBlock = new float[blockSizeLocal];
+            var acc = new float[MLocal];
+
             for (int bk = 0; bk < nBlocksLocal; bk++)
             {
-                float scale = sScales[scaleRowBase + bk];
-
+                float scale = scaleArr[scaleRowBase + bk];
                 float zp;
                 if (zpFloatLocal is not null) zp = zpFloatLocal[scaleRowBase + bk];
                 else if (zpPackedLocal is not null) zp = UnpackNBit(zpPackedLocal, zpRowBase, bk, bitsLocal, mask);
@@ -203,21 +243,101 @@ public sealed class MatMulNBitsKernel : IKernel
 
                 int blobBase = bRowBase + bk * blobSizeLocal;
                 int kStart = bk * blockSizeLocal;
-                int kEnd = Math.Min(kStart + blockSizeLocal, KLocal);
-                for (int k = kStart; k < kEnd; k++)
-                {
-                    int inBlock = k - kStart;               // index within the block
-                    int q = UnpackNBit(sb, blobBase, inBlock, bitsLocal, mask);
-                    w[k] = (q - zp) * scale;
-                }
+                int len = Math.Min(blockSizeLocal, KLocal - kStart);
+                if (len <= 0) break;
+
+                // Vectorized nibble unpack + (q - zp) * scale into the block scratch.
+                if (bitsLocal == 4)
+                    MatMulNBitsSimd.DequantBlock4(bArr, blobBase, len, zp, scale, wBlock);
+                else
+                    MatMulNBitsSimd.DequantBlock8(bArr, blobBase, len, zp, scale, wBlock);
+
+                // FMA-accumulate this weight block against the matching activation slice of each row.
+                for (int m = 0; m < MLocal; m++)
+                    acc[m] = MatMulNBitsSimd.FmaAccumulate(acc[m], aArr, m * KLocal + kStart, wBlock, 0, len);
             }
 
-            // Accumulate Y[m, n] = Σ_k A[m, k] * w[k] for every A row (SIMD inner dot).
             for (int m = 0; m < MLocal; m++)
-                sy[m * NLocal + n] = MatMulParallel.Dot(sa, m * KLocal, w, KLocal);
+                yArr[m * NLocal + n] = acc[m];
         });
 
         ctx.Set(node.Outputs[0], y);
+    }
+
+    /// <summary>
+    /// Opt-in W4A8 column kernel: dynamically quantizes each activation row's block to int8, dots it
+    /// against the packed int4 weight codes with an int32 SIMD dot (VNNI / maddubs), then rescales
+    /// by <c>scaleA · scaleW</c> and subtracts the zero-point compensation. Lower precision than the
+    /// default path; only reachable when <c>MODELSHARP_W4A8</c> is set. Correctness identity:
+    /// <c>Σ a·(q−zp)·s = s·(Σ a_q·q)·sA − s·zp·(Σ a_q)·sA</c>, where a_q are the int8 codes and
+    /// <c>sA</c> the activation scale.
+    /// </summary>
+    private static void ExecuteColumnW4A8(
+        int n, float[] aArr, float[] yArr, float[] scaleArr, byte[] bArr,
+        float[]? zpFloatLocal, byte[]? zpPackedLocal,
+        int bRowBase, int scaleRowBase, int zpRowBase, int blockSize, int nBlocks,
+        int blobSize, int K, int N, int M, float defaultZp, byte mask, int bits)
+    {
+        // Weight codes for one block (0..15), as bytes, for the int8 dot. Small blocks stack; large
+        // (pathological) blocks fall back to the heap so we never blow the stack.
+        bool onStack = blockSize <= 8192;
+        Span<byte> wCodes = onStack ? stackalloc byte[blockSize] : new byte[blockSize];
+        Span<sbyte> aq = onStack ? stackalloc sbyte[blockSize] : new sbyte[blockSize];
+        Span<byte> aqU = onStack ? stackalloc byte[blockSize] : new byte[blockSize]; // +128 (unsigned)
+
+        for (int m = 0; m < M; m++)
+        {
+            float total = 0f;
+            for (int bk = 0; bk < nBlocks; bk++)
+            {
+                float scaleW = scaleArr[scaleRowBase + bk];
+                float zp;
+                if (zpFloatLocal is not null) zp = zpFloatLocal[scaleRowBase + bk];
+                else if (zpPackedLocal is not null) zp = UnpackNBit(zpPackedLocal, zpRowBase, bk, bits, mask);
+                else zp = defaultZp;
+
+                int blobBase = bRowBase + bk * blobSize;
+                int kStart = bk * blockSize;
+                int len = Math.Min(blockSize, K - kStart);
+                if (len <= 0) break;
+
+                // Unpack the len weight codes into bytes.
+                for (int i = 0; i < len; i++)
+                {
+                    int b = bArr[blobBase + (i >> 1)];
+                    wCodes[i] = (byte)(((i & 1) == 0) ? (b & 0x0F) : (b >> 4) & 0x0F);
+                }
+
+                // Dynamically int8-quantize this activation block.
+                float scaleA = MatMulNBitsSimd.QuantizeActivationInt8(aArr, m * K + kStart, len, aq, out int sumAq);
+                if (scaleA == 0f) continue;
+
+                // Shift activation codes to unsigned [0,255] for the u8×u8 VNNI/maddubs dot, then
+                // remove the +128 bias analytically: Σ (a_q+128)·q − 128·Σ q.
+                int sumW = 0;
+                for (int i = 0; i < len; i++)
+                {
+                    aqU[i] = (byte)(aq[i] + 128);
+                    sumW += wCodes[i];
+                }
+                int rawU = MatMulNBitsSimd.DotU8xU8(aqU.Slice(0, len), wCodes.Slice(0, len), len);
+                int dotAqQ = rawU - 128 * sumW;   // Σ a_q · q
+
+                // Σ a·(q − zp)·s = s·sA·(Σ a_q·q − zp·Σ a_q)
+                total += scaleW * scaleA * (dotAqQ - zp * sumAq);
+            }
+            yArr[m * N + n] = total;
+        }
+    }
+
+    /// <summary>Dense zero-offset byte array for <paramref name="t"/> so it can be indexed inside a
+    /// <c>Parallel.For</c> body; copies only for a non-trivial sub-view.</summary>
+    private static byte[] DenseByteArray(Tensor<byte> t)
+    {
+        if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray<byte>(t.Buffer, out var seg)
+            && seg.Offset == 0 && seg.Array is { } arr && arr.Length == t.Buffer.Length)
+            return arr;
+        return t.Buffer.Span.ToArray();
     }
 
     /// <summary>
