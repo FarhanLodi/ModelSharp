@@ -204,7 +204,19 @@ public sealed class GroupQueryAttentionKernel : IKernel
         ReadOnlySpan<float> kSpan = kBuf;
         ReadOnlySpan<float> vSpan = vBuf;
 
-        // present_key / present_value: [B, kv_num_heads, totalSeq, head_dim].
+        // present_key / present_value: [B, kv_num_heads, totalSeq, head_dim] = past concatenated with the
+        // new K/V along the sequence axis.
+        //
+        // TODO(kv-cache-in-place): a genuinely append-only cache would reuse the past's backing buffer and
+        // write only the single new row, turning the per-step Θ(pastSeq·kv_heads·head_dim) past copy below
+        // into Θ(kv_heads·head_dim). That is not currently possible from this kernel: the present must be a
+        // contiguous [B, kv_heads, totalSeq, head_dim] tensor for the attention math, the sequence axis is
+        // an interleaved middle stride (so appending a row shifts every later head's data unless the buffer
+        // was pre-strided for the final length), and Tensor<T> enforces buffer.Length == shape.Length, so a
+        // capacity-backed (over-allocated) past cannot be threaded in without editing the tensor core (out
+        // of scope here). We therefore keep the safe, byte-identical win: bulk-copy each contiguous
+        // (batch, kv_head) past block with a single vectorized Span.CopyTo instead of the old scalar
+        // per-element loop, then scatter the new row.
         var presentK = new Tensor<float>(new TensorShape(batch, kvNumHeads, totalSeq, headDim));
         var presentV = new Tensor<float>(new TensorShape(batch, kvNumHeads, totalSeq, headDim));
         Span<float> pk = presentK.Span, pv = presentV.Span;
@@ -213,24 +225,28 @@ public sealed class GroupQueryAttentionKernel : IKernel
         {
             ReadOnlySpan<float> psk = pastKey.Span;
             ReadOnlySpan<float> psv = pastValue!.Span;
-            for (int b = 0; b < batch; b++)
-            for (int g = 0; g < kvNumHeads; g++)
-            for (int s = 0; s < pastSeq; s++)
+            int pastBlock = pastSeq * headDim;      // contiguous past run per (batch, kv_head)
+            int presentBlock = totalSeq * headDim;  // matching present block (past prefix + new tail)
+            for (int bg = 0; bg < batch * kvNumHeads; bg++)
             {
-                int src = ((b * kvNumHeads + g) * pastSeq + s) * headDim;
-                int dst = ((b * kvNumHeads + g) * totalSeq + s) * headDim;
-                for (int d = 0; d < headDim; d++) { pk[dst + d] = psk[src + d]; pv[dst + d] = psv[src + d]; }
+                int src = bg * pastBlock;
+                int dst = bg * presentBlock;
+                psk.Slice(src, pastBlock).CopyTo(pk.Slice(dst, pastBlock));
+                psv.Slice(src, pastBlock).CopyTo(pv.Slice(dst, pastBlock));
             }
         }
 
-        // Scatter new K/V [B, Skv, kv_num_heads·head_dim] into present at offset pastSeq.
+        // Scatter new K/V [B, Skv, kv_num_heads·head_dim] into present at offset pastSeq. Each (b, s, g)
+        // contributes one contiguous head_dim run, copied with CopyTo (byte-identical to the old scalar
+        // inner loop).
         for (int b = 0; b < batch; b++)
         for (int s = 0; s < kvSeq; s++)
         for (int g = 0; g < kvNumHeads; g++)
         {
             int src = (b * kvSeq + s) * kvHid + g * headDim;
             int dst = ((b * kvNumHeads + g) * totalSeq + pastSeq + s) * headDim;
-            for (int d = 0; d < headDim; d++) { pk[dst + d] = kSpan[src + d]; pv[dst + d] = vSpan[src + d]; }
+            kSpan.Slice(src, headDim).CopyTo(pk.Slice(dst, headDim));
+            vSpan.Slice(src, headDim).CopyTo(pv.Slice(dst, headDim));
         }
 
         var outT = new Tensor<float>(new TensorShape(batch, qSeq, qHid));

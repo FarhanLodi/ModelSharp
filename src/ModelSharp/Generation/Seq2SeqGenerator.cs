@@ -214,6 +214,14 @@ public sealed class Seq2SeqGenerator
         Dictionary<string, Tensor>? selfPast = null;   // self-attn KV, grows each step
         Dictionary<string, Tensor>? crossPast = null;  // cross-attn KV, captured once then constant
 
+        // Hot-loop scratch, allocated once and reused every step (mirrors TextGenerator):
+        //  - the feed dictionary is cleared + repopulated rather than reallocated;
+        //  - the decoder self-attention mask is grown in place from a persistent ones-buffer;
+        //  - a reusable buffer backs the last-position logits copy on the sampling path.
+        var feeds = new Dictionary<string, NamedTensor>(StringComparer.Ordinal);
+        var decMaskState = _decMaskInfo is not null ? new MaskBuffer(decoderSequence.Count) : null;
+        float[]? logitsScratch = null;
+
         while (true)
         {
             if (generatedCount >= config.MaxNewTokens) yield break;
@@ -223,12 +231,14 @@ public sealed class Seq2SeqGenerator
             int chunkLength = (!cache || selfPast is null) ? decoderSequence.Count : 1;
             int startPosition = decoderSequence.Count - chunkLength;
 
-            IReadOnlyDictionary<string, NamedTensor> feeds =
-                BuildDecoderFeeds(decoderSequence, chunkLength, startPosition, encoderHidden, encMask, cache, selfPast, crossPast);
+            BuildDecoderFeeds(
+                feeds, decMaskState, decoderSequence, chunkLength, startPosition,
+                encoderHidden, encMask, cache, selfPast, crossPast);
             IReadOnlyDictionary<string, NamedTensor> outputs = _decoder.Run(feeds);
 
-            float[] logitsRow = ExtractLastPositionLogits(outputs);
-            int nextId = LogitsProcessor.SelectNextToken(logitsRow, config, decoderSequence, rng);
+            (Tensor<float> logits, int offset, int vocab) = LocateLastPositionLogits(outputs);
+            int nextId = LogitsProcessor.SelectNextTokenFromLogits(
+                logits.Span, offset, vocab, config, decoderSequence, rng, ref logitsScratch);
             long next = nextId;
 
             decoderSequence.Add(next);
@@ -311,13 +321,19 @@ public sealed class Seq2SeqGenerator
         return mask;
     }
 
-    /// <summary>Builds the decoder feed dictionary for one step.</summary>
-    private IReadOnlyDictionary<string, NamedTensor> BuildDecoderFeeds(
+    /// <summary>
+    /// Populates the (reused) decoder feed dictionary for one step in place: clears the previous step's
+    /// entries, then rebinds decoder input_ids / encoder hidden states / encoder + decoder masks /
+    /// use_cache_branch / self- and cross-attention past. The decoder self-attention mask is grown in
+    /// place from a persistent ones-buffer rather than reallocated per step.
+    /// </summary>
+    private void BuildDecoderFeeds(
+        Dictionary<string, NamedTensor> feeds, MaskBuffer? decMaskState,
         List<long> sequence, int chunkLength, int startPosition,
         NamedTensor encoderHidden, long[] encMask,
         bool cache, Dictionary<string, Tensor>? selfPast, Dictionary<string, Tensor>? crossPast)
     {
-        var feeds = new Dictionary<string, NamedTensor>(StringComparer.Ordinal);
+        feeds.Clear();
 
         // decoder input_ids: the chunk processed this step.
         var ids = new long[chunkLength];
@@ -335,13 +351,14 @@ public sealed class Seq2SeqGenerator
                 _options.EncoderAttentionMaskInputName,
                 BuildIntTensor(_encMaskInputInfo, new TensorShape(1, encMask.Length), encMask));
 
-        // decoder_attention_mask: ones over every decoder token attended to so far.
+        // decoder_attention_mask: ones over every decoder token attended to so far. Grown in place from
+        // a persistent buffer so each step appends a single "1" instead of reallocating a full array.
         if (_decMaskInfo is not null)
         {
-            var mask = new long[sequence.Count];
-            for (int i = 0; i < sequence.Count; i++) mask[i] = 1;
+            int maskLength = sequence.Count;
+            Memory<long> mask = decMaskState!.OnesUpTo(maskLength);
             feeds[_options.DecoderAttentionMaskName] = new NamedTensor(
-                _options.DecoderAttentionMaskName, BuildIntTensor(_decMaskInfo, new TensorShape(1, sequence.Count), mask));
+                _options.DecoderAttentionMaskName, BuildIntTensor(_decMaskInfo, new TensorShape(1, maskLength), mask));
         }
 
         // use_cache_branch: false on the prefill pass, true on cached steps.
@@ -357,8 +374,6 @@ public sealed class Seq2SeqGenerator
             // the captured first-pass present.*.encoder.* re-fed unchanged every later step.
             FeedPast(feeds, _crossPairs, crossPast);
         }
-
-        return feeds;
     }
 
     private void FeedPast(
@@ -392,8 +407,13 @@ public sealed class Seq2SeqGenerator
         return map;
     }
 
-    /// <summary>Reads the vocabulary distribution at the final decoder position (rank 1-3 accepted).</summary>
-    private float[] ExtractLastPositionLogits(IReadOnlyDictionary<string, NamedTensor> outputs)
+    /// <summary>
+    /// Locates the vocabulary distribution at the final decoder position without copying it (rank 1-3
+    /// accepted). Returns the backing tensor plus the <c>offset</c>/<c>vocab</c> of the last-position row;
+    /// the caller reads it in place (greedy) or copies it into a reused scratch buffer (sampling).
+    /// </summary>
+    private (Tensor<float> Logits, int Offset, int Vocab) LocateLastPositionLogits(
+        IReadOnlyDictionary<string, NamedTensor> outputs)
     {
         if (!outputs.TryGetValue(_options.LogitsOutputName, out NamedTensor? logitsNamed))
         {
@@ -424,9 +444,7 @@ public sealed class Seq2SeqGenerator
                     $"Unexpected logits rank {dims.Length} (shape {logits.Shape}); expected 1-3 dimensions.");
         }
 
-        var row = new float[vocab];
-        logits.Span.Slice(offset, vocab).CopyTo(row);
-        return row;
+        return (logits, offset, vocab);
     }
 
     // ---- KV layout detection ----
@@ -470,11 +488,20 @@ public sealed class Seq2SeqGenerator
     // ---- tensor builders (mirrors TextGenerator's conventions) ----
 
     private static Tensor BuildIntTensor(TensorInfo? info, TensorShape shape, long[] values)
+        => BuildIntTensor(info, shape, (Memory<long>)values);
+
+    /// <summary>
+    /// Builds an integer feed tensor from an int64 span. When the binding is declared int64 the buffer is
+    /// wrapped without a copy (so a reused backing array threads straight into the feed); int32 bindings
+    /// are narrowed into a fresh buffer.
+    /// </summary>
+    private static Tensor BuildIntTensor(TensorInfo? info, TensorShape shape, Memory<long> values)
     {
         if (info?.ElementType == ElementType.Int32)
         {
-            var buffer = new int[values.Length];
-            for (int i = 0; i < values.Length; i++) buffer[i] = checked((int)values[i]);
+            ReadOnlySpan<long> src = values.Span;
+            var buffer = new int[src.Length];
+            for (int i = 0; i < src.Length; i++) buffer[i] = checked((int)src[i]);
             return new Tensor<int>(shape, buffer);
         }
         return new Tensor<long>(shape, values);
@@ -548,6 +575,42 @@ public sealed class Seq2SeqGenerator
         foreach (int eos in config.EosTokenIds)
             if (eos == token) return true;
         return false;
+    }
+
+    /// <summary>
+    /// A grow-only buffer of all-ones int64 decoder-attention-mask values, reused across decode steps
+    /// (mirrors <c>TextGenerator.MaskBuffer</c>). The decoder self-attention mask is always a run of
+    /// <c>1</c>s of the current decoder-sequence length, so each step only needs the buffer to be at
+    /// least that long; we fill any newly exposed tail with <c>1</c> once and hand back a length-bounded
+    /// view, avoiding a fresh full-length allocation per token.
+    /// </summary>
+    private sealed class MaskBuffer
+    {
+        private long[] _ones;
+        private int _filled;
+
+        public MaskBuffer(int initialLength)
+        {
+            _ones = new long[Math.Max(initialLength, 1)];
+            // _filled left at 0; OnesUpTo fills lazily on first use.
+        }
+
+        /// <summary>Returns a view of <paramref name="length"/> ones, growing/filling the buffer as needed.</summary>
+        public Memory<long> OnesUpTo(int length)
+        {
+            if (length > _ones.Length)
+            {
+                int cap = _ones.Length;
+                while (cap < length) cap *= 2;
+                Array.Resize(ref _ones, cap);
+            }
+            if (length > _filled)
+            {
+                for (int i = _filled; i < length; i++) _ones[i] = 1;
+                _filled = length;
+            }
+            return new Memory<long>(_ones, 0, length);
+        }
     }
 }
 

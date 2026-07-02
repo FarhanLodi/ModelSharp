@@ -136,6 +136,10 @@ public sealed class TextGenerator
         var feeds = new Dictionary<string, NamedTensor>(StringComparer.Ordinal);
         var maskState = _attentionMaskInfo is not null ? new MaskBuffer(sequence.Count) : null;
 
+        // Reused across steps: the sampling pipeline needs a mutable copy of the last-position logits
+        // row, but greedy decoding reads them in place. Allocated lazily on the first step that needs it.
+        float[]? logitsScratch = null;
+
         while (true)
         {
             if (generatedCount >= config.MaxNewTokens) yield break;
@@ -149,8 +153,9 @@ public sealed class TextGenerator
             BuildFeeds(feeds, maskState, sequence, chunkLength, startPosition, cache, past);
             IReadOnlyDictionary<string, NamedTensor> outputs = _engine.Run(feeds);
 
-            float[] logitsRow = ExtractLastPositionLogits(outputs);
-            int nextId = LogitsProcessor.SelectNextToken(logitsRow, config, sequence, rng);
+            (Tensor<float> logits, int offset, int vocab) = LocateLastPositionLogits(outputs);
+            int nextId = LogitsProcessor.SelectNextTokenFromLogits(
+                logits.Span, offset, vocab, config, sequence, rng, ref logitsScratch);
             long next = nextId;
 
             sequence.Add(next);
@@ -251,11 +256,14 @@ public sealed class TextGenerator
     }
 
     /// <summary>
-    /// Reads the vocabulary distribution at the final sequence position. Accepts logits shaped
-    /// <c>[batch, seq, vocab]</c>, <c>[batch, vocab]</c> (single-position cached run, or <c>[seq, vocab]</c>),
-    /// or a bare <c>[vocab]</c> row. Returns a fresh copy that downstream warpers may mutate.
+    /// Locates the vocabulary distribution at the final sequence position without copying it. Accepts
+    /// logits shaped <c>[batch, seq, vocab]</c>, <c>[batch, vocab]</c> (single-position cached run, or
+    /// <c>[seq, vocab]</c>), or a bare <c>[vocab]</c> row, and returns the backing tensor together with
+    /// the <c>offset</c>/<c>vocab</c> of the last-position row inside it. The caller reads the row in
+    /// place (greedy) or copies it into a reused scratch buffer (sampling).
     /// </summary>
-    private float[] ExtractLastPositionLogits(IReadOnlyDictionary<string, NamedTensor> outputs)
+    private (Tensor<float> Logits, int Offset, int Vocab) LocateLastPositionLogits(
+        IReadOnlyDictionary<string, NamedTensor> outputs)
     {
         if (!outputs.TryGetValue(_options.LogitsOutputName, out NamedTensor? logitsNamed))
         {
@@ -296,9 +304,7 @@ public sealed class TextGenerator
                     $"Unexpected logits rank {dims.Length} (shape {logits.Shape}); expected 1-3 dimensions.");
         }
 
-        var row = new float[vocab];
-        logits.Span.Slice(offset, vocab).CopyTo(row);
-        return row;
+        return (logits, offset, vocab);
     }
 
     private TensorInfo? FindInput(string name)
