@@ -227,9 +227,9 @@ public static class OnnxModelLoader
         return (name, value);
     }
 
-    // ONNX TensorProto.DataType values we materialize. FLOAT16 (10) and BFLOAT16 (16)
-    // half-precision initializers are upconverted to float32 on load (the engine computes
-    // in float32), so they materialize as Tensor&lt;float&gt;.
+    // ONNX TensorProto.DataType values we materialize. FLOAT16 (10) initializers are kept as compact
+    // Tensor&lt;Half&gt; (2 bytes/element) and widened to float32 on demand — and memoized — at the compute
+    // boundary (Tensor.ToFloat32 / GraphContext.Get). BFLOAT16 (16) is decoded to float32 on load.
     private const long DtFloat = 1, DtUint8 = 2, DtInt8 = 3, DtInt32 = 6, DtInt64 = 7, DtBool = 9,
         DtFloat16 = 10, DtBFloat16 = 16;
 
