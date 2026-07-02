@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using ModelSharp.Cpu.Kernels.Internal;
 
 namespace ModelSharp.Cpu.Kernels.Linear;
 
@@ -116,12 +117,12 @@ internal static class BlockedGemm
             var b0v = new Vector<float>(b, bo);
             var b1v = new Vector<float>(b, bo + w);
             Vector<float> va;
-            va = new Vector<float>(a[a0Row + k]); c00 += va * b0v; c01 += va * b1v;
-            va = new Vector<float>(a[a1Row + k]); c10 += va * b0v; c11 += va * b1v;
-            va = new Vector<float>(a[a2Row + k]); c20 += va * b0v; c21 += va * b1v;
-            va = new Vector<float>(a[a3Row + k]); c30 += va * b0v; c31 += va * b1v;
-            va = new Vector<float>(a[a4Row + k]); c40 += va * b0v; c41 += va * b1v;
-            va = new Vector<float>(a[a5Row + k]); c50 += va * b0v; c51 += va * b1v;
+            va = new Vector<float>(a[a0Row + k]); c00 = SimdFma.MulAdd(va, b0v, c00); c01 = SimdFma.MulAdd(va, b1v, c01);
+            va = new Vector<float>(a[a1Row + k]); c10 = SimdFma.MulAdd(va, b0v, c10); c11 = SimdFma.MulAdd(va, b1v, c11);
+            va = new Vector<float>(a[a2Row + k]); c20 = SimdFma.MulAdd(va, b0v, c20); c21 = SimdFma.MulAdd(va, b1v, c21);
+            va = new Vector<float>(a[a3Row + k]); c30 = SimdFma.MulAdd(va, b0v, c30); c31 = SimdFma.MulAdd(va, b1v, c31);
+            va = new Vector<float>(a[a4Row + k]); c40 = SimdFma.MulAdd(va, b0v, c40); c41 = SimdFma.MulAdd(va, b1v, c41);
+            va = new Vector<float>(a[a5Row + k]); c50 = SimdFma.MulAdd(va, b0v, c50); c51 = SimdFma.MulAdd(va, b1v, c51);
             bo += ldb;
         }
 
@@ -162,7 +163,7 @@ internal static class BlockedGemm
                 for (; n <= last; n += w)
                 {
                     var cur = new Vector<float>(acc.Slice(dst + n, w));
-                    (cur + avv * new Vector<float>(b, bo + n)).CopyTo(acc.Slice(dst + n, w));
+                    SimdFma.MulAdd(avv, new Vector<float>(b, bo + n), cur).CopyTo(acc.Slice(dst + n, w));
                 }
                 for (; n < ncols; n++) acc[dst + n] += av * b[bo + n];
             }

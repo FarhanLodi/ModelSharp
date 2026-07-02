@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using System.Threading.Tasks;
+using ModelSharp.Cpu.Kernels.Internal;
 
 namespace ModelSharp.Cpu.Kernels.Linear;
 
@@ -71,15 +72,15 @@ internal static class MatMulParallel
         int limit4 = k - 4 * width;
         for (; i <= limit4; i += 4 * width)
         {
-            a0 += new Vector<float>(a.Slice(aBase + i, width)) * new Vector<float>(w.Slice(i, width));
-            a1 += new Vector<float>(a.Slice(aBase + i + width, width)) * new Vector<float>(w.Slice(i + width, width));
-            a2 += new Vector<float>(a.Slice(aBase + i + 2 * width, width)) * new Vector<float>(w.Slice(i + 2 * width, width));
-            a3 += new Vector<float>(a.Slice(aBase + i + 3 * width, width)) * new Vector<float>(w.Slice(i + 3 * width, width));
+            a0 = SimdFma.MulAdd(new Vector<float>(a.Slice(aBase + i, width)), new Vector<float>(w.Slice(i, width)), a0);
+            a1 = SimdFma.MulAdd(new Vector<float>(a.Slice(aBase + i + width, width)), new Vector<float>(w.Slice(i + width, width)), a1);
+            a2 = SimdFma.MulAdd(new Vector<float>(a.Slice(aBase + i + 2 * width, width)), new Vector<float>(w.Slice(i + 2 * width, width)), a2);
+            a3 = SimdFma.MulAdd(new Vector<float>(a.Slice(aBase + i + 3 * width, width)), new Vector<float>(w.Slice(i + 3 * width, width)), a3);
         }
         var acc = (a0 + a1) + (a2 + a3);
         int limit = k - width;
         for (; i <= limit; i += width)
-            acc += new Vector<float>(a.Slice(aBase + i, width)) * new Vector<float>(w.Slice(i, width));
+            acc = SimdFma.MulAdd(new Vector<float>(a.Slice(aBase + i, width)), new Vector<float>(w.Slice(i, width)), acc);
         float sum = Vector.Dot(acc, Vector<float>.One);
         for (; i < k; i++) sum += a[aBase + i] * w[i];
         return sum;

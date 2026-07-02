@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using ModelSharp.Cpu.Kernels.Internal;
 using ModelSharp.Tensors;
 
 namespace ModelSharp.Cpu.Kernels.Llm;
@@ -47,15 +48,15 @@ internal static class KernelSimd
         int last4 = n - 4 * W;
         for (; i <= last4; i += 4 * W)
         {
-            a0 += new Vector<float>(a, aOff + i) * new Vector<float>(b, bOff + i);
-            a1 += new Vector<float>(a, aOff + i + W) * new Vector<float>(b, bOff + i + W);
-            a2 += new Vector<float>(a, aOff + i + 2 * W) * new Vector<float>(b, bOff + i + 2 * W);
-            a3 += new Vector<float>(a, aOff + i + 3 * W) * new Vector<float>(b, bOff + i + 3 * W);
+            a0 = SimdFma.MulAdd(new Vector<float>(a, aOff + i), new Vector<float>(b, bOff + i), a0);
+            a1 = SimdFma.MulAdd(new Vector<float>(a, aOff + i + W), new Vector<float>(b, bOff + i + W), a1);
+            a2 = SimdFma.MulAdd(new Vector<float>(a, aOff + i + 2 * W), new Vector<float>(b, bOff + i + 2 * W), a2);
+            a3 = SimdFma.MulAdd(new Vector<float>(a, aOff + i + 3 * W), new Vector<float>(b, bOff + i + 3 * W), a3);
         }
         var acc = (a0 + a1) + (a2 + a3);
         int last = n - W;
         for (; i <= last; i += W)
-            acc += new Vector<float>(a, aOff + i) * new Vector<float>(b, bOff + i);
+            acc = SimdFma.MulAdd(new Vector<float>(a, aOff + i), new Vector<float>(b, bOff + i), acc);
         float dot = Vector.Dot(acc, Vector<float>.One);
         for (; i < n; i++) dot += a[aOff + i] * b[bOff + i];
         return dot;
@@ -193,7 +194,7 @@ internal static class KernelSimd
         {
             var d = new Vector<float>(dst, dOff + i);
             var s = new Vector<float>(src, sOff + i);
-            (d + wv * s).CopyTo(dst, dOff + i);
+            SimdFma.MulAdd(wv, s, d).CopyTo(dst, dOff + i);
         }
         for (; i < n; i++) dst[dOff + i] += w * src[sOff + i];
     }
